@@ -119,21 +119,67 @@ Every MCP stdio client uses the same shape: a `command` to launch the
 server, optional `args`, optional `env`. The differences are just the
 file/UI where you put the config.
 
-**Recommended config** (works in every client — keep secrets in a
-`.env` file outside any repo and pass `--env-file`):
+The server isn't on PyPI yet, so there's no globally-installed
+`kalshi-mcp` command on your PATH. The two reliable patterns:
+
+### Pattern A — `uv run` against a local clone (recommended)
+
+Best for users who have [uv](https://docs.astral.sh/uv/) installed
+(common in modern Python workflows). Clone the repo, then point the
+MCP client config at `uv` with `--directory`:
 
 ```json
 {
   "mcpServers": {
     "kalshi": {
-      "command": "kalshi-mcp",
-      "args": ["--env-file", "/Users/you/.kalshi/.env"]
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/absolute/path/to/kalshi-mcp-server",
+        "kalshi-mcp",
+        "--env-file", "/Users/you/.kalshi/.env"
+      ]
     }
   }
 }
 ```
 
-Where to put this:
+`uv run` activates the project's venv automatically, so dependencies
+work without manual `pip install`. Updating to a new version is `git
+pull` + restart the MCP client.
+
+### Pattern B — Docker against the public image
+
+Best for users without Python / uv installed, or who'd rather not
+clone. Uses the pre-built public image at GHCR:
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-v", "/Users/you/.kalshi/demo.pem:/secrets/demo.pem:ro",
+        "-e", "KALSHI_API_KEY_ID=<your-key-id>",
+        "-e", "KALSHI_PRIVATE_KEY_PATH=/secrets/demo.pem",
+        "-e", "KALSHI_ENV=demo",
+        "ghcr.io/cejor6/kalshi-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+The `-v` mount bind-mounts your PEM file read-only into the container
+at a fixed path; `KALSHI_PRIVATE_KEY_PATH` points at that path. Secrets
+live in the JSON config — fine for a single-user machine.
+
+> A future release will publish to PyPI, after which `pipx install
+> kalshi-mcp-server` will put `kalshi-mcp` on your global PATH and the
+> config simplifies to just `"command": "kalshi-mcp", "args": [...]`.
+
+### Where to put this config:
 
 | Client | Config location |
 |---|---|
