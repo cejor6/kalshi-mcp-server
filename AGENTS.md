@@ -19,8 +19,8 @@ exposes tools + resources that an LLM agent can use to query markets,
 inspect a portfolio, and place trades.
 
 The repo is designed to be **forked**. Conventions, safety controls, and
-documentation should be useful to anyone who clones the project — not
-just the original maintainer.
+documentation should be useful to anyone who clones the project. Write
+for a stranger, not for the current owner.
 
 ---
 

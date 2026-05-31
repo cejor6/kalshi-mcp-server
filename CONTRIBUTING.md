@@ -110,3 +110,21 @@ See the "How to add a new tool" section of [AGENTS.md](AGENTS.md).
 
 Open a discussion or issue. For sensitive matters (auth bugs, suspected
 vulnerabilities), see [SECURITY.md](SECURITY.md).
+
+## Forking this for your own use
+
+When you fork, swap these to your own values before cutting a release or
+opening it to outside contributors:
+
+- `LICENSE` — copyright holder name
+- `pyproject.toml` — `authors`, `urls.Homepage`, `urls.Issues`, `urls.Source`
+- `server.json` / `server.yaml` — `homepage`, docker image path
+- `SECURITY.md` — disclosure email and advisory URL
+- `CODE_OF_CONDUCT.md` — contact email
+- `.github/CODEOWNERS` — replace `@cejor6` with your username
+- `.github/ISSUE_TEMPLATE/config.yml` — security advisory URL
+- `README.md` — clone/pull URLs in the install section
+- `DEPLOY.md` — the Render image URL example
+
+Everything else (CI workflows, source code, tests, agent docs) is
+generic by design and does not need editing on fork.
