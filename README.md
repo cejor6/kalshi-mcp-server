@@ -26,8 +26,10 @@ endpoints. This one aims to be:
 - **Hosted-deploy friendly.** Accepts the private key as either a file
   path OR an env var with inline PEM, so it works on platforms without
   filesystem mounts.
-- **Fork-able.** MIT, no personal data, clean Pattern A CI/CD that lets
-  others deploy their own instance without touching yours.
+- **Fork-able.** MIT, no personal data, CI/CD set up so PR contributions
+  flow through `main` without ever triggering a production deploy — only
+  tagged releases (`v*`) do. Your fork's deployment stays decoupled from
+  this repo's, and your fork's contributors can't affect what you run.
 
 ## Install
 
@@ -149,12 +151,21 @@ ATM is — small mistakes shouldn't cost large amounts.
 
 See [AGENTS.md](AGENTS.md) for the full design.
 
-## Self-deployment
+## Deployment
 
-This repo uses **Pattern A** (image-deploy) so that public PRs cannot
-trigger deployments to the maintainer's instance. See
-[DEPLOY.md](DEPLOY.md) for the full setup, with Render as a worked
-example.
+Use it locally as a stdio server (Claude Desktop, Claude Code, Cursor)
+or run it as a remote HTTP MCP behind an OAuth proxy.
+
+For remote deployment, the recommended setup is **image-deploy**: a
+production host (Render, Fly.io, Cloud Run, ECS, anything that supports
+pulling container images) pulls the image that's built and pushed when
+you tag a release (`git tag v0.1.0`). This decouples deployments from
+PR merges — PRs to `main` only ever run tests, never push a new image —
+so a malicious or careless PR cannot affect what's running in your
+container.
+
+See [DEPLOY.md](DEPLOY.md) for the rationale and a worked example with
+Render.
 
 ## Contributing
 

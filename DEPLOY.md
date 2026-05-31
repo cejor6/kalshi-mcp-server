@@ -27,9 +27,11 @@ Pattern A breaks that link:
 - CI runs tests on every PR. **CI never touches your deployment.**
 - A separate `release.yml` workflow builds and pushes a versioned image
   to GHCR. It runs **only on tag push**.
-- Only maintainers can push tags (enforced by branch protection on
-  `main` + protected tags).
-- Render is configured to pull the image, NOT to build from source.
+- Only you (and anyone you explicitly grant push access) can publish
+  tags, because `main` is branch-protected and tag pushes require repo
+  write access.
+- Your production host (Render, etc.) is configured to pull the image,
+  NOT to build from source.
 
 PRs in main → no deploy. `git tag v0.1.0 && git push origin v0.1.0` →
 new image → Render picks it up.
@@ -60,8 +62,12 @@ The `Release` workflow will:
 
 1. **Create a new Web Service** → Source: "Deploy an existing image
    from a registry" (NOT "Connect a Git repo").
-2. **Image URL:** `ghcr.io/cejor6/kalshi-mcp-server:latest` (or a
-   pinned tag like `:v0.1.0` if you don't want automatic updates).
+2. **Image URL:** `ghcr.io/<your-github-username>/kalshi-mcp-server:latest`
+   (or a pinned tag like `:v0.1.0` if you don't want automatic updates).
+   If you're deploying the upstream image without forking, that's
+   `ghcr.io/cejor6/kalshi-mcp-server:latest` — but for any serious
+   deployment you almost certainly want to fork, audit, and publish your
+   own image so you control what code runs.
 3. **Plan:** Starter ($7/mo) is fine for stdio-equivalent traffic.
 4. **Health check:** TCP/port-listen (no HTTP path) — the MCP `/mcp`
    endpoint returns 401/405 to unauthenticated requests, which Render
