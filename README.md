@@ -119,14 +119,36 @@ Every MCP stdio client uses the same shape: a `command` to launch the
 server, optional `args`, optional `env`. The differences are just the
 file/UI where you put the config.
 
-The server isn't on PyPI yet, so there's no globally-installed
-`kalshi-mcp` command on your PATH. The two reliable patterns:
+Three install patterns work — pick whichever fits your environment.
 
-### Pattern A — `uv run` against a local clone (recommended)
+### Pattern A — `pipx install` (cleanest, recommended once published)
 
-Best for users who have [uv](https://docs.astral.sh/uv/) installed
-(common in modern Python workflows). Clone the repo, then point the
-MCP client config at `uv` with `--directory`:
+Installs `kalshi-mcp` to a globally-available, isolated environment.
+[pipx](https://pipx.pypa.io/) is the modern Python tool for this:
+
+```bash
+pipx install kalshi-mcp-server
+```
+
+MCP client config then collapses to:
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "kalshi-mcp",
+      "args": ["--env-file", "/Users/you/.kalshi/.env"]
+    }
+  }
+}
+```
+
+Update with `pipx upgrade kalshi-mcp-server` when you want the latest.
+
+### Pattern B — `uv run` against a local clone
+
+Best if you've cloned the repo and have [uv](https://docs.astral.sh/uv/)
+installed. Point the MCP client at `uv` with `--directory`:
 
 ```json
 {
@@ -144,14 +166,14 @@ MCP client config at `uv` with `--directory`:
 }
 ```
 
-`uv run` activates the project's venv automatically, so dependencies
-work without manual `pip install`. Updating to a new version is `git
-pull` + restart the MCP client.
+`uv run` activates the project's venv automatically. Update with
+`git pull` + restart the MCP client. Useful for development /
+hacking on the server itself.
 
-### Pattern B — Docker against the public image
+### Pattern C — Docker against the public image
 
-Best for users without Python / uv installed, or who'd rather not
-clone. Uses the pre-built public image at GHCR:
+Best for users without Python installed, or who prefer container
+isolation:
 
 ```json
 {
@@ -171,13 +193,9 @@ clone. Uses the pre-built public image at GHCR:
 }
 ```
 
-The `-v` mount bind-mounts your PEM file read-only into the container
-at a fixed path; `KALSHI_PRIVATE_KEY_PATH` points at that path. Secrets
+The `-v` mount bind-mounts your PEM file read-only into the
+container; `KALSHI_PRIVATE_KEY_PATH` points at that path. Secrets
 live in the JSON config — fine for a single-user machine.
-
-> A future release will publish to PyPI, after which `pipx install
-> kalshi-mcp-server` will put `kalshi-mcp` on your global PATH and the
-> config simplifies to just `"command": "kalshi-mcp", "args": [...]`.
 
 ### Where to put this config:
 
