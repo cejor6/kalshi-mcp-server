@@ -54,10 +54,14 @@ docker pull ghcr.io/cejor6/kalshi-mcp-server:latest
 1. Generate a Kalshi API key at https://kalshi.com/account/profile (or
    the demo equivalent at https://demo.kalshi.co/account/profile). Save
    the private key — it is shown ONCE.
-2. Copy `.env.example` to `.env` and fill in the values:
+
+2. Put your secrets in **one** `.env` file. A good location for the
+   MCP-client use case is `~/.kalshi/.env` (outside any repo). For local
+   dev, the repo's own `.env` (gitignored) works too.
 
 ```bash
-cp .env.example .env
+cp .env.example ~/.kalshi/.env
+# edit ~/.kalshi/.env
 ```
 
 3. At minimum, set:
@@ -76,26 +80,38 @@ KALSHI_ALLOW_PROD=1
 KALSHI_TRADING_ENABLED=1   # only if you want writes
 ```
 
+### How env vars are resolved
+
+On startup, the server resolves config in this order (highest wins):
+
+1. **Values already in the process environment** — set in the MCP client
+   config's `env:` block, or exported in your shell.
+2. **`.env` file** — loaded from `--env-file PATH` if you pass that flag,
+   otherwise from `./.env` in the current working directory if it exists.
+   Variables already in the environment from step 1 are **not** overridden.
+
+So you can put secrets either inline in the MCP config (`env:`) or in a
+file the config points at (`--env-file`). You don't need to do both.
+
 ## Use with Claude Desktop / Claude Code / Cursor
 
-Claude Desktop (`claude_desktop_config.json`):
+The cleanest pattern is to keep all your secrets in one `.env` file
+outside any repo and pass `--env-file`:
+
+**Claude Desktop** (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "kalshi": {
       "command": "kalshi-mcp",
-      "env": {
-        "KALSHI_API_KEY_ID": "your-key-id",
-        "KALSHI_PRIVATE_KEY_PATH": "/path/to/your/private_key.pem",
-        "KALSHI_ENV": "demo"
-      }
+      "args": ["--env-file", "/Users/you/.kalshi/.env"]
     }
   }
 }
 ```
 
-Claude Code (project `.mcp.json` or `~/.claude/mcp.json`):
+**Claude Code** (project `.mcp.json` or `~/.claude/mcp.json`):
 
 ```json
 {
@@ -103,6 +119,20 @@ Claude Code (project `.mcp.json` or `~/.claude/mcp.json`):
     "kalshi": {
       "type": "stdio",
       "command": "kalshi-mcp",
+      "args": ["--env-file", "/Users/you/.kalshi/.env"]
+    }
+  }
+}
+```
+
+If you prefer inline env vars in the MCP config (and don't mind them
+sitting in JSON), that works too:
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "kalshi-mcp",
       "env": {
         "KALSHI_API_KEY_ID": "your-key-id",
         "KALSHI_PRIVATE_KEY_PATH": "/path/to/your/private_key.pem",
@@ -112,6 +142,14 @@ Claude Code (project `.mcp.json` or `~/.claude/mcp.json`):
   }
 }
 ```
+
+> **Why not just `.env` in the project dir?** MCP clients spawn the
+> server as a subprocess from their own working directory (typically
+> your home dir on macOS/Linux, the client's install dir on Windows), so
+> a `.env` sitting in this repo wouldn't get found. Hence `--env-file`
+> to point at it explicitly. Local development from the project dir
+> still works without flags — the server auto-loads `./.env` when
+> launched there.
 
 ## Tools (planned)
 

@@ -9,6 +9,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from kalshi_mcp_server import __version__
 from kalshi_mcp_server.auth import KalshiSigner
@@ -57,13 +60,53 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Port when running with --transport http. Defaults to PORT env or 8000.",
     )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a .env file to load before reading config. If omitted, "
+            "we still look for a `.env` in the current working directory; "
+            "set --env-file explicitly when launching from an MCP client "
+            "(Claude Desktop, etc.) so secrets live in a file instead of "
+            "being inlined into the MCP config JSON."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _load_env_file(env_file: Path | None) -> None:
+    """Load a .env file before resolving config.
+
+    - If --env-file was given, load exactly that path (error if missing).
+    - Otherwise, look for a `.env` in CWD and load it if present (no error
+      if absent — running with all env vars already exported is fine).
+
+    Values already in the environment win over .env entries (override=False).
+    """
+    if env_file is not None:
+        if not env_file.exists():
+            raise ConfigError(f"--env-file path does not exist: {env_file}")
+        load_dotenv(env_file, override=False)
+        logger.info("Loaded env from %s", env_file)
+        return
+
+    cwd_env = Path.cwd() / ".env"
+    if cwd_env.exists():
+        load_dotenv(cwd_env, override=False)
+        logger.info("Loaded env from %s", cwd_env)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    # Logging is configured AFTER env load so LOG_LEVEL from .env applies,
+    # but we want to capture the "loaded env from X" message — so set up a
+    # minimal handler first, then re-configure once we know the level.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+
     try:
+        _load_env_file(args.env_file)
         config = Config.from_env()
     except ConfigError as exc:
         sys.stderr.write(f"\nConfig error: {exc}\n\n")
