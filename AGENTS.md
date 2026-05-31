@@ -236,6 +236,23 @@ URI scheme: `kalshi://<noun>[/<id>][/<subresource>]`. Examples:
 
 ---
 
+## Git author identity (recommended, not enforced)
+
+The maintainer uses a **GitHub noreply email** for commits in this
+repo, to keep real email out of public commit metadata. Contributors
+are welcome to follow the same convention but are not required to:
+
+```bash
+# In your fork or local clone, optional:
+git config user.email "NN+USERNAME@users.noreply.github.com"
+```
+
+Find your noreply address at https://github.com/settings/emails
+(enable "Keep my email addresses private"). Whatever email you commit
+under will appear in the public commit log — keep that in mind.
+
+---
+
 ## What NOT to commit
 
 - Real or test `.pem` files. Generate keys on demand in fixtures.
