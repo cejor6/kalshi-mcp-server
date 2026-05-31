@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -155,6 +156,21 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("\nfastmcp is not installed. Run `uv sync` to install dependencies.\n\n")
         return 1
 
+    # Build the OAuth proxy if env vars are present. Stdio doesn't need
+    # auth (the MCP client *is* the operator). HTTP transport without
+    # OAuth is allowed locally but refused on a non-localhost bind — see
+    # _enforce_http_auth_policy below.
+    from kalshi_mcp_server.oauth import (
+        build_auth_provider,
+        build_user_restriction_middleware,
+    )
+
+    auth_provider, storage_desc = build_auth_provider()
+    if auth_provider is not None:
+        logger.info("OAuth: GitHub proxy enabled — DCR client storage: %s", storage_desc)
+    if transport == "http":
+        _enforce_http_auth_policy(auth_provider)
+
     server = FastMCP(
         name="kalshi-mcp-server",
         instructions=(
@@ -162,7 +178,13 @@ def main(argv: list[str] | None = None) -> int:
             f"Connected to {config.env.upper()}. "
             f"Trading {'enabled' if config.trading_enabled else 'DISABLED (read-only)'}."
         ),
+        auth=auth_provider,
     )
+
+    user_restrict = build_user_restriction_middleware()
+    if user_restrict is not None:
+        server.add_middleware(user_restrict)
+        logger.info("OAuth: tool calls restricted to GitHub logins in MCP_ALLOWED_GITHUB_LOGINS")
 
     # Hold references so they aren't GC'd, and so tool modules can import them.
     server._kalshi_signer = signer  # type: ignore[attr-defined]
@@ -183,6 +205,49 @@ def main(argv: list[str] | None = None) -> int:
     else:
         server.run(transport="http", port=port)
     return 0
+
+
+def _enforce_http_auth_policy(auth_provider) -> None:
+    """Fail closed when --transport http is used without OAuth configured.
+
+    HTTP exposes the server's tool surface over a network — without OAuth
+    + an allowlist, anyone who can reach the port can place trades. This
+    check refuses to start the server unless either:
+
+    - OAuth is configured (GITHUB_CLIENT_ID/SECRET + MCP_BASE_URL +
+      MCP_ALLOWED_GITHUB_LOGINS), OR
+    - The operator explicitly opts out via MCP_ALLOW_INSECURE_HTTP=1
+      (use case: local dev where you're hitting localhost yourself).
+    """
+    if auth_provider is not None:
+        # If OAuth is enabled, the allowlist is also required (otherwise
+        # any GitHub user could call tools — see RestrictGitHubUsersMiddleware).
+        if not os.environ.get("MCP_ALLOWED_GITHUB_LOGINS", "").strip():
+            raise ConfigError(
+                "OAuth is configured but MCP_ALLOWED_GITHUB_LOGINS is empty. "
+                "Set it to your GitHub login (comma-separated for multiple) "
+                "to lock tool calls to specific users."
+            )
+        return
+
+    if os.environ.get("MCP_ALLOW_INSECURE_HTTP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        logger.warning(
+            "HTTP transport without OAuth — MCP_ALLOW_INSECURE_HTTP is set. "
+            "DO NOT use this configuration for any non-localhost deployment."
+        )
+        return
+
+    raise ConfigError(
+        "HTTP transport requires OAuth configuration. Set GITHUB_CLIENT_ID, "
+        "GITHUB_CLIENT_SECRET, MCP_BASE_URL, and MCP_ALLOWED_GITHUB_LOGINS — "
+        "or set MCP_ALLOW_INSECURE_HTTP=1 if this is local dev only. "
+        "See DEPLOY.md for the production deployment guide."
+    )
 
 
 if __name__ == "__main__":
