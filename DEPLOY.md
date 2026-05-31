@@ -1,16 +1,33 @@
 # Deployment guide
 
 This guide walks you end-to-end through deploying `kalshi-mcp-server`
-as a remote MCP service for **claude.ai** (custom connector / Routines)
-or any other client that speaks Streamable HTTP MCP.
+as a remote, OAuth-protected MCP service that any MCP client
+supporting [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http)
++ OAuth 2.1 can connect to.
 
 Estimated time start-to-finish: **~20 minutes** of clicks + waits.
 
-If you only want to use the server locally as a stdio MCP (Claude
-Desktop, Claude Code, Cursor on your own machine), see
-[README.md](README.md) — you don't need any of this. Local stdio is
-just `kalshi-mcp --env-file ~/.kalshi/.env`. No hosting, no OAuth,
-no public URL.
+## Pick your path before reading further
+
+Three legitimate ways to run this server, with very different setup
+requirements:
+
+| You want to... | Path | Setup time |
+|---|---|---|
+| Use it from your **own machine** with a local MCP client (Claude Desktop, Cursor, Zed, Continue, Cline, Goose, etc.) | **Local stdio** — see [README.md](README.md). No hosting, no OAuth, no public URL needed. Just `kalshi-mcp --env-file ~/.kalshi/.env`. | ~3 min |
+| Use it from **claude.ai** (custom connector, Routines) — or any future client that needs remote OAuth MCP | **Remote with OAuth** — the rest of this guide | ~20 min |
+| Run a remote instance for **yourself only** without OAuth (a private VPN like Tailscale, a personal Cloud Run with IAM, or `MCP_ALLOW_INSECURE_HTTP=1` behind your own ingress auth) | **Remote without OAuth** — covered briefly in [Operational notes](#operational-notes) | Varies |
+
+> ⚠️ Don't deploy this server with `MCP_ALLOW_INSECURE_HTTP=1` on a
+> public URL. The flag exists for local dev + properly-isolated
+> private networks. An unauthenticated MCP server with trading
+> credentials reachable on the public internet is a footgun the
+> server explicitly refuses unless you opt in.
+
+The walkthrough below assumes you picked the **remote with OAuth**
+path. The example client is claude.ai because that's the major MCP
+client today that requires OAuth-protected HTTP — the same setup
+works for any future client that adopts the same transport + auth.
 
 ---
 
@@ -20,7 +37,7 @@ no public URL.
                  OAuth 2.1 + PKCE
    claude.ai ────────────────────────► https://<your-host>.onrender.com/mcp
    (or any                                          │
-    OAuth MCP                                       │  HTTPS + RSA-PSS signed
+    OAuth-MCP                                       │  HTTPS + RSA-PSS signed
     client)                                         ▼
                                             api.kalshi.com or
                                             demo-api.kalshi.co
@@ -29,7 +46,8 @@ no public URL.
 A single Render web service running the published Docker image, with:
 
 - **OAuth proxy** (GitHub provider) in front of the MCP endpoint —
-  required because claude.ai's custom-connector form only supports OAuth.
+  required for any MCP client that can't speak stdio and needs
+  OAuth-protected HTTP (claude.ai is the primary one today).
 - **`MCP_ALLOWED_GITHUB_LOGINS` allowlist** — only specific GitHub
   accounts can invoke tools, even after a successful OAuth.
 - **Upstash Redis** (free tier) for Dynamic Client Registration
@@ -105,9 +123,12 @@ to wire this up.
 
 ## Quick start — end-to-end checklist
 
-These 9 steps take you from zero to a working claude.ai connector. Some
-of the earliest steps (Kalshi key, GitHub OAuth App) can be done in
-parallel if you want, but the order below is the dependency order.
+These 9 steps take you from zero to a working remote MCP service —
+configured to connect from claude.ai (the demonstration client) but
+usable from any future MCP client that supports OAuth-protected
+Streamable HTTP. Some of the earliest steps (Kalshi key, GitHub
+OAuth App) can be done in parallel if you want, but the order below
+is the dependency order.
 
 ### 1. Generate a Kalshi RSA keypair on your machine
 
@@ -351,23 +372,33 @@ curl -s https://kalshi-mcp-XXXX.onrender.com/.well-known/oauth-authorization-ser
 # Expected: OAuth metadata JSON with issuer, endpoints, DCR support
 ```
 
-### 8. Connect from claude.ai
+### 8. Connect from a remote MCP client
+
+Walkthrough below uses **claude.ai** as the concrete example. Any
+MCP client supporting OAuth-protected Streamable HTTP follows the
+same pattern — point it at `<MCP_BASE_URL>/mcp`, leave Client ID +
+Secret blank (Dynamic Client Registration handles them), complete
+the GitHub OAuth flow.
+
+**claude.ai:**
 
 1. https://claude.ai → **Settings** → **Connectors**
 2. **+ Add custom connector**
 3. **Name:** anything (e.g. `Kalshi MCP`)
 4. **Remote MCP server URL:** `https://kalshi-mcp-XXXX.onrender.com/mcp`
 5. Leave **OAuth Client ID** and **OAuth Client Secret** **blank** —
-   the server advertises Dynamic Client Registration, so claude.ai
+   the server advertises Dynamic Client Registration, so the client
    self-registers.
 6. **Add**
 
-claude.ai opens a tab to GitHub: *"Authorize Kalshi MCP (demo)"* (your
-App name). Click **Authorize** as the GitHub user in your allowlist.
+The client opens a tab to GitHub: *"Authorize Kalshi MCP (demo)"*
+(your OAuth App name). Click **Authorize** as the GitHub user in your
+allowlist.
 
 GitHub redirects to `https://kalshi-mcp-XXXX.onrender.com/auth/callback`,
-the proxy completes the token exchange, hands a JWT back to claude.ai.
-The connector page shows **Connected** with the full tool list (26 tools).
+the proxy completes the token exchange, hands a JWT back to the
+client. The connector page shows **Connected** with the full tool
+list (26 tools).
 
 ### 9. Verify with a few tool calls
 
@@ -504,10 +535,11 @@ own claude.ai → GitHub OAuth flow.
 
 ## Local stdio use (not Render)
 
-You don't need Render at all if you only want to use the server locally
-with Claude Desktop, Claude Code, or Cursor. Local stdio doesn't need
-OAuth, doesn't need a public URL, doesn't need Upstash. See
-[README.md](README.md) for the local config — short version:
+You don't need Render at all if you only want to use the server
+locally with an MCP stdio client (Claude Desktop, Claude Code,
+Cursor, Zed, Continue, Cline, Goose, or any other). Local stdio
+doesn't need OAuth, doesn't need a public URL, doesn't need Upstash.
+See [README.md](README.md) for the local config — short version:
 
 ```json
 {
@@ -568,6 +600,34 @@ already designed to handle a missing hook gracefully.
 just prints a message and exits 0. Useful for forkers running on
 Fly.io / Cloud Run / a different Render account / etc. — your release
 pipeline doesn't break just because you don't have this configured.
+
+### Remote hosting without OAuth (advanced)
+
+OAuth is the canonical path for remote MCP because it's what claude.ai
+and any other modern OAuth-MCP client expects. But there are legitimate
+"remote without OAuth" setups for personal use:
+
+- **Private network only** — host the server on Tailscale, WireGuard,
+  ZeroTier, or a Cloudflare Tunnel with Access. The MCP endpoint has
+  no public URL; only your devices on the VPN can reach it. Run with
+  `MCP_TRANSPORT=http` and `MCP_ALLOW_INSECURE_HTTP=1`. Safe because
+  network-layer auth handles access control.
+- **Reverse proxy with separate auth** — Caddy with `basic_auth`,
+  nginx with mTLS, a custom auth proxy. The MCP server itself runs
+  without auth (`MCP_ALLOW_INSECURE_HTTP=1`) on a localhost port; the
+  proxy handles the public auth layer. Useful if you have an existing
+  SSO setup you'd rather reuse.
+- **Cloud-IAM-protected service** — Cloud Run with IAM, ECS behind an
+  ALB with Cognito, etc. Same idea: cloud provider handles auth; the
+  MCP server is unauthenticated behind it.
+
+> ⚠️ **Don't combine `MCP_ALLOW_INSECURE_HTTP=1` with a directly
+> public URL.** The fail-closed startup check exists exactly to
+> prevent this. The flag is there for the configurations above where
+> something else handles access — never as a substitute.
+
+For a personal, claude.ai-only use case, none of this is worth the
+effort. Stick with the documented OAuth + Render path above.
 
 ### Pre-known URL trick
 

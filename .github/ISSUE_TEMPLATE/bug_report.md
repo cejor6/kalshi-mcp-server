@@ -26,7 +26,8 @@ Minimal steps to reproduce. Include:
 - Python version:
 - OS:
 - `KALSHI_ENV` (demo / prod):
-- MCP client (Claude Desktop / Claude Code / Cursor / other):
+- MCP client (which app — Claude Desktop, Claude Code, Cursor, Zed, Continue, claude.ai, other):
+- Transport (stdio or HTTP):
 
 ## Logs
 
