@@ -15,8 +15,10 @@ from dotenv import load_dotenv
 
 from kalshi_mcp_server import __version__
 from kalshi_mcp_server.auth import KalshiSigner
+from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import Config
 from kalshi_mcp_server.errors import ConfigError, KalshiMCPError
+from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import SafetyController
 
 logger = logging.getLogger("kalshi_mcp_server")
@@ -131,6 +133,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         signer = _build_signer(config)
         safety = SafetyController(config)
+        # Default to Basic-tier limits. Once we expose
+        # `kalshi_get_api_limits`, the server can query /account/limits at
+        # boot and swap to live values — for now Basic is safest because
+        # it under-promises (rate limiter blocks before we'd hit Kalshi's
+        # real ceiling).
+        rate_limiter = KalshiRateLimiter(TierLimits.basic())
+        client = KalshiClient(
+            config=config,
+            signer=signer,
+            rate_limiter=rate_limiter,
+        )
     except KalshiMCPError as exc:
         sys.stderr.write(f"\nStartup failed: {exc}\n\n")
         return 2
@@ -155,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     server._kalshi_signer = signer  # type: ignore[attr-defined]
     server._kalshi_config = config  # type: ignore[attr-defined]
     server._kalshi_safety = safety  # type: ignore[attr-defined]
+    server._kalshi_rate_limiter = rate_limiter  # type: ignore[attr-defined]
+    server._kalshi_client = client  # type: ignore[attr-defined]
 
     # Register tools (none yet — landing in subsequent commits).
     from kalshi_mcp_server.tools import register_all_tools
