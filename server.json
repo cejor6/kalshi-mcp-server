@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/servers/main/schema/server.json",
   "name": "kalshi-mcp-server",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Model Context Protocol server for Kalshi prediction markets — native RSA-PSS auth, token-bucket rate limiting, demo/prod safety controls.",
   "homepage": "https://github.com/cejor6/kalshi-mcp-server",
   "license": "MIT",
