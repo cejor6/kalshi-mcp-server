@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/cejor6/kalshi-mcp-server/security/advisories/new
+    about: Report a security issue privately. Do NOT file a public issue for vulnerabilities.
+  - name: Kalshi API question
+    url: https://docs.kalshi.com
+    about: Questions about Kalshi's API itself (not this MCP server) belong in Kalshi's Discord or docs.

@@ -1,0 +1,50 @@
+# Pre-commit hooks — first line of defense against committing secrets,
+# broken syntax, or unformatted code.
+#
+# Install once per clone:
+#   uv run pre-commit install
+#
+# Run on all files (CI does this too):
+#   uv run pre-commit run --all-files
+
+repos:
+  # ---- Built-in hygiene ---------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: mixed-line-ending
+
+  # ---- Secret scanning ----------------------------------------------------
+  # detect-secrets is the primary line of defense. It uses .secrets.baseline
+  # to ignore known false positives (committed test vectors, example PEMs,
+  # etc.). Update the baseline only with full review:
+  #   uv run detect-secrets scan --baseline .secrets.baseline
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: |
+          (?x)^(
+            \.secrets\.baseline|
+            tests/fixtures/.*\.pem|
+            tests/test_auth\.py
+          )$
+
+  # ---- Lint + format (ruff handles both) ----------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.0
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format

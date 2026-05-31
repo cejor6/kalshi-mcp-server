@@ -1,0 +1,18 @@
+# Enforce LF line endings across platforms.
+# Without this, Windows clones get CRLF in checkouts and diffs are noisy.
+* text=auto eol=lf
+
+# Binary files should never be converted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+
+# Lock files are technically text but rewriting them creates churn.
+uv.lock      text eol=lf
+package-lock.json text eol=lf

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Bash(uv add *)",
+      "Bash(uv lock)",
+      "Bash(uv python install *)",
+      "Bash(uv venv *)",
+      "Bash(uvx *)",
+      "Bash(uv tool *)",
+      "Bash(pre-commit run *)",
+      "Bash(pre-commit install)",
+      "Bash(ruff check *)",
+      "Bash(ruff format *)",
+      "Bash(pytest *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(git add *)",
+      "Bash(git restore *)",
+      "Bash(gh pr list *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr diff *)",
+      "Bash(gh issue list *)",
+      "Bash(gh issue view *)",
+      "Bash(gh api *)",
+      "Bash(docker build *)",
+      "Bash(docker image *)",
+      "Bash(docker images)",
+      "Read(*)",
+      "Glob(*)",
+      "Grep(*)"
+    ],
+    "ask": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git tag *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh release *)",
+      "Bash(docker push *)",
+      "Bash(docker run *)"
+    ],
+    "deny": [
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard *)",
+      "Bash(gh api * --method DELETE)",
+      "Bash(rm -rf *)"
+    ]
+  },
+  "env": {
+    "KALSHI_ENV": "demo",
+    "KALSHI_ALLOW_PROD": "0",
+    "KALSHI_TRADING_ENABLED": "0"
+  }
+}
