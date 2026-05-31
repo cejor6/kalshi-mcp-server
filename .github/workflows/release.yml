@@ -75,3 +75,28 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
+
+      # Trigger Render to pull the newly-published `:latest` image.
+      # Render's image-deploy services do NOT auto-poll GHCR on a useful
+      # cadence — without this step, you'd have to click "Manual Deploy"
+      # in Render's UI after every tag push. The deploy hook URL is a
+      # write-only secret on the GitHub side (set in repo Settings →
+      # Secrets → Actions as RENDER_DEPLOY_HOOK_URL). The URL is passed
+      # only via env so GitHub's secret-masking covers any leak path.
+      #
+      # If RENDER_DEPLOY_HOOK_URL is unset (forkers without a Render
+      # service, or running with a different host), the step skips
+      # cleanly — non-Render forkers don't see a failed workflow.
+      - name: Trigger Render deploy
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL not configured — skipping (no auto-redeploy)."
+            exit 0
+          fi
+          echo "Triggering Render redeploy via deploy hook..."
+          curl --fail --silent --show-error --output /dev/null \
+            -X POST -H "Content-Type: application/json" \
+            "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render deploy hook fired successfully."

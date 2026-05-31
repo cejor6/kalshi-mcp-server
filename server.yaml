@@ -1,6 +1,6 @@
 # Same metadata as server.json, in YAML for registries that prefer it.
 name: kalshi-mcp-server
-version: 0.1.3
+version: 0.1.4
 description: |
   Model Context Protocol server for Kalshi prediction markets — native
   RSA-PSS auth, token-bucket rate limiting, demo/prod safety controls.
