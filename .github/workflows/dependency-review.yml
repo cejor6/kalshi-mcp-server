@@ -18,11 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
-        # `continue-on-error` because dependency-review requires GitHub
-        # Advanced Security on private repos (free on public). While
-        # private, it can't run; once public, it works automatically and
-        # this line can be dropped to make findings blocking.
-        continue-on-error: true
         with:
           fail-on-severity: high
           comment-summary-in-pr: on-failure

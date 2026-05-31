@@ -40,13 +40,5 @@ jobs:
           languages: ${{ matrix.language }}
           queries: security-and-quality
       - uses: github/codeql-action/analyze@v3
-        # `continue-on-error` because the SARIF upload requires the
-        # GitHub "code scanning" feature, which is free on public repos
-        # and gated behind Advanced Security on private repos. While
-        # private, the analysis still runs (you can see findings in the
-        # workflow logs) but the upload fails — that shouldn't break CI.
-        # When the repo flips public, drop this line to make the upload
-        # mandatory.
-        continue-on-error: true
         with:
           category: "/language:${{ matrix.language }}"
