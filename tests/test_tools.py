@@ -84,12 +84,23 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_get_events",
         "kalshi_get_series",
         "kalshi_get_trades",
+        # market_data.py
+        "kalshi_get_orderbook",
+        "kalshi_get_market_candlesticks",
+        "kalshi_get_event_candlesticks",
+        "kalshi_get_market_trades",
         # portfolio.py
         "kalshi_get_balance",
         "kalshi_get_positions",
         "kalshi_get_orders",
         "kalshi_get_fills",
         "kalshi_get_settlements",
+        # orders.py
+        "kalshi_prepare_order",
+        "kalshi_confirm_order",
+        "kalshi_cancel_order",
+        "kalshi_decrease_order",
+        "kalshi_get_order",
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"
