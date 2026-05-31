@@ -4,9 +4,9 @@ A Model Context Protocol server for [Kalshi](https://kalshi.com)
 prediction markets. Native RSA-PSS auth, token-bucket rate limiting,
 demo/prod safety controls.
 
-> **Status — alpha.** Auth, rate-limiting, config, and safety scaffolding
-> are in place. Tools land in subsequent commits. Designed to be forked
-> and deployed.
+> **Status — alpha.** Auth, rate limiting, safety controls, REST client,
+> 24 tools, and 4 resources are in place. WebSocket / live-orderbook
+> resources are planned for v0.2.
 
 ---
 
@@ -151,28 +151,32 @@ sitting in JSON), that works too:
 > still works without flags — the server auto-loads `./.env` when
 > launched there.
 
-## Tools (planned)
+## Tools
 
-Coming in subsequent commits. The intended v0.1 surface:
+| Group | Tools |
+|---|---|
+| Exchange / account | `kalshi_get_exchange_status`, `kalshi_get_exchange_schedule`, `kalshi_get_api_limits`, `kalshi_get_environment` |
+| Discovery | `kalshi_get_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_trades` |
+| Market data | `kalshi_get_orderbook`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_market_trades` |
+| Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
+| Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
 
-| Group        | Tools |
-|--------------|-------|
-| Discovery    | `kalshi_search_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_series`, `kalshi_resolve_ticker` |
-| Market data  | `kalshi_get_orderbook`, `kalshi_get_candlesticks`, `kalshi_get_trades` |
-| Portfolio    | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_fills`, `kalshi_get_settlements` |
-| Orders       | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_amend_order` |
-| Account      | `kalshi_get_api_limits`, `kalshi_get_exchange_status` |
+Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
+local safety checks and returns a `confirmation_id`; nothing is sent to
+Kalshi until you call `kalshi_confirm_order` with that token. Cancel and
+decrease bypass the trading-enabled flag — they only reduce exposure.
 
-## Resources (planned)
+## Resources
 
 | URI | Description |
 |---|---|
-| `kalshi://environment` | Current env, tier, rate-limit headroom |
-| `kalshi://balance` | Cash + portfolio value |
-| `kalshi://positions` | Open positions |
-| `kalshi://orders/open` | Resting orders |
-| `kalshi://markets/{ticker}` | Single market snapshot |
-| `kalshi://markets/{ticker}/orderbook` | Live (WS-backed) orderbook |
+| `kalshi://environment` | Current env, safety caps, rate-limit headroom (no API call) |
+| `kalshi://balance` | Cash + buying power |
+| `kalshi://positions` | Open positions (unsettled) |
+| `kalshi://orders` | Resting orders (open / partially filled) |
+
+WebSocket-backed live resources (`kalshi://markets/{ticker}/orderbook`)
+are planned for v0.2.
 
 ## Safety model
 
@@ -218,7 +222,3 @@ few rules around auth changes, secret hygiene, and test conventions.
 
 - [FastMCP](https://github.com/jlowin/fastmcp) — MCP framework.
 - [Kalshi](https://docs.kalshi.com) — the underlying API.
-- Prior art that informed the design:
-  [yakub268/kalshi-mcp](https://github.com/yakub268/kalshi-mcp),
-  [alexandermazza/kalshi-trading-mcp](https://github.com/alexandermazza/kalshi-trading-mcp),
-  [joinQuantish/kalshi-mcp](https://github.com/joinQuantish/kalshi-mcp).
