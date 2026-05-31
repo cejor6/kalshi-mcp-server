@@ -1,51 +1,109 @@
 {
-  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/servers/main/schema/server.json",
-  "name": "kalshi-mcp-server",
-  "version": "0.1.7",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cejor6/kalshi-mcp-server",
+  "title": "Kalshi Prediction Markets",
   "description": "Model Context Protocol server for Kalshi prediction markets — native RSA-PSS auth, token-bucket rate limiting, demo/prod safety controls.",
-  "homepage": "https://github.com/cejor6/kalshi-mcp-server",
-  "license": "MIT",
-  "runtimes": [
+  "repository": {
+    "url": "https://github.com/cejor6/kalshi-mcp-server",
+    "source": "github"
+  },
+  "version": "0.1.8",
+  "packages": [
     {
-      "type": "python",
-      "package": "kalshi-mcp-server",
-      "entrypoint": "kalshi-mcp",
-      "min_python": "3.11"
+      "registryType": "pypi",
+      "identifier": "kalshi-mcp-server",
+      "version": "0.1.8",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KALSHI_API_KEY_ID",
+          "description": "Kalshi API key ID from https://kalshi.com/account/profile",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_PRIVATE_KEY_PATH",
+          "description": "Filesystem path to the RSA private key PEM. Set this or KALSHI_PRIVATE_KEY_PEM.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_PRIVATE_KEY_PEM",
+          "description": "Inline PEM contents, for hosted deploys without filesystem access.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "KALSHI_ENV",
+          "description": "demo or prod. Defaults to demo for safety.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_ALLOW_PROD",
+          "description": "Must be 1 for the server to start with KALSHI_ENV=prod. Defaults to 0.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_TRADING_ENABLED",
+          "description": "Must be 1 for order-placement tools to operate. Read-only by default (0).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
     },
     {
-      "type": "docker",
-      "image": "ghcr.io/cejor6/kalshi-mcp-server",
-      "tag": "latest"
+      "registryType": "oci",
+      "identifier": "ghcr.io/cejor6/kalshi-mcp-server:0.1.8",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KALSHI_API_KEY_ID",
+          "description": "Kalshi API key ID from https://kalshi.com/account/profile",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_PRIVATE_KEY_PEM",
+          "description": "Inline PEM contents, for hosted deploys without filesystem access.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "KALSHI_ENV",
+          "description": "demo or prod. Defaults to demo for safety.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_ALLOW_PROD",
+          "description": "Must be 1 for the server to start with KALSHI_ENV=prod. Defaults to 0.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KALSHI_TRADING_ENABLED",
+          "description": "Must be 1 for order-placement tools to operate. Read-only by default (0).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
     }
-  ],
-  "transports": ["stdio", "http"],
-  "env": {
-    "KALSHI_API_KEY_ID": {
-      "required": true,
-      "description": "Kalshi API key ID from https://kalshi.com/account/profile"
-    },
-    "KALSHI_PRIVATE_KEY_PATH": {
-      "required": false,
-      "description": "Filesystem path to the RSA private key PEM file. Set either this or KALSHI_PRIVATE_KEY_PEM."
-    },
-    "KALSHI_PRIVATE_KEY_PEM": {
-      "required": false,
-      "description": "Inline PEM contents (for hosted deploys without filesystem access)."
-    },
-    "KALSHI_ENV": {
-      "required": false,
-      "default": "demo",
-      "description": "demo or prod. Defaults to demo for safety."
-    },
-    "KALSHI_ALLOW_PROD": {
-      "required": false,
-      "default": "0",
-      "description": "Must be 1 for the server to start with KALSHI_ENV=prod."
-    },
-    "KALSHI_TRADING_ENABLED": {
-      "required": false,
-      "default": "0",
-      "description": "Must be 1 for order-placement tools to operate. Read-only by default."
-    }
-  }
+  ]
 }

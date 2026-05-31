@@ -33,6 +33,11 @@ RUN uv pip install --no-cache ".[oauth]"
 # Stage 2 — slim runtime image.
 FROM python:3.14-slim-bookworm AS runtime
 
+# MCP Registry ownership verification: the registry confirms this image
+# belongs to the io.github.cejor6/* namespace by reading this annotation.
+# It MUST match the `name` field in server.json.
+LABEL io.modelcontextprotocol.server.name="io.github.cejor6/kalshi-mcp-server"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"

@@ -1,5 +1,7 @@
 # kalshi-mcp-server
 
+<!-- mcp-name: io.github.cejor6/kalshi-mcp-server -->
+
 [![CI](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
