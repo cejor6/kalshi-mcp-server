@@ -4,9 +4,10 @@ A Model Context Protocol server for [Kalshi](https://kalshi.com)
 prediction markets. Native RSA-PSS auth, token-bucket rate limiting,
 demo/prod safety controls.
 
-> **Status — alpha.** Auth, rate limiting, safety controls, REST client,
-> 24 tools, and 4 resources are in place. WebSocket / live-orderbook
-> resources are planned for v0.2.
+> **Status — alpha.** Auth (REST + WS), rate limiting, safety controls,
+> 26 tools across REST + live channels, and 4 resources are in place.
+> A long-lived multiplexed WebSocket session and `kalshi://markets/{ticker}/orderbook`
+> live resource are planned for v0.2.
 
 ---
 
@@ -160,6 +161,7 @@ sitting in JSON), that works too:
 | Market data | `kalshi_get_orderbook`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_market_trades` |
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
+| Live (WebSocket) | `kalshi_get_live_orderbook`, `kalshi_sample_trades` |
 
 Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
 local safety checks and returns a `confirmation_id`; nothing is sent to
@@ -175,8 +177,10 @@ decrease bypass the trading-enabled flag — they only reduce exposure.
 | `kalshi://positions` | Open positions (unsettled) |
 | `kalshi://orders` | Resting orders (open / partially filled) |
 
-WebSocket-backed live resources (`kalshi://markets/{ticker}/orderbook`)
-are planned for v0.2.
+A WebSocket-backed live-orderbook resource (`kalshi://markets/{ticker}/orderbook`)
+is planned — for now, use the `kalshi_get_live_orderbook` tool which
+opens a transient WS, samples the book, and returns the current
+snapshot + delta arrival rate.
 
 ## Safety model
 

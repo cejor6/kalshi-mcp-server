@@ -101,6 +101,9 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_cancel_order",
         "kalshi_decrease_order",
         "kalshi_get_order",
+        # live.py (WebSocket-backed)
+        "kalshi_get_live_orderbook",
+        "kalshi_sample_trades",
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"
