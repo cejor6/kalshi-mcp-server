@@ -98,6 +98,9 @@ audit/
 *.sqlite
 *.sqlite3
 *.db
+# Cygwin / Git Bash crash dumps — get spat into CWD when a child exits
+# abnormally on Windows. Never want these in commits.
+*.stackdump
 
 # -- Local data / fixtures with possibly-sensitive content -----------------
 data/local/

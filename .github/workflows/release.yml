@@ -100,3 +100,36 @@ jobs:
             -X POST -H "Content-Type: application/json" \
             "$RENDER_DEPLOY_HOOK_URL"
           echo "Render deploy hook fired successfully."
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # PyPI Trusted Publishing (configured at
+    # https://pypi.org/manage/project/kalshi-mcp-server/settings/publishing/)
+    # uses OIDC to authenticate this workflow — no token secret needed.
+    # The id-token: write permission lets the runner request an OIDC
+    # token; PyPI's `pypa/gh-action-pypi-publish` action sends it and
+    # PyPI verifies it matches the configured workflow.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # `skip-existing: true` makes the step idempotent on
+          # workflow_dispatch reruns — if v0.1.x is already on PyPI,
+          # the step succeeds without re-uploading. Safer than letting
+          # it 400 on a duplicate version.
+          skip-existing: true
