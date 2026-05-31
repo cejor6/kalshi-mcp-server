@@ -24,7 +24,11 @@ COPY src ./src
 RUN uv venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
-RUN uv pip install --no-cache .
+# Install with [oauth] extras so the OAuth proxy (FastMCP GitHubProvider
+# + Redis-backed DCR store) works out of the box on hosted deploys. The
+# extras add ~6MB to the image — worth it to avoid silent crashes when
+# MCP_REDIS_URL is set on a deployment.
+RUN uv pip install --no-cache ".[oauth]"
 
 # Stage 2 — slim runtime image.
 FROM python:3.14-slim-bookworm AS runtime
