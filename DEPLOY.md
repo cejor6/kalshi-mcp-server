@@ -122,23 +122,64 @@ To allow writes:
 
 ---
 
-## OAuth proxy (for remote MCP deployment)
+## OAuth proxy (for claude.ai remote MCP)
 
-If you're exposing the server as a remote MCP for a Claude.ai connector
-or similar, you need an OAuth proxy in front of it — claude.ai's custom
-connector form only supports OAuth, not static bearer tokens.
+If you're exposing this server as a remote MCP for a claude.ai custom
+connector or a Routine, you need an OAuth proxy in front of it —
+claude.ai's connector form only supports OAuth, not static bearer
+tokens.
 
-This is **deliberately not bundled** into the server itself. Patterns
-that work:
+**The proxy is now bundled.** Install with the `[oauth]` extras (already
+included in the published Docker image) and configure it via env vars.
+Local stdio use does not need any of this and ignores the OAuth vars
+entirely.
 
-- **FastMCP `OAuthProxy` + `GitHubProvider`** running in the same
-  container, restricting tool calls by GitHub login. This is what the
-  Alpaca MCP setup uses; see that repo's `DEPLOY.md` for reference.
-- **A separate reverse proxy** (Caddy, nginx) doing OAuth2 in front of
-  this server.
+### Required env vars when running with OAuth
 
-If you go the FastMCP `OAuthProxy` route, your wrapper repo can wrap
-this image and add the proxy module — no need to fork the upstream.
+| Key | Purpose |
+|---|---|
+| `MCP_TRANSPORT=http` | Switch from stdio to HTTP |
+| `GITHUB_CLIENT_ID` | OAuth App Client ID — github.com → Settings → Developer settings → OAuth Apps |
+| `GITHUB_CLIENT_SECRET` | OAuth App Client Secret (shown once at creation) |
+| `MCP_BASE_URL` | Public URL of the server (no trailing slash). e.g. `https://kalshi-mcp-XXXX.onrender.com` |
+| `MCP_ALLOWED_GITHUB_LOGINS` | Comma-separated GitHub logins permitted to invoke tools (e.g. just `cejor6`) |
+
+### Strongly recommended
+
+| Key | Purpose |
+|---|---|
+| `MCP_JWT_SIGNING_KEY` | 64-byte URL-safe random — signs proxy-issued JWTs; keep stable across restarts so claude.ai tokens survive redeploys. Generate with `python -c "import secrets; print(secrets.token_urlsafe(64))"` |
+| `MCP_REDIS_URL` | `rediss://default:<password>@<host>.upstash.io:6379` — persistent DCR client store. Without it, every redeploy boots claude.ai out and forces a reconnect. Free Upstash tier is sufficient. |
+
+### Fail-closed behavior
+
+If `MCP_TRANSPORT=http` is set without OAuth configuration, the server
+**refuses to start**. This is by design — an unauthenticated trade
+server reachable over HTTP is a footgun. The override
+`MCP_ALLOW_INSECURE_HTTP=1` exists for local-only dev (e.g. testing
+http transport on localhost) but should never be used for a
+non-localhost deploy.
+
+### GitHub OAuth App callback URL
+
+When you register the OAuth App at github.com → Settings → Developer
+settings → OAuth Apps, set:
+
+- **Homepage URL:** your `MCP_BASE_URL`
+- **Authorization callback URL:** `<MCP_BASE_URL>/auth/callback`
+
+### Connecting from claude.ai
+
+claude.ai → Settings → Connectors → **+ Add custom connector**:
+
+- **Name:** any (e.g. `Kalshi MCP (demo)`)
+- **Remote MCP server URL:** `<MCP_BASE_URL>/mcp`
+- **Advanced settings:** leave OAuth Client ID and Secret **blank** —
+  the server advertises Dynamic Client Registration (DCR), so claude.ai
+  will self-register a client.
+
+Click Add → GitHub OAuth screen → Authorize → land back in claude.ai →
+the connector shows "Connected" with the tool list visible.
 
 ---
 
