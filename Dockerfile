@@ -52,3 +52,9 @@ ENV MCP_TRANSPORT=stdio \
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/bin/tini", "--", "kalshi-mcp"]
+# CMD provides default args appended to ENTRYPOINT. For containerized
+# HTTP serving we MUST bind to 0.0.0.0 — the CLI's default 127.0.0.1
+# is safe for local dev but means Render/Cloud Run/etc. can't route
+# external traffic to the container. Override at runtime by passing
+# `docker run ... --host 127.0.0.1` if you want localhost-only.
+CMD ["--host", "0.0.0.0"]

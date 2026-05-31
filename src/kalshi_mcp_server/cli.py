@@ -64,6 +64,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Port when running with --transport http. Defaults to PORT env or 8000.",
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help=(
+            "Host to bind on with --transport http. Defaults to 127.0.0.1 "
+            "(safe for local dev). The published Docker image overrides "
+            "this to 0.0.0.0 via CMD so containerized deployments work "
+            "without any extra config."
+        ),
+    )
+    parser.add_argument(
         "--env-file",
         type=Path,
         default=None,
@@ -203,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     if transport == "stdio":
         server.run(transport="stdio")
     else:
-        server.run(transport="http", port=port)
+        logger.info("HTTP bind: %s:%s", args.host, port)
+        server.run(transport="http", host=args.host, port=port)
     return 0
 
 
