@@ -4,6 +4,12 @@ A Model Context Protocol server for [Kalshi](https://kalshi.com)
 prediction markets. Native RSA-PSS auth, token-bucket rate limiting,
 demo/prod safety controls.
 
+> ⚠️ **This software lets an LLM place trades. Read [DISCLAIMER.md](DISCLAIMER.md)
+> before deploying.** Trading prediction markets involves substantial
+> risk of loss. AI agents make mistakes — sometimes confidently. The
+> authors are not liable for any losses. Test in demo (`KALSHI_ENV=demo`,
+> `KALSHI_TRADING_ENABLED=0`) until you understand the failure modes.
+
 > **Status — alpha.** Auth (REST + WS), rate limiting, safety controls,
 > 26 tools across REST + live channels, and 4 resources are in place.
 > A long-lived multiplexed WebSocket session and `kalshi://markets/{ticker}/orderbook`
@@ -220,7 +226,9 @@ few rules around auth changes, secret hygiene, and test conventions.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). See also [DISCLAIMER.md](DISCLAIMER.md) — the MIT
+license disclaims warranty; DISCLAIMER.md spells out the trading- and
+AI-specific risks you're accepting by using this software.
 
 ## Acknowledgments
 

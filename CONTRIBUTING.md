@@ -104,6 +104,7 @@ See the "How to add a new tool" section of [AGENTS.md](AGENTS.md).
 - Architecture / agent guidance: `AGENTS.md`
 - User-facing docs: `README.md`
 - Deployment: `DEPLOY.md`
+- Risk disclosure (trading + AI): `DISCLAIMER.md`
 - Personal-only notes: `CLAUDE.local.md` (gitignored)
 
 ## Questions
@@ -128,3 +129,9 @@ opening it to outside contributors:
 
 Everything else (CI workflows, source code, tests, agent docs) is
 generic by design and does not need editing on fork.
+
+**Do NOT edit out [DISCLAIMER.md](DISCLAIMER.md).** It's generic about
+trading and AI risks, not about any specific maintainer, and protects
+both you and your downstream users. If you have substantive additions
+specific to your deployment context, append them — don't remove the
+existing language.
