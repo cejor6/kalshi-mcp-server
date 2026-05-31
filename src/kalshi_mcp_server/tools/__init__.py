@@ -13,7 +13,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
-from kalshi_mcp_server.tools import discovery, exchange, market_data, orders, portfolio
+from kalshi_mcp_server.tools import (
+    discovery,
+    exchange,
+    live,
+    market_data,
+    orders,
+    portfolio,
+)
 
 
 def register_all_tools(server: FastMCP) -> None:
@@ -26,3 +33,4 @@ def register_all_tools(server: FastMCP) -> None:
     market_data.register(server)
     portfolio.register(server)
     orders.register(server)
+    live.register(server)
