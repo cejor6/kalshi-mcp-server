@@ -61,6 +61,10 @@ class KalshiClient:
     def config(self) -> Config:
         return self._config
 
+    @property
+    def rate_limiter(self) -> KalshiRateLimiter:
+        return self._rate_limiter
+
     async def aclose(self) -> None:
         await self._http.aclose()
 
@@ -170,6 +174,23 @@ class KalshiClient:
         if resp.status_code == 429:
             msg = _extract_error_message(body) or "rate limited"
             raise RateLimitError(status=429, message=msg, body=body)
+
+        # 3xx redirects: we don't follow them automatically because they
+        # almost always indicate a malformed request (e.g. an empty path
+        # parameter that hit `/markets/` → 301 → `/markets`). Treat as
+        # error so the agent gets a clear message instead of stray HTML
+        # bodies leaking into a "success" path.
+        if 300 <= resp.status_code < 400:
+            location = resp.headers.get("location", "<unknown>")
+            raise KalshiAPIError(
+                status=resp.status_code,
+                message=(
+                    f"Unexpected {resp.status_code} redirect to {location!r}. "
+                    "Likely cause: a path parameter (ticker, event_ticker, "
+                    "order_id, etc.) is empty or malformed."
+                ),
+                body=body,
+            )
 
         if 400 <= resp.status_code < 600:
             msg = _extract_error_message(body) or resp.reason_phrase or f"HTTP {resp.status_code}"

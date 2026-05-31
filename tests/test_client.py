@@ -184,6 +184,42 @@ async def test_unparseable_error_body_still_raises_cleanly(rsa_private_key):
     assert "raw" in exc.value.body
 
 
+@pytest.mark.asyncio
+async def test_3xx_redirect_raises_clear_error(rsa_private_key):
+    """Empty path parameters cause Kalshi to 301 to the canonical URL.
+
+    The client should NOT silently accept that as success — it should
+    raise with a hint about what likely went wrong (malformed param).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            301,
+            headers={"location": "/trade-api/v2/markets"},
+            content=b'<a href="/trade-api/v2/markets">Moved Permanently</a>',
+        )
+
+    client = _make_client(handler, rsa_private_key)
+    with pytest.raises(KalshiAPIError) as exc:
+        await client.get("/markets/")  # trailing-slash hits the redirect
+    assert exc.value.status == 301
+    assert "redirect" in exc.value.message.lower()
+    assert "path parameter" in exc.value.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_other_3xx_codes_also_raise(rsa_private_key):
+    """302 / 303 / 307 / 308 — anything in 3xx is unexpected."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307, headers={"location": "/elsewhere"})
+
+    client = _make_client(handler, rsa_private_key)
+    with pytest.raises(KalshiAPIError) as exc:
+        await client.get("/markets/X")
+    assert exc.value.status == 307
+
+
 def test_make_config_has_correct_demo_base():
     """Sanity check on the demo config used throughout these tests."""
     config = _make_config()

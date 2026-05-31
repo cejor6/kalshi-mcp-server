@@ -160,6 +160,17 @@ class KalshiRateLimiter:
         target = self._read if bucket is Bucket.READ else self._write
         await target.acquire(cost, nowait=nowait)
 
+    def reconfigure(self, tier: TierLimits) -> None:
+        """Swap in new bucket capacities + refill rates.
+
+        Use this when the server learns its real tier from
+        `/account/limits` and wants to replace the default Basic-tier
+        starting values. Both buckets are reset to their new capacity
+        (full), so the next request gets a clean budget.
+        """
+        self._read = TokenBucket(capacity=tier.read_capacity, refill_rate=tier.read_refill)
+        self._write = TokenBucket(capacity=tier.write_capacity, refill_rate=tier.write_refill)
+
     @property
     def read(self) -> TokenBucket:
         return self._read

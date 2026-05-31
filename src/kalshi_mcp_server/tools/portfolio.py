@@ -20,8 +20,13 @@ def register(server: FastMCP) -> None:
     async def kalshi_get_balance() -> dict[str, Any]:
         """Get the current cash balance and unrealized P&L.
 
-        Returns cash and (if applicable) buying-power numbers in cents.
-        Divide by 100 for USD.
+        Returns a dict with both raw and pre-formatted values:
+            balance: integer cents (e.g. 12500 = $125.00)
+            balance_dollars: string-formatted USD (e.g. "125.0000")
+            portfolio_value: integer cents — total cash + position value
+            balance_breakdown: per-subaccount breakdown if applicable
+
+        Prefer `balance_dollars` for display — it's already formatted.
         """
         return await client.get("/portfolio/balance")
 
@@ -36,9 +41,17 @@ def register(server: FastMCP) -> None:
     ) -> dict[str, Any]:
         """List your positions.
 
+        Returns BOTH:
+            market_positions: per-market position details (ticker, count,
+                avg fill price, realized/unrealized P&L)
+            event_positions: position summaries grouped by event
+            cursor: pagination cursor
+
         Args:
             limit: 1-1000. Default 200.
-            cursor: Pagination cursor.
+            cursor: Pagination cursor. Kalshi silently returns an empty
+                list on bad cursors — verify carefully if you expected
+                results.
             ticker: Restrict to a specific market ticker.
             event_ticker: Restrict to positions in a specific event.
             settlement_status: "all" (default), "settled", or "unsettled".

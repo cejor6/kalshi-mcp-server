@@ -68,3 +68,36 @@ async def test_basic_tier_defaults_are_reasonable():
         await limiter.acquire(Bucket.WRITE)
     with pytest.raises(RateLimitError):
         await limiter.acquire(Bucket.WRITE, nowait=True)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_swaps_buckets_and_refills():
+    """reconfigure() lets the CLI hydrate the limiter from /account/limits."""
+    limiter = KalshiRateLimiter(TierLimits.basic())
+    # Drain the read bucket
+    await limiter.acquire(Bucket.READ, cost=200)
+    assert limiter.read.tokens == pytest.approx(0, abs=1)
+
+    # Reconfigure to a larger tier — buckets should reset to capacity
+    limiter.reconfigure(TierLimits.premier())
+    assert limiter.read.capacity == 2000
+    assert limiter.read.tokens == pytest.approx(2000)
+    assert limiter.write.capacity == 2000
+    assert limiter.write.tokens == pytest.approx(2000)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_with_custom_tier():
+    """Verify reconfigure handles arbitrary TierLimits, not just preset classmethods."""
+    limiter = KalshiRateLimiter(TierLimits.basic())
+    custom = TierLimits(
+        read_capacity=12345,
+        read_refill=6789,
+        write_capacity=987,
+        write_refill=321,
+    )
+    limiter.reconfigure(custom)
+    assert limiter.read.capacity == 12345
+    assert limiter.read.refill_rate == 6789
+    assert limiter.write.capacity == 987
+    assert limiter.write.refill_rate == 321

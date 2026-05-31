@@ -10,6 +10,7 @@ import argparse
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -145,11 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         signer = _build_signer(config)
         safety = SafetyController(config)
-        # Default to Basic-tier limits. Once we expose
-        # `kalshi_get_api_limits`, the server can query /account/limits at
-        # boot and swap to live values — for now Basic is safest because
-        # it under-promises (rate limiter blocks before we'd hit Kalshi's
-        # real ceiling).
+        # Start with Basic-tier defaults; the lifespan hook below queries
+        # /account/limits at boot and reconfigures the limiter to the
+        # real numbers Kalshi reports. Basic is the safer fallback if
+        # that call fails — it under-promises (blocks earlier than the
+        # real Kalshi ceiling).
         rate_limiter = KalshiRateLimiter(TierLimits.basic())
         client = KalshiClient(
             config=config,
@@ -159,6 +160,48 @@ def main(argv: list[str] | None = None) -> int:
     except KalshiMCPError as exc:
         sys.stderr.write(f"\nStartup failed: {exc}\n\n")
         return 2
+
+    @asynccontextmanager
+    async def _kalshi_lifespan(_server):
+        """Hydrate the rate limiter from /account/limits at startup.
+
+        Kalshi tier limits depend on the account, so the hardcoded Basic
+        defaults are conservative for accounts that have been upgraded.
+        Calling /account/limits once at boot replaces the buckets with
+        the real numbers. If the call fails (network glitch, brief auth
+        hiccup), we keep the Basic defaults — the server still works,
+        just on the conservative budget.
+        """
+        try:
+            limits = await client.get("/account/limits")
+            read = limits.get("read", {}) or {}
+            write = limits.get("write", {}) or {}
+            read_capacity = read.get("bucket_capacity")
+            write_capacity = write.get("bucket_capacity")
+            if read_capacity and write_capacity:
+                tier = TierLimits(
+                    read_capacity=float(read_capacity),
+                    read_refill=float(read.get("refill_rate") or read_capacity),
+                    write_capacity=float(write_capacity),
+                    write_refill=float(write.get("refill_rate") or write_capacity),
+                )
+                rate_limiter.reconfigure(tier)
+                logger.info(
+                    "Rate limiter hydrated from /account/limits: tier=%s "
+                    "read=%g cap @ %g/s, write=%g cap @ %g/s",
+                    limits.get("usage_tier", "?"),
+                    tier.read_capacity,
+                    tier.read_refill,
+                    tier.write_capacity,
+                    tier.write_refill,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not hydrate rate limits from /account/limits — "
+                "keeping Basic-tier defaults. (%s)",
+                exc,
+            )
+        yield
 
     # Lazy import so config errors surface before pulling in the framework.
     try:
@@ -190,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Trading {'enabled' if config.trading_enabled else 'DISABLED (read-only)'}."
         ),
         auth=auth_provider,
+        lifespan=_kalshi_lifespan,
     )
 
     user_restrict = build_user_restriction_middleware()
