@@ -82,11 +82,24 @@ confidence that nothing reaches prod until you explicitly ship.
 To deploy a new version yourself (as the maintainer):
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
-The release workflow builds + pushes `ghcr.io/<your-owner>/kalshi-mcp-server:v0.1.3` and `:latest`. Render's auto-deploy picks `:latest` up in a few minutes.
+The release workflow:
+
+1. Builds + pushes `ghcr.io/<your-owner>/kalshi-mcp-server:v0.1.4` and
+   `:latest` to GHCR (multi-arch: amd64 + arm64).
+2. **POSTs to your Render deploy hook URL** (stored as the
+   `RENDER_DEPLOY_HOOK_URL` GitHub Actions secret) to trigger an
+   immediate redeploy. Render's image-deploy services do NOT auto-poll
+   GHCR on a useful cadence — without the deploy hook, you'd have to
+   click "Manual Deploy" in Render's UI after every tag push.
+
+If `RENDER_DEPLOY_HOOK_URL` isn't set as a secret, step 2 skips cleanly
+(forkers running on Fly.io / Cloud Run / etc. don't see workflow
+failures). See [Deploy-hook setup](#deploy-hook-setup) below for how
+to wire this up.
 
 ---
 
@@ -399,12 +412,21 @@ git repo" which builds the Dockerfile on every push to a watched branch.
 We deliberately avoid that — see [Architecture](#architecture--why-pattern-a)
 above.
 
-**Auto-deploy on image updates.** Render polls the registry on a
-schedule (~1-5 min) for changes to the tagged image's digest. When you
-push a new `v*` tag, the release workflow updates `:latest` and Render
-picks it up. For more control, pin to a specific tag (`:v0.1.5`) in the
-Render image URL field — then auto-deploy is effectively manual (you
-have to bump the tag in Render's UI to upgrade).
+**Redeploys: deploy hook, not auto-polling.** Despite what the older
+docs in this repo used to claim, Render does NOT auto-poll image
+registries on a cadence that's useful for CI/CD — in practice
+redeploys must be triggered explicitly. We use Render's per-service
+**deploy hook** (a unique POST URL) that our `release.yml` calls
+after the image push. See [Deploy-hook setup](#deploy-hook-setup) for
+the one-time configuration. Without the hook, you can still redeploy
+manually via Render → service → "Manual Deploy" → "Clear build cache
+& deploy".
+
+**Pinning a specific version.** The image URL in Render service
+settings defaults to `:latest`. To freeze a version, set it to
+`:v0.1.5` (or whatever) — Render then ignores the deploy hook for new
+`:latest` pushes and only redeploys when you bump the pin manually.
+Useful for staging environments or production rollback windows.
 
 **Health check.** Leave the path blank. Render falls back to a TCP
 port-listen check, which succeeds the moment the container binds to
@@ -505,6 +527,47 @@ Same Kalshi key works for both if you want.
 ---
 
 ## Operational notes
+
+### Deploy-hook setup
+
+One-time setup to make `git tag v*` auto-redeploy to Render. Skip if
+you're deploying somewhere other than Render — the workflow is
+already designed to handle a missing hook gracefully.
+
+1. **In Render** → service settings → scroll to **Deploy Hook** →
+   click **Generate Hook URL**. Copy the URL. It looks like
+   `https://api.render.com/deploy/srv-xxxxxxxxxxxx?key=...`. The key
+   in the URL is the secret part — anyone with the URL can trigger a
+   redeploy of *that specific service*.
+
+2. **In GitHub** → your repo → Settings → Secrets and variables →
+   Actions → **New repository secret**:
+   - Name: `RENDER_DEPLOY_HOOK_URL`
+   - Value: paste the URL from step 1
+
+3. Done. The next time you push a `v*` tag, `release.yml` will:
+   - Build + push the image to GHCR
+   - POST to the deploy hook URL → Render redeploys within seconds
+
+**Security notes**:
+- Repository secrets on GitHub are write-only. Once saved, the value
+  is never retrievable through the UI (even by repo admins) — only
+  workflow runs you trigger can use it.
+- The URL is passed to the workflow only as an env var, never
+  interpolated into a shell command line. GitHub Actions also
+  auto-masks any string matching a known secret value with `***` in
+  workflow logs.
+- The `release.yml` workflow triggers only on `push: tags: ['v*']`,
+  which requires repo write access. Fork PRs cannot trigger it and
+  therefore cannot access this secret.
+- If the URL leaks anyway: regenerate it in Render's UI (the old one
+  immediately stops working). Update the GitHub secret with the new
+  value.
+
+**Skipping**: if `RENDER_DEPLOY_HOOK_URL` isn't set, the deploy step
+just prints a message and exits 0. Useful for forkers running on
+Fly.io / Cloud Run / a different Render account / etc. — your release
+pipeline doesn't break just because you don't have this configured.
 
 ### Pre-known URL trick
 
@@ -671,13 +734,20 @@ need prod (`KALSHI_ENV=prod` + `KALSHI_ALLOW_PROD=1`).
 
 ### Render didn't pick up the new image
 
-Render auto-polls GHCR every few minutes. If you just pushed a tag and
-want the image *now*:
+Render image-deploy services don't auto-poll GHCR on a useful cadence
+— redeploys are triggered explicitly. Two paths:
 
-1. Service page → **Manual Deploy** button (top right)
-2. **Clear build cache & deploy**
+- **Set up the deploy hook** (recommended) — see
+  [Deploy-hook setup](#deploy-hook-setup). After that, every tag push
+  triggers a redeploy automatically.
+- **Manual redeploy** — Render service page → **Manual Deploy** (top
+  right) → **Clear build cache & deploy**. Forces a fresh pull
+  immediately.
 
-Forces a fresh image pull immediately.
+If you have the hook set up and a tag-push redeploy still didn't
+happen, check the release-workflow logs for the "Trigger Render
+deploy" step. The hook URL might be stale (regenerate in Render
+settings) or the action might have hit a transient error.
 
 ### Claude.ai disconnected after a Render redeploy
 
