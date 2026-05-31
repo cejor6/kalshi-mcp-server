@@ -1,0 +1,14 @@
+# Default reviewer for everything.
+* @cejor6
+
+# Auth + signing — extra-sensitive, never merge without review.
+/src/kalshi_mcp_server/auth.py    @cejor6
+/src/kalshi_mcp_server/safety.py  @cejor6
+
+# Workflows can exfiltrate secrets — review every change.
+/.github/workflows/               @cejor6
+/Dockerfile                       @cejor6
+
+# Dependency manifests
+/pyproject.toml                   @cejor6
+/uv.lock                          @cejor6

@@ -1,0 +1,49 @@
+# Personal scratchpad — example
+
+Copy this file to `CLAUDE.local.md` (which is gitignored) and use it for
+notes that should NOT be in the public repo:
+
+- Your personal API key paths (e.g. `~/.kalshi/prod.pem`)
+- Watchlists / market tickers you're tracking
+- Risk thresholds tuned to your account
+- Personal TODO items for this codebase
+- Half-formed strategy ideas you're testing
+- Anything else that's useful only to you
+
+**`CLAUDE.local.md` is gitignored** — see `.gitignore`. Never commit it,
+never share it publicly. Treat it like an `.env`: yours alone.
+
+---
+
+## Example structure
+
+### My credentials
+
+- Demo key ID: `<my-demo-key-id>`
+- Demo PEM path: `C:\Users\me\.kalshi\demo.pem`
+- Prod key ID: `<my-prod-key-id>` (NOT enabled by default)
+- Prod PEM path: `C:\Users\me\.kalshi\prod.pem`
+
+### My risk profile
+
+- Max single order: $25 (default in code, leave as-is)
+- Daily cap: $100 (lower than the $250 default)
+- Cash reserve: $200 (never spend below this)
+- Default to NO-side on weather markets (payoff protection)
+
+### Markets I'm watching
+
+- `KXFED-...` — Fed rate decisions
+- `KXBTC-...` — Bitcoin price bands
+- Weather (`KXHIGH...`, `KXLOWT...`) — only NYC, CHI, MIA
+
+### Personal TODOs for this repo
+
+- [ ] Try out the orderbook resource against KXBTC
+- [ ] Tune daily limit after a week of dry-run usage
+
+### Notes / learnings
+
+- Demo orderbook for low-volume markets often shows wide spreads — don't
+  expect tight spreads when testing.
+- Demo settlements can lag prod — check timestamps when comparing.

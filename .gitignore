@@ -1,0 +1,106 @@
+# -- Secrets and credentials (NEVER commit) -------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_private_key*
+*_priv_key*
+kalshi-*.pem
+private_key*
+secrets/
+keys/
+.envrc
+.envrc.local
+credentials.json
+credentials.*.json
+
+# -- Personal / per-developer files ---------------------------------------
+# CLAUDE.local.md is the personal scratchpad — NOT committed.
+CLAUDE.local.md
+AGENTS.local.md
+.claude/settings.local.json
+.claude/.session*
+.notes/
+notes.local.md
+
+# -- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# -- Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# -- Testing / coverage ----------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# -- Type checkers ---------------------------------------------------------
+.mypy_cache/
+.pyright/
+.pytype/
+.ruff_cache/
+
+# -- Tooling ---------------------------------------------------------------
+pip-log.txt
+pip-delete-this-directory.txt
+.uv/
+
+# -- IDE / editors ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# -- OS --------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# -- Logs / runtime artifacts ----------------------------------------------
+*.log
+logs/
+audit/
+*.sqlite
+*.sqlite3
+*.db
+
+# -- Local data / fixtures with possibly-sensitive content -----------------
+data/local/
+fixtures/local/
+scratch/
+tmp/

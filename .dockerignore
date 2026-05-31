@@ -1,0 +1,63 @@
+# Mirror .gitignore + drop things irrelevant to a runtime image.
+.git
+.github
+.claude
+.idea
+.vscode
+.venv
+venv
+env
+ENV
+.python-version
+
+# Tests/dev tooling not needed at runtime
+tests
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.pyright
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+.tox
+.nox
+.hypothesis
+
+# Build artifacts
+build
+dist
+*.egg-info
+__pycache__
+*.py[cod]
+
+# Local docs and notes
+*.md
+!README.md
+docs
+
+# Secrets / local files (defense in depth — should already be gitignored)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets
+keys
+CLAUDE.local.md
+AGENTS.local.md
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+
+# Logs / databases
+*.log
+logs
+*.sqlite
+*.sqlite3
+*.db
+
+# Pre-commit baseline doesn't belong in the image
+.secrets.baseline
+.pre-commit-config.yaml
