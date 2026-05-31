@@ -1,0 +1,16 @@
+# gitleaks config — extends the default ruleset.
+#
+# Why this file exists: gitleaks scans every commit for secret-shaped
+# strings, but .secrets.baseline (the detect-secrets metadata file)
+# contains SHA1 hashes of known false positives that look like generic
+# API keys to gitleaks. Without this allowlist, the two scanners fight
+# each other.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow .secrets.baseline — detect-secrets metadata, contains hashes that look like API keys"
+paths = [
+    '''\.secrets\.baseline$'''
+]

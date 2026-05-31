@@ -9,11 +9,11 @@ leaked credentials.
 
 **Please do not file public issues for vulnerabilities.**
 
-Use one of:
+Open a private GitHub security advisory:
+https://github.com/cejor6/kalshi-mcp-server/security/advisories/new
 
-1. **GitHub private advisory** (preferred): open at
-   https://github.com/cejor6/kalshi-mcp-server/security/advisories/new
-2. **Email**: cejor6 — subject line: `[security] kalshi-mcp-server`.
+That channel is end-to-end private — only the maintainer sees the
+report until disclosure is coordinated.
 
 Please include:
 

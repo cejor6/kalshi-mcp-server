@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [
-    { name = "cejor6", email = "cejor6" },
+    { name = "cejor6" },
 ]
 keywords = ["mcp", "model-context-protocol", "kalshi", "prediction-markets", "trading"]
 classifiers = [
