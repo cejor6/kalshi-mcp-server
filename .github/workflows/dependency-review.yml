@@ -1,0 +1,37 @@
+# Dependency review — runs on every PR. Blocks PRs that introduce
+# dependencies with known vulnerabilities or non-compatible licenses.
+
+name: Dependency review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    name: dependency-review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+          # The MIT license is on the project, so allow common permissive licenses
+          # for dependencies. If you fork and your downstream constraints change,
+          # tighten this list.
+          allow-licenses: >-
+            MIT,
+            BSD-2-Clause,
+            BSD-3-Clause,
+            Apache-2.0,
+            ISC,
+            Python-2.0,
+            CC0-1.0,
+            Unlicense,
+            MPL-2.0,
+            PSF-2.0

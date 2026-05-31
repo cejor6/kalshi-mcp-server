@@ -1,0 +1,27 @@
+# Release drafter — keeps a draft release in GitHub up to date based on
+# merged PRs. When you're ready to ship, click "Publish" on the draft
+# (or push a tag, which triggers release.yml).
+
+name: Release drafter
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  update_release_draft:
+    name: draft
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

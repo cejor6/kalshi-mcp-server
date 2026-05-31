@@ -1,0 +1,36 @@
+# Stale — closes inactive issues and PRs so the repo doesn't accumulate
+# stale work. Runs daily.
+
+name: Stale
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: stale
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-message: >-
+            This issue has been inactive for 60 days. It will be closed
+            in 14 days if no further activity occurs. To keep it open,
+            comment or remove the stale label.
+          stale-pr-message: >-
+            This PR has been inactive for 60 days. It will be closed in
+            14 days if no further activity occurs.
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: "pinned,security,roadmap"
+          exempt-pr-labels: "pinned,security,dependencies,wip"
+          # Don't auto-close PRs — humans should decide.
+          days-before-pr-close: -1
