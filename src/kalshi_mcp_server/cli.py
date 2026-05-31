@@ -171,10 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     server._kalshi_rate_limiter = rate_limiter  # type: ignore[attr-defined]
     server._kalshi_client = client  # type: ignore[attr-defined]
 
-    # Register tools (none yet — landing in subsequent commits).
+    from kalshi_mcp_server.resources import register_all_resources
     from kalshi_mcp_server.tools import register_all_tools
 
     register_all_tools(server)
+    register_all_resources(server)
 
     logger.info("Transport: %s", transport)
     if transport == "stdio":
