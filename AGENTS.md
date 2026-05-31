@@ -129,6 +129,58 @@ locally before any request goes to Kalshi:
 All three are operator-configurable. The defaults are conservative on
 purpose — fork-and-adjust to your risk tolerance.
 
+A fourth gate fires at startup when HTTP transport is used:
+**`http` transport refuses to start without OAuth configured** unless
+`MCP_ALLOW_INSECURE_HTTP=1` is explicitly set. An unauthenticated HTTP
+trade server is a serious footgun; the policy fails closed.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full risk disclosure. The
+safety controls reduce blast radius but don't eliminate it.
+
+---
+
+## OAuth proxy (HTTP-transport only)
+
+`src/kalshi_mcp_server/oauth.py` wraps the FastMCP server with a
+`GitHubProvider` OAuth proxy when relevant env vars are set:
+
+- `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_BASE_URL` — required
+  to enable the proxy
+- `MCP_ALLOWED_GITHUB_LOGINS` — required for HTTP transport (defense in
+  depth — the proxy lets anyone authenticate; the middleware rejects
+  tool calls from logins outside this list)
+- `MCP_JWT_SIGNING_KEY` — stable key for proxy-issued JWTs (optional;
+  generated per-process if unset, invalidates tokens on restart)
+- `MCP_REDIS_URL` — persistent DCR client storage (optional; in-memory
+  if unset, requires reconnect after each redeploy)
+
+Stdio transport ignores all of these. Local stdio clients (Claude
+Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
+itself is the operator.
+
+---
+
+## Deployment contracts
+
+A few invariants the deployed image needs to honor. If you change any
+of these in a refactor, check that they still hold.
+
+- **HTTP must bind to `0.0.0.0`** when containerized. The CLI defaults
+  to `127.0.0.1` (safe for local dev), so the **Dockerfile must
+  override via `CMD ["--host", "0.0.0.0"]`**. Without this, hosted
+  deploys return 502 — the gateway can't reach a localhost-only bind.
+- **The published image must include `[oauth]` extras.** The Dockerfile
+  installs with `uv pip install ".[oauth]"`, not `.`. Without the
+  extras, the OAuth proxy crashes on import when `MCP_REDIS_URL` is set.
+- **The Dockerfile's `ENTRYPOINT` runs as a non-root user** (uid 10001).
+  Don't add steps that require root after the `USER app` directive.
+- **The release workflow tags both `:vX.Y.Z` and `:latest`** so image-
+  deploy hosts on `:latest` pick up new versions automatically.
+
+These contracts are part of the test surface only indirectly (the
+Render deploy is the integration test). When in doubt, smoke-test
+against Render before tagging a release.
+
 ---
 
 ## How to add a new tool
@@ -206,15 +258,16 @@ bypassed locally — discipline is the actual safeguard.
 
 - **FIX protocol.** Kalshi supports it for institutional users. This
   server is for the REST + WS surface only.
-- **OAuth for end users.** Authentication is RSA-PSS with the operator's
-  own Kalshi key. If you want OAuth in front (e.g. for a remote MCP
-  deployment where multiple users connect to one server instance), that
-  belongs in a *proxy* in front of this server, not inside it. See
-  DEPLOY.md.
 - **Trading strategies / signal generation.** This server exposes the
-  Kalshi API. The decision of WHAT to trade belongs in a separate program
-  that consumes this MCP. Keeping that separation makes the server
-  trustable and fork-able.
+  Kalshi API. The decision of *what* to trade belongs in a separate
+  program that consumes this MCP. Keeping that separation makes the
+  server trustable and fork-able.
+- **Multi-user tenant isolation.** The server's identity is the
+  operator's Kalshi key — there is one trading account per running
+  process. `MCP_ALLOWED_GITHUB_LOGINS` controls *who can invoke tools*,
+  not *which Kalshi account they hit*. Adding multi-user support
+  (different Kalshi keys per logged-in GitHub user) would require a
+  significant architectural change.
 
 ---
 
