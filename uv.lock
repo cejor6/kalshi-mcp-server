@@ -833,7 +833,7 @@ wheels = [
 
 [[package]]
 name = "kalshi-mcp-server"
-version = "0.1.4"
+version = "0.1.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

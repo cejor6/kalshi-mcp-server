@@ -8,8 +8,14 @@
 A Model Context Protocol server for [Kalshi](https://kalshi.com)
 prediction markets. Native RSA-PSS auth, async token-bucket rate
 limiting, two-step prepare/confirm order flow with safety caps,
-bundled OAuth proxy for claude.ai remote-MCP deployment, 26 tools +
+optional bundled OAuth proxy for remote-MCP deployments, 26 tools +
 4 resources across REST and WebSocket. MIT, designed to be forked.
+
+Works with any [MCP](https://modelcontextprotocol.io) client —
+locally via stdio (Claude Desktop, Claude Code, Cursor, Zed,
+Continue, Cline, Goose, etc.) or remotely as a self-hosted HTTP
+server (claude.ai custom connectors today, any OAuth-capable MCP
+client in the future).
 
 > ⚠️ **This software lets an LLM place trades. Read [DISCLAIMER.md](DISCLAIMER.md)
 > before deploying.** Trading prediction markets involves substantial
@@ -107,40 +113,86 @@ On startup, the server resolves config in this order (highest wins):
 So you can put secrets either inline in the MCP config (`env:`) or in a
 file the config points at (`--env-file`). You don't need to do both.
 
-## Use with Claude Desktop / Claude Code / Cursor
+## Use with an MCP client (stdio)
 
-The cleanest pattern is to keep all your secrets in one `.env` file
-outside any repo and pass `--env-file`:
+Every MCP stdio client uses the same shape: a `command` to launch the
+server, optional `args`, optional `env`. The differences are just the
+file/UI where you put the config.
 
-**Claude Desktop** (`claude_desktop_config.json`):
+The server isn't on PyPI yet, so there's no globally-installed
+`kalshi-mcp` command on your PATH. The two reliable patterns:
 
-```json
-{
-  "mcpServers": {
-    "kalshi": {
-      "command": "kalshi-mcp",
-      "args": ["--env-file", "/Users/you/.kalshi/.env"]
-    }
-  }
-}
-```
+### Pattern A — `uv run` against a local clone (recommended)
 
-**Claude Code** (project `.mcp.json` or `~/.claude/mcp.json`):
+Best for users who have [uv](https://docs.astral.sh/uv/) installed
+(common in modern Python workflows). Clone the repo, then point the
+MCP client config at `uv` with `--directory`:
 
 ```json
 {
   "mcpServers": {
     "kalshi": {
-      "type": "stdio",
-      "command": "kalshi-mcp",
-      "args": ["--env-file", "/Users/you/.kalshi/.env"]
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "/absolute/path/to/kalshi-mcp-server",
+        "kalshi-mcp",
+        "--env-file", "/Users/you/.kalshi/.env"
+      ]
     }
   }
 }
 ```
 
-If you prefer inline env vars in the MCP config (and don't mind them
-sitting in JSON), that works too:
+`uv run` activates the project's venv automatically, so dependencies
+work without manual `pip install`. Updating to a new version is `git
+pull` + restart the MCP client.
+
+### Pattern B — Docker against the public image
+
+Best for users without Python / uv installed, or who'd rather not
+clone. Uses the pre-built public image at GHCR:
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-v", "/Users/you/.kalshi/demo.pem:/secrets/demo.pem:ro",
+        "-e", "KALSHI_API_KEY_ID=<your-key-id>",
+        "-e", "KALSHI_PRIVATE_KEY_PATH=/secrets/demo.pem",
+        "-e", "KALSHI_ENV=demo",
+        "ghcr.io/cejor6/kalshi-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+The `-v` mount bind-mounts your PEM file read-only into the container
+at a fixed path; `KALSHI_PRIVATE_KEY_PATH` points at that path. Secrets
+live in the JSON config — fine for a single-user machine.
+
+> A future release will publish to PyPI, after which `pipx install
+> kalshi-mcp-server` will put `kalshi-mcp` on your global PATH and the
+> config simplifies to just `"command": "kalshi-mcp", "args": [...]`.
+
+### Where to put this config:
+
+| Client | Config location |
+|---|---|
+| [Claude Desktop](https://claude.ai/download) | `claude_desktop_config.json` (Settings → Developer) |
+| [Claude Code](https://claude.com/claude-code) | project `.mcp.json` or `~/.claude/mcp.json` |
+| [Cursor](https://cursor.com) | Settings → MCP → Add new MCP Server (UI fills the same JSON) |
+| [Zed](https://zed.dev) | `~/.config/zed/settings.json` under `context_servers` |
+| [Continue](https://continue.dev) | `~/.continue/config.json` under `experimental.modelContextProtocolServers` |
+| [Cline](https://cline.bot) | Cline settings → MCP Servers → Edit JSON |
+| [Goose](https://block.github.io/goose/) | `~/.config/goose/config.yaml` under `extensions` |
+
+If you'd rather inline secrets in the MCP config (acceptable for
+local dev where the config file is on your own machine):
 
 ```json
 {
@@ -159,11 +211,24 @@ sitting in JSON), that works too:
 
 > **Why not just `.env` in the project dir?** MCP clients spawn the
 > server as a subprocess from their own working directory (typically
-> your home dir on macOS/Linux, the client's install dir on Windows), so
-> a `.env` sitting in this repo wouldn't get found. Hence `--env-file`
-> to point at it explicitly. Local development from the project dir
-> still works without flags — the server auto-loads `./.env` when
-> launched there.
+> your home dir on macOS/Linux, the client's install dir on Windows),
+> so a `.env` sitting in this repo wouldn't get found. Hence
+> `--env-file` to point at it explicitly. Running the server directly
+> from the project dir (no client) still works without flags — the
+> CLI auto-loads `./.env` when launched there.
+
+## Use as a remote MCP service
+
+For clients that don't speak local stdio — currently the main one
+being **claude.ai's custom connector form**, which only supports
+OAuth-protected HTTP — host the server somewhere reachable and point
+the client at it. The OAuth proxy is bundled with the server; you
+just need to configure it.
+
+See [DEPLOY.md](DEPLOY.md) for an end-to-end walkthrough using
+Render + GitHub OAuth + Upstash Redis. Other image-deploy hosts
+(Fly.io, Cloud Run, ECS, Railway) work the same way — Render is just
+the worked example.
 
 ## Tools
 
@@ -212,8 +277,8 @@ See [AGENTS.md](AGENTS.md) for the full design.
 
 ## Deployment
 
-Use it locally as a stdio server (Claude Desktop, Claude Code, Cursor)
-or run it as a remote HTTP MCP behind an OAuth proxy.
+Use it locally as a stdio server with any MCP client, or run it as a
+remote HTTP MCP behind an OAuth proxy.
 
 For remote deployment, the recommended setup is **image-deploy**: a
 production host (Render, Fly.io, Cloud Run, ECS, anything that supports
