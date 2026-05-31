@@ -9,5 +9,11 @@ In short:
 - Disagree on ideas, not on people.
 - No harassment, demeaning comments, or personal attacks.
 
-Report violations privately to cejor6@gmail.com. Maintainers will
-investigate and respond within a reasonable timeframe.
+Report violations privately by opening a GitHub security advisory —
+the same channel used for security issues:
+https://github.com/cejor6/kalshi-mcp-server/security/advisories/new
+
+That channel is end-to-end private; the maintainer will respond within
+a reasonable timeframe and may invite additional discussion. For
+content-specific issues (a comment, a PR), GitHub's per-item report
+button (`...` menu) is also a fine route.

@@ -1,8 +1,15 @@
 # kalshi-mcp-server
 
+[![CI](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
 A Model Context Protocol server for [Kalshi](https://kalshi.com)
-prediction markets. Native RSA-PSS auth, token-bucket rate limiting,
-demo/prod safety controls.
+prediction markets. Native RSA-PSS auth, async token-bucket rate
+limiting, two-step prepare/confirm order flow with safety caps,
+bundled OAuth proxy for claude.ai remote-MCP deployment, 26 tools +
+4 resources across REST and WebSocket. MIT, designed to be forked.
 
 > ⚠️ **This software lets an LLM place trades. Read [DISCLAIMER.md](DISCLAIMER.md)
 > before deploying.** Trading prediction markets involves substantial
