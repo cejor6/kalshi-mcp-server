@@ -107,3 +107,7 @@ data/local/
 fixtures/local/
 scratch/
 tmp/
+
+# Claude Code scheduler runtime lock (per-machine, not for the repo)
+.claude/scheduled_tasks.lock
+.claude/*.lock
