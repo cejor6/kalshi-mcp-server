@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kalshi-mcp-server"
-version = "0.1.8"
+version = "0.1.9"
 description = "Model Context Protocol server for Kalshi prediction markets — native RSA-PSS auth, token-bucket rate limiting, demo/prod safety controls."
 readme = "README.md"
 requires-python = ">=3.11"

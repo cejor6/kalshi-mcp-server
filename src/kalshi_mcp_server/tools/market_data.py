@@ -13,10 +13,34 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from kalshi_mcp_server.tools.discovery import _validate_ticker
+from kalshi_mcp_server.errors import KalshiAPIError
+from kalshi_mcp_server.tools.discovery import _event_hint, _validate_ticker
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
+
+
+def _book_is_empty(body: dict[str, Any]) -> bool:
+    """True if an orderbook response has no resting size on either side.
+
+    Kalshi nests the book under `orderbook_fp` (`yes_dollars` / `no_dollars`)
+    after its fixed-point migration; the legacy `orderbook` used `yes` / `no`.
+    Check both so the empty-detection survives either shape; if Kalshi
+    changes the layout again, this returns False (book passed through as-is),
+    which is the safe failure mode.
+    """
+    if not isinstance(body, dict):
+        return False
+    book = body.get("orderbook_fp")
+    if book is None:
+        book = body.get("orderbook")
+    # No recognized book container → don't treat as empty (fail safe): an
+    # unknown layout must not wrongly trigger the event-hint path.
+    if not isinstance(book, dict):
+        return False
+    return not (
+        book.get("yes_dollars") or book.get("no_dollars") or book.get("yes") or book.get("no")
+    )
 
 
 def register(server: FastMCP) -> None:
@@ -31,7 +55,11 @@ def register(server: FastMCP) -> None:
         """Get the current orderbook for a market.
 
         Args:
-            ticker: Market ticker, e.g. "KXFED-26MAR19-B5.25".
+            ticker: MARKET ticker, e.g. "KXFED-26MAR19-B5.25". Must carry
+                the outcome suffix — an EVENT ticker (e.g. "…PITHOU" without
+                "-HOU") has no single book and would otherwise return an
+                empty book with no error; this tool detects that case and
+                raises a hint naming the real market tickers instead.
             depth: Number of price levels per side to return (default 10).
                 Note: Kalshi rejects very large depth values with a 400.
                 `depth=0` is interpreted as "no limit" and returns the
@@ -49,7 +77,18 @@ def register(server: FastMCP) -> None:
         """
         ticker = _validate_ticker(ticker)
         params: dict[str, Any] = {"depth": depth}
-        return await client.get(f"/markets/{ticker}/orderbook", params=params)
+        body = await client.get(f"/markets/{ticker}/orderbook", params=params)
+
+        # An EVENT ticker (or a genuinely dead market) returns an empty book
+        # with no error. Disambiguate: if the ticker resolves to an event,
+        # raise an actionable hint rather than letting the caller read the
+        # empty book as "no liquidity". A real but illiquid market is not an
+        # event, so `_event_hint` returns None and the empty book passes through.
+        if _book_is_empty(body):
+            hint = await _event_hint(client, ticker)
+            if hint:
+                raise KalshiAPIError(status=0, message=hint)
+        return body
 
     @server.tool
     async def kalshi_get_market_candlesticks(

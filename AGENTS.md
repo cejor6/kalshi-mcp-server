@@ -221,6 +221,36 @@ URI scheme: `kalshi://<noun>[/<id>][/<subresource>]`. Examples:
 
 ---
 
+## Discovery / market-listing gotchas
+
+Hard-won lessons from running scan agents against prod. The discovery
+tools encode these; don't regress them.
+
+- **Two projection axes on `kalshi_get_markets`.** `compact` is a
+  *blacklist* (`_VERBOSE_MARKET_FIELDS`) — preserves forward-compat as
+  Kalshi adds fields. `minimal` is a *whitelist* (`_MINIMAL_MARKET_FIELDS`)
+  — bounds worst-case payload size for `KXMVE…` combo markets, whose bulk
+  lives outside the blacklist (`custom_strike`, `mve_selected_legs`, long
+  `*_sub_title`s). Prefer `minimal` for listing/scanning. The same
+  projection applies to nested markets on the event tools. Precedence:
+  `fields` > `minimal` > `compact` > full.
+- **Combos dominate the default listing.** A bare `status=open` page is
+  mostly multivariate combos with empty/one-sided books. Kalshi has **no
+  server-side sort**, but it does have `mve_filter` (`exclude`/`only`).
+  `kalshi_get_markets(mve_filter="exclude")` de-noises server-side;
+  `kalshi_find_liquid_markets` layers a windowed, volume-ranked shortlist
+  on top (be honest about the window — it reports `scanned`).
+- **`liquidity_dollars` is always `0.0000`** (even on deep books). Don't
+  reintroduce it into curated views or gate on it; rank/assess via the
+  orderbook + `volume_24h_fp` / `open_interest_fp`.
+- **Event ticker ≠ market ticker.** An event ticker passed where a market
+  ticker is expected fails silently (404, empty book, empty list). The
+  tools call `_event_hint` on the failed path to raise an actionable error
+  naming the real market tickers. `_event_hint` must **fail open** (return
+  None on any error) so it never masks the caller's original problem.
+
+---
+
 ## Testing conventions
 
 - **No real account data in fixtures.** Mock everything. The CI runner

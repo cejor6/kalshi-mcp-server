@@ -10,14 +10,44 @@ import pytest
 
 from kalshi_mcp_server.errors import KalshiAPIError
 from kalshi_mcp_server.tools.discovery import (
+    _EVENT_HINT_MISS_MAX,
     _MINIMAL_MARKET_FIELDS,
     _compact_event,
     _compact_market,
+    _event_hint,
+    _event_hint_misses,
     _minimal_market,
     _parse_fields,
     _project_market,
+    _rank_liquid_markets,
+    _record_event_hint_miss,
+    _scan_markets_excluding_mve,
+    _single_ticker,
+    _validate_mve_filter,
     _validate_ticker,
+    _volume_24h,
 )
+
+# Note: the `_event_hint_misses` negative cache is reset around every test by
+# the autouse `_reset_event_hint_cache` fixture in conftest.py.
+
+
+class _FakeClient:
+    """Minimal async stand-in for KalshiClient.get used by the discovery
+    helpers. Replays queued responses in order (or raises a queued error)
+    and records every (path, params) call for assertions."""
+
+    def __init__(self, responses=None, error=None):
+        self._responses = list(responses or [])
+        self._error = error
+        self.calls: list[tuple[str, dict | None]] = []
+
+    async def get(self, path, params=None):
+        self.calls.append((path, params))
+        if self._error is not None:
+            raise self._error
+        return self._responses.pop(0) if self._responses else {}
+
 
 # ── _validate_ticker ───────────────────────────────────────────────────────
 
@@ -320,3 +350,220 @@ def test_full_view_preserves_liquidity_dollars():
     future refactor that accidentally strips it globally."""
     market = {"ticker": "KX-TEST", "liquidity_dollars": "0.0000"}
     assert _project_market(market)["liquidity_dollars"] == "0.0000"
+
+
+# ── _validate_mve_filter (issue #29) ───────────────────────────────────────
+
+
+def test_validate_mve_filter_accepts_valid():
+    assert _validate_mve_filter("exclude") == "exclude"
+    assert _validate_mve_filter("only") == "only"
+
+
+def test_validate_mve_filter_rejects_invalid():
+    for bad in ("Exclude", "all", "", "yes", "none"):
+        with pytest.raises(KalshiAPIError) as exc:
+            _validate_mve_filter(bad)
+        assert "mve_filter" in exc.value.message
+
+
+# ── _volume_24h / _rank_liquid_markets (issue #29) ─────────────────────────
+
+
+def test_volume_24h_parses_and_defaults_to_zero():
+    assert _volume_24h({"volume_24h_fp": "8566.60"}) == pytest.approx(8566.60)
+    assert _volume_24h({}) == 0.0
+    assert _volume_24h({"volume_24h_fp": None}) == 0.0
+    assert _volume_24h({"volume_24h_fp": "garbage"}) == 0.0
+
+
+def test_rank_liquid_markets_sorts_filters_and_projects():
+    markets = [
+        {"ticker": "A", "volume_24h_fp": "10", "rules_primary": "x"},
+        {"ticker": "B", "volume_24h_fp": "100", "rules_primary": "y"},
+        {"ticker": "C", "volume_24h_fp": "1"},
+        {"ticker": "D", "volume_24h_fp": "50"},
+    ]
+    ranked = _rank_liquid_markets(markets, min_volume=5, limit=2)
+    # desc by volume, C dropped (below min_volume), capped at limit=2
+    assert [m["ticker"] for m in ranked] == ["B", "D"]
+    # results are minimal-projected — verbose fields gone
+    assert "rules_primary" not in ranked[0]
+
+
+# ── _scan_markets_excluding_mve (issue #29) ────────────────────────────────
+
+
+async def test_scan_excludes_mve_and_paginates():
+    client = _FakeClient(
+        responses=[
+            {"markets": [{"ticker": "A"}, {"ticker": "B"}], "cursor": "c1"},
+            {"markets": [{"ticker": "C"}], "cursor": ""},  # "" = terminal cursor
+        ]
+    )
+    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=200, status="open")
+    assert [m["ticker"] for m in out] == ["A", "B", "C"]
+    assert exhausted is True  # terminal cursor reached
+    # every request excluded combos server-side
+    assert all(params["mve_filter"] == "exclude" for _, params in client.calls)
+    # the second request carried the first page's cursor
+    assert client.calls[1][1]["cursor"] == "c1"
+
+
+async def test_scan_caps_result_at_scan_limit():
+    client = _FakeClient(responses=[{"markets": [{"ticker": str(i)} for i in range(5)]}])
+    out, _ = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    # first request asked for exactly scan_limit
+    assert client.calls[0][1]["limit"] == 3
+    # one page already satisfied the window — no second request
+    assert len(client.calls) == 1
+    # result is capped at scan_limit even if the page came back larger
+    assert [m["ticker"] for m in out] == ["0", "1", "2"]
+
+
+async def test_scan_exhausted_true_when_terminal_at_exactly_scan_limit():
+    """Regression: a terminal cursor that fires exactly when the window is
+    full must still report exhausted=True (the exchange ran out), not False."""
+    client = _FakeClient(
+        responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": ""}]
+    )
+    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(out) == 3
+    assert exhausted is True
+
+
+async def test_scan_not_exhausted_when_window_fills_with_more_available():
+    client = _FakeClient(
+        responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": "more"}]
+    )
+    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(out) == 3
+    assert exhausted is False  # window filled, a live cursor means more remain
+    assert len(client.calls) == 1
+
+
+async def test_scan_clamps_nonpositive_scan_limit():
+    client = _FakeClient(responses=[{"markets": [{"ticker": "A"}], "cursor": ""}])
+    out, _ = await _scan_markets_excluding_mve(client, scan_limit=0, status="open")
+    # scan_limit clamped up to 1 — one request asking for 1
+    assert client.calls[0][1]["limit"] == 1
+    assert len(out) == 1
+
+
+async def test_scan_dedupes_and_stops_on_nonadvancing_cursor():
+    """A non-advancing cursor (Kalshi pagination quirk) must not pad the
+    result with duplicates or loop forever."""
+    client = _FakeClient(
+        responses=[
+            {"markets": [{"ticker": "A"}], "cursor": "stuck"},
+            {"markets": [{"ticker": "A"}], "cursor": "stuck"},  # same page + cursor
+        ]
+    )
+    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=10, status="open")
+    assert [m["ticker"] for m in out] == ["A"]  # de-duped
+    assert exhausted is True  # no forward progress == exhausted
+    assert len(client.calls) == 2  # one fetch, one to discover the cursor is stuck
+
+
+async def test_scan_passes_series_ticker_when_given():
+    client = _FakeClient(responses=[{"markets": [], "cursor": ""}])
+    await _scan_markets_excluding_mve(
+        client, scan_limit=50, status="open", series_ticker="KXMLBGAME"
+    )
+    assert client.calls[0][1]["series_ticker"] == "KXMLBGAME"
+
+
+# ── _event_hint (issue #30) ────────────────────────────────────────────────
+
+
+async def test_event_hint_returns_actionable_message():
+    event = "KXMLBGAME-26JUN042010PITHOU"
+    markets = [f"{event}-HOU", f"{event}-PIT"]
+    client = _FakeClient(
+        responses=[
+            {
+                "event": {"event_ticker": event},
+                "markets": [{"ticker": t} for t in markets],
+            }
+        ]
+    )
+    hint = await _event_hint(client, event)
+    assert hint is not None
+    assert "EVENT ticker" in hint
+    for t in markets:
+        assert t in hint
+    # resolved via the events endpoint, requesting nested markets
+    assert client.calls[0][0] == f"/events/{event}"
+    assert client.calls[0][1]["with_nested_markets"] == "true"
+
+
+async def test_event_hint_none_when_not_an_event():
+    """A market ticker (or junk) 404s on /events/{ticker} — fail open."""
+    client = _FakeClient(error=KalshiAPIError(status=404, message="not found"))
+    assert await _event_hint(client, "KXMLBGAME-26JUN042010PITHOU-HOU") is None
+
+
+async def test_event_hint_none_when_event_has_no_markets():
+    client = _FakeClient(responses=[{"event": {"event_ticker": "X"}, "markets": []}])
+    assert await _event_hint(client, "X") is None
+
+
+async def test_event_hint_truncates_long_market_lists():
+    markets = [{"ticker": f"EVT-{i}"} for i in range(25)]
+    client = _FakeClient(responses=[{"markets": markets}])
+    hint = await _event_hint(client, "EVT")
+    assert "(+5 more)" in hint
+
+
+async def test_event_hint_truncation_boundary():
+    """Exactly 20 markets → all shown, no '+N more'; 21 → '+1 more'."""
+    c20 = _FakeClient(responses=[{"markets": [{"ticker": f"E20-{i}"} for i in range(20)]}])
+    hint20 = await _event_hint(c20, "E20")
+    assert "more)" not in hint20
+
+    c21 = _FakeClient(responses=[{"markets": [{"ticker": f"E21-{i}"} for i in range(21)]}])
+    hint21 = await _event_hint(c21, "E21")
+    assert "(+1 more)" in hint21
+
+
+async def test_event_hint_negative_cache_skips_repeat_probe():
+    """A non-event ticker must be probed once, then served from the negative
+    cache on repeat calls — no second /events request (issue: polling cost)."""
+    client = _FakeClient(error=KalshiAPIError(status=404, message="not found"))
+    assert await _event_hint(client, "REAL-MARKET-XYZ") is None
+    assert await _event_hint(client, "REAL-MARKET-XYZ") is None
+    # Only the first call hit the API; the second was cached.
+    assert len(client.calls) == 1
+
+
+def test_event_hint_miss_cache_is_hard_bounded():
+    """The negative cache must never grow past its cap, even if a process
+    probes far more distinct non-event tickers than the limit."""
+    for i in range(_EVENT_HINT_MISS_MAX + 100):
+        _record_event_hint_miss(f"T-{i}", float(i))
+    assert len(_event_hint_misses) <= _EVENT_HINT_MISS_MAX
+    # Oldest entries are evicted first (FIFO) — newest survives.
+    assert f"T-{_EVENT_HINT_MISS_MAX + 99}" in _event_hint_misses
+    assert "T-0" not in _event_hint_misses
+
+
+async def test_event_hint_ignores_markets_without_ticker():
+    client = _FakeClient(responses=[{"markets": [{"no_ticker": "x"}, {"ticker": "EVT-A"}]}])
+    hint = await _event_hint(client, "EVT")
+    assert "EVT-A" in hint
+
+
+# ── _single_ticker (issue #30 gate) ────────────────────────────────────────
+
+
+def test_single_ticker_detects_lone_ticker_tolerating_noise():
+    assert _single_ticker("KXFED-26MAR19") == "KXFED-26MAR19"
+    assert _single_ticker("  KXFED-26MAR19  ") == "KXFED-26MAR19"
+    assert _single_ticker("KXFED-26MAR19,") == "KXFED-26MAR19"  # trailing comma
+
+
+def test_single_ticker_none_for_multi_or_empty():
+    assert _single_ticker("A,B") is None
+    assert _single_ticker("") is None
+    assert _single_ticker("   ") is None
+    assert _single_ticker(",") is None

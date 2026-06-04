@@ -26,6 +26,7 @@ to stay under an LLM tool-result token cap even for combo markets.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from kalshi_mcp_server.errors import KalshiAPIError
@@ -185,6 +186,183 @@ def _project_market(
     return dict(market)
 
 
+_MVE_FILTER_VALUES: frozenset[str] = frozenset({"exclude", "only"})
+
+
+def _validate_mve_filter(value: str) -> str:
+    """Validate the `mve_filter` passthrough before it reaches Kalshi.
+
+    Kalshi accepts only "exclude" (drop multivariate/combo markets) or
+    "only" (return just combos). Anything else 400s server-side with a
+    less helpful message, so reject it locally.
+    """
+    if value not in _MVE_FILTER_VALUES:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"mve_filter must be 'exclude' or 'only', got {value!r}. "
+                "Use 'exclude' to drop multivariate (KXMVE…) combo markets, "
+                "or 'only' to return just those."
+            ),
+        )
+    return value
+
+
+def _volume_24h(market: dict[str, Any]) -> float:
+    """Best-effort parse of a market's 24h volume.
+
+    Kalshi sends it as a string in `volume_24h_fp`. Missing/garbage → 0.0
+    so it sorts to the bottom rather than blowing up the ranking.
+    """
+    try:
+        return float(market.get("volume_24h_fp") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rank_liquid_markets(
+    markets: list[dict[str, Any]],
+    *,
+    min_volume: float = 0.0,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Filter by min 24h volume, sort by 24h volume (desc), take the top
+    `limit`, and project each survivor to the minimal triage view."""
+    eligible = [m for m in markets if _volume_24h(m) >= min_volume]
+    eligible.sort(key=_volume_24h, reverse=True)
+    return [_minimal_market(m) for m in eligible[:limit]]
+
+
+async def _scan_markets_excluding_mve(
+    client: Any,
+    *,
+    scan_limit: int,
+    status: str,
+    series_ticker: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Page the markets listing with combos excluded, collecting up to
+    `scan_limit` markets. De-dupes by ticker and caps the result at
+    `scan_limit`. `scan_limit` is clamped to [1, 1000] to bound read-bucket
+    cost.
+
+    Returns `(markets, exhausted)`. `exhausted` is True when the scan reached
+    the end of all matching markets — an empty page, a terminal cursor (""),
+    or a non-advancing cursor (Kalshi's known quirk of returning the same
+    cursor forever). It is False when the scan stopped because the window
+    filled (`scan_limit` reached) while more markets remained — i.e. the
+    caller is seeing a windowed subset, not the full set.
+    """
+    scan_limit = max(1, min(scan_limit, 1000))
+    collected: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+    seen_cursors: set[str] = set()
+    cursor: str | None = None
+    exhausted = False
+    while len(collected) < scan_limit:
+        params: dict[str, Any] = {
+            "limit": min(1000, scan_limit - len(collected)),
+            "status": status,
+            "mve_filter": "exclude",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        body = await client.get("/markets", params=params)
+        page = body.get("markets") or []
+        for market in page:
+            ticker = market.get("ticker")
+            # De-dupe by ticker so a non-advancing cursor can't pad the list
+            # with repeats. Markets without a ticker (shouldn't happen) are
+            # kept as-is rather than collapsed into one.
+            if ticker is not None and ticker in seen_tickers:
+                continue
+            if ticker is not None:
+                seen_tickers.add(ticker)
+            collected.append(market)
+            if len(collected) >= scan_limit:
+                break
+        cursor = body.get("cursor")
+        # Stop on empty page, terminal cursor (""), or a cursor we've already
+        # followed (no forward progress) — all mean no more markets exist.
+        if not page or not cursor or cursor in seen_cursors:
+            exhausted = True
+            break
+        seen_cursors.add(cursor)
+    return collected[:scan_limit], exhausted
+
+
+# Negative cache for `_event_hint`: ticker -> monotonic time we last confirmed
+# it is NOT an event. The event-resolution probe runs on already-failed paths
+# (404 / empty book / empty list); without this, an agent polling a real but
+# illiquid market's orderbook would fire a fresh `/events` lookup on EVERY
+# poll. Caching the "not an event" verdict bounds that to one probe per ticker
+# per TTL. A confirmed event clears its entry so a later miss re-probes.
+_EVENT_HINT_MISS_TTL_S: float = 300.0
+_EVENT_HINT_MISS_MAX: int = 4096
+_event_hint_misses: dict[str, float] = {}
+
+
+def _record_event_hint_miss(ticker: str, now: float) -> None:
+    # Record (or refresh) a "not an event" verdict. Staleness is enforced at
+    # READ time via the TTL check; here we only keep the cache HARD-bounded.
+    # dict preserves insertion order, so evicting from the front is a simple
+    # O(overflow) FIFO — no full O(n) scan on every miss when at capacity.
+    _event_hint_misses[ticker] = now
+    overflow = len(_event_hint_misses) - _EVENT_HINT_MISS_MAX
+    if overflow > 0:
+        for stale in list(_event_hint_misses)[:overflow]:
+            del _event_hint_misses[stale]
+
+
+async def _event_hint(client: Any, ticker: str) -> str | None:
+    """If `ticker` is actually an EVENT ticker, return an actionable hint
+    listing its market tickers; otherwise return None.
+
+    Kalshi tools take MARKET tickers (with an outcome suffix, e.g.
+    `…PITHOU-HOU`); an EVENT ticker (`…PITHOU`) passed instead fails
+    silently — an empty orderbook, an empty markets list, or a blunt 404.
+    This resolver is called ONLY on that already-failed path, so the happy
+    path never pays for the extra read. It fails open: any error resolving
+    the event returns None rather than masking the caller's real problem.
+    A short-lived negative cache (`_event_hint_misses`) prevents a repeated
+    poll of the same non-event ticker from re-probing `/events` every time.
+    """
+    now = time.monotonic()
+    missed_at = _event_hint_misses.get(ticker)
+    if missed_at is not None and (now - missed_at) < _EVENT_HINT_MISS_TTL_S:
+        return None
+    try:
+        body = await client.get(f"/events/{ticker}", params={"with_nested_markets": "true"})
+    except KalshiAPIError:
+        _record_event_hint_miss(ticker, now)
+        return None
+    markets = (body.get("markets") or []) if isinstance(body, dict) else []
+    tickers = [m.get("ticker") for m in markets if isinstance(m, dict) and m.get("ticker")]
+    if not tickers:
+        _record_event_hint_miss(ticker, now)
+        return None
+    _event_hint_misses.pop(ticker, None)  # it IS an event — clear any stale miss
+    shown = ", ".join(tickers[:20])
+    more = f" (+{len(tickers) - 20} more)" if len(tickers) > 20 else ""
+    return (
+        f"'{ticker}' is an EVENT ticker, not a MARKET ticker. Its markets are: "
+        f"{shown}{more}. Retry with one of those market tickers, or call "
+        f"kalshi_get_event('{ticker}') to fetch the whole event."
+    )
+
+
+def _single_ticker(tickers: str) -> str | None:
+    """Return the sole ticker if `tickers` names exactly one, tolerating
+    surrounding whitespace and a trailing comma; otherwise None.
+
+    Used to decide whether an empty `kalshi_get_markets(tickers=…)` result
+    warrants an event-vs-market hint — only meaningful for a single ticker.
+    """
+    parts = [t.strip() for t in tickers.split(",") if t.strip()]
+    return parts[0] if len(parts) == 1 else None
+
+
 def register(server: FastMCP) -> None:
     """Register discovery tools against the FastMCP server."""
     client = server._kalshi_client  # type: ignore[attr-defined]
@@ -199,6 +377,7 @@ def register(server: FastMCP) -> None:
         tickers: str | None = None,
         min_close_ts: int | None = None,
         max_close_ts: int | None = None,
+        mve_filter: str | None = None,
         compact: bool = False,
         minimal: bool = False,
         fields: str | None = None,
@@ -217,9 +396,18 @@ def register(server: FastMCP) -> None:
                 "settled". Multiple OK with comma-separated values.
             event_ticker: Return only markets in a specific event.
             series_ticker: Return only markets in a specific series.
-            tickers: Comma-separated list of market tickers to fetch.
+            tickers: Comma-separated list of market tickers to fetch. These
+                must be MARKET tickers (with an outcome suffix), not EVENT
+                tickers — an event ticker returns an empty list. (When a
+                single event ticker is passed, this tool raises a hint
+                naming the real market tickers instead of an empty result.)
             min_close_ts: Filter to markets closing on/after this unix ts.
             max_close_ts: Filter to markets closing on/before this unix ts.
+            mve_filter: Multivariate (combo) market filter. "exclude" drops
+                `KXMVE…` combo markets server-side — strongly recommended for
+                discovery, since the default open listing is dominated by
+                combos with empty/one-sided books. "only" returns just combos.
+                Default None (no filter). See also `kalshi_find_liquid_markets`.
             compact: When True, drop verbose fields (rules text, previous
                 prices, etc.) from each market. Default False. NOTE:
                 compact is a blacklist and does NOT shrink multivariate
@@ -263,13 +451,83 @@ def register(server: FastMCP) -> None:
             params["min_close_ts"] = min_close_ts
         if max_close_ts is not None:
             params["max_close_ts"] = max_close_ts
+        if mve_filter is not None:
+            params["mve_filter"] = _validate_mve_filter(mve_filter)
         body = await client.get("/markets", params=params)
+
+        # A single EVENT ticker passed via `tickers` yields an empty list
+        # with no error — surface an actionable hint instead of a silent [].
+        if tickers and not body.get("markets"):
+            sole = _single_ticker(tickers)
+            if sole:
+                hint = await _event_hint(client, sole)
+                if hint:
+                    raise KalshiAPIError(status=0, message=hint)
+
         if "markets" in body:
             body["markets"] = [
                 _project_market(m, compact=compact, minimal=minimal, fields=fields)
                 for m in body["markets"]
             ]
         return body
+
+    @server.tool
+    async def kalshi_find_liquid_markets(
+        limit: int = 20,
+        scan_limit: int = 200,
+        status: str = "open",
+        series_ticker: str | None = None,
+        min_volume: float = 0.0,
+    ) -> dict[str, Any]:
+        """Find the most liquid SINGLE (non-combo) markets, ranked by 24h volume.
+
+        Kalshi's default market listing is dominated by multivariate
+        (`KXMVE…`) combo markets with empty/one-sided books, and the API
+        offers NO server-side sort. This helper does the de-noising for you:
+        it pages the listing with combos excluded (`mve_filter=exclude`),
+        ranks the result by 24h volume locally, and returns a short
+        minimal-projection shortlist — the page an agent actually wants.
+
+        Args:
+            limit: Size of the returned shortlist (top-N by volume). Default 20.
+            scan_limit: How many markets to fetch+rank before taking the top
+                `limit`. Higher = more thorough but more read-bucket cost.
+                Default 200, capped at 1000.
+            status: Lifecycle filter (default "open"). Same values as
+                `kalshi_get_markets`.
+            series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
+            min_volume: Drop markets whose 24h volume is below this (same
+                units as `volume_24h_fp`). Default 0.0 (keep all).
+
+        IMPORTANT — windowed ranking: Kalshi has no server-side sort, so the
+        ranking is over the SCANNED WINDOW only (the top markets among the
+        first `scan_limit` results), NOT a global exchange-wide ranking unless
+        the scan exhausted all matching markets. Check `complete` (and
+        `scanned`) in the response; raise `scan_limit` (up to 1000) to look
+        deeper when `complete` is False.
+
+        Returns:
+            `markets`: ranked shortlist (minimal projection), highest 24h
+                volume first.
+            `scanned`: number of distinct markets fetched and ranked.
+            `scan_limit`: the effective scan cap (after clamping to 1-1000).
+            `complete`: True if the scan reached the end of all markets
+                matching `status` + combo-exclusion before hitting `scan_limit`
+                — the ranking then covers every such market (after `min_volume`
+                is applied locally). False means the window filled and more
+                matching markets exist beyond it; raise `scan_limit` to see them.
+        """
+        effective_scan = max(1, min(scan_limit, 1000))
+        collected, exhausted = await _scan_markets_excluding_mve(
+            client, scan_limit=effective_scan, status=status, series_ticker=series_ticker
+        )
+        ranked = _rank_liquid_markets(collected, min_volume=min_volume, limit=limit)
+        return {
+            "markets": ranked,
+            "scanned": len(collected),
+            "scan_limit": effective_scan,
+            "complete": exhausted,
+        }
 
     @server.tool
     async def kalshi_get_market(
@@ -300,7 +558,16 @@ def register(server: FastMCP) -> None:
         the orderbook and `volume_24h_fp` / `open_interest_fp` instead.
         """
         ticker = _validate_ticker(ticker)
-        body = await client.get(f"/markets/{ticker}")
+        try:
+            body = await client.get(f"/markets/{ticker}")
+        except KalshiAPIError as exc:
+            # A 404 is often an EVENT ticker passed where a market ticker
+            # was expected — give an actionable hint instead of a blunt 404.
+            if exc.status == 404:
+                hint = await _event_hint(client, ticker)
+                if hint:
+                    raise KalshiAPIError(status=404, message=hint) from exc
+            raise
         if "market" in body:
             body["market"] = _project_market(
                 body["market"], compact=compact, minimal=minimal, fields=fields

@@ -7,12 +7,12 @@
     "url": "https://github.com/cejor6/kalshi-mcp-server",
     "source": "github"
   },
-  "version": "0.1.8",
+  "version": "0.1.9",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "kalshi-mcp-server",
-      "version": "0.1.8",
+      "version": "0.1.9",
       "transport": {
         "type": "stdio"
       },
@@ -63,7 +63,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/cejor6/kalshi-mcp-server:0.1.8",
+      "identifier": "ghcr.io/cejor6/kalshi-mcp-server:0.1.9",
       "transport": {
         "type": "stdio"
       },

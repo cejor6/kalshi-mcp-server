@@ -255,7 +255,7 @@ the worked example.
 | Group | Tools |
 |---|---|
 | Exchange / account | `kalshi_get_exchange_status`, `kalshi_get_exchange_schedule`, `kalshi_get_api_limits`, `kalshi_get_environment` |
-| Discovery | `kalshi_get_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_trades` |
+| Discovery | `kalshi_get_markets`, `kalshi_find_liquid_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_trades` |
 | Market data | `kalshi_get_orderbook`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_market_trades` |
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
@@ -281,6 +281,21 @@ markets (the event objects themselves only have the `compact` view).
 `0.0000` on every market, even deep books — measure liquidity from the
 orderbook (best bid/ask + resting size) plus `volume_24h_fp` /
 `open_interest_fp`. It is stripped from `compact` and `minimal` views.
+
+**Finding tradeable markets:** the default open listing is dominated by
+multivariate (`KXMVE…`) combo markets with empty/one-sided books. Pass
+`mve_filter="exclude"` to `kalshi_get_markets` to drop them server-side, or
+use `kalshi_find_liquid_markets` — it excludes combos, ranks by 24h volume,
+and returns a short minimal-projection shortlist. (Kalshi has no server-side
+sort, so the helper's ranking is over a bounded scan window, reported as
+`scanned` in the result.)
+
+**Event ticker vs market ticker:** a *market* ticker carries an outcome
+suffix (`…PITHOU-HOU`); an *event* ticker (`…PITHOU`) does not. Passing an
+event ticker to `kalshi_get_market` / `kalshi_get_orderbook` / `kalshi_get_markets`
+used to fail silently (404, or an empty book/list read as "no liquidity").
+These tools now detect that case and raise an actionable hint naming the
+real market tickers instead.
 
 ## Resources
 
