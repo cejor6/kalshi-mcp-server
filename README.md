@@ -266,6 +266,22 @@ local safety checks and returns a `confirmation_id`; nothing is sent to
 Kalshi until you call `kalshi_confirm_order` with that token. Cancel and
 decrease bypass the trading-enabled flag — they only reduce exposure.
 
+**Listing markets for an LLM:** `kalshi_get_markets` / `kalshi_get_market`
+accept `minimal=true` to project each market down to a small whitelist of
+triage fields (ticker, prices, sizes, volume, status, close time). Prefer
+this over `compact=true` for scanning — `compact` is a blacklist and barely
+shrinks multivariate (`KXMVE…`) combo markets, whose bulk lives in
+`custom_strike` / `mve_selected_legs` / long sub-titles. Pass a custom
+`fields="ticker,yes_bid_dollars,…"` to override the default whitelist.
+View precedence is `fields` > `minimal` > `compact` > full. `kalshi_get_event`
+/ `kalshi_get_events` accept the same `minimal` / `fields` for their nested
+markets (the event objects themselves only have the `compact` view).
+
+**Don't gate on `liquidity_dollars`:** Kalshi currently returns it as
+`0.0000` on every market, even deep books — measure liquidity from the
+orderbook (best bid/ask + resting size) plus `volume_24h_fp` /
+`open_interest_fp`. It is stripped from `compact` and `minimal` views.
+
 ## Resources
 
 | URI | Description |
