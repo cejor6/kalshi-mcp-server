@@ -19,10 +19,19 @@ credentials.*.json
 # CLAUDE.local.md is the personal scratchpad — NOT committed.
 CLAUDE.local.md
 AGENTS.local.md
-.claude/settings.local.json
-.claude/.session*
 .notes/
 notes.local.md
+
+# -- .claude/ : allowlist (fail-closed) ------------------------------------
+# Ignore EVERYTHING under .claude/ by default, then re-include only the
+# files we deliberately share. This way new Claude Code runtime artifacts
+# (session locks, caches, personal settings.local.json, etc.) can never be
+# committed by accident — only what's explicitly listed below is tracked.
+# If you add shared project skills/agents, re-include them too, e.g.
+#   !.claude/skills/
+#   !.claude/skills/**
+.claude/*
+!.claude/settings.json
 
 # -- Python ----------------------------------------------------------------
 __pycache__/
