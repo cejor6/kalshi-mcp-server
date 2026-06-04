@@ -79,6 +79,7 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_get_environment",
         # discovery.py
         "kalshi_get_markets",
+        "kalshi_find_liquid_markets",
         "kalshi_get_market",
         "kalshi_get_event",
         "kalshi_get_events",
