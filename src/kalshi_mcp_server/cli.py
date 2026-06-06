@@ -145,7 +145,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         signer = _build_signer(config)
-        safety = SafetyController(config)
+        # Runtime safety-limit overrides persist via this store when
+        # MCP_REDIS_URL is set; otherwise they're in-memory (reset on
+        # restart). Building the store is non-fatal — an unreachable Redis
+        # surfaces later, at load/save time.
+        from kalshi_mcp_server.safety_store import build_limits_store
+
+        limits_store, limits_store_desc = build_limits_store()
+        safety = SafetyController(config, store=limits_store)
+        logger.info("Safety-limit override store: %s", limits_store_desc)
         # Start with Basic-tier defaults; the lifespan hook below queries
         # /account/limits at boot and reconfigures the limiter to the
         # real numbers Kalshi reports. Basic is the safer fallback if
@@ -171,7 +179,26 @@ def main(argv: list[str] | None = None) -> int:
         the real numbers. If the call fails (network glitch, brief auth
         hiccup), we keep the Basic defaults — the server still works,
         just on the conservative budget.
+
+        Also restores any persisted runtime safety-limit override (clamped
+        to the env ceilings). If the override store is unreachable we boot
+        at the env ceilings and warn — availability is not coupled to the
+        optional persistence backend, and the ceiling is always the loosest
+        allowed state, so this fails safe.
         """
+        try:
+            effective = await safety.load_persisted()
+            if effective != safety.ceilings:
+                logger.info(
+                    "Restored persisted runtime safety limits (clamped to env ceilings): %s",
+                    effective.as_dict(),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not load persisted safety limits — booting at env ceilings. (%s)",
+                exc,
+            )
+
         try:
             limits = await client.get("/account/limits")
             read = limits.get("read", {}) or {}

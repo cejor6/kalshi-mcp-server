@@ -19,6 +19,7 @@ def register(server: FastMCP) -> None:
     """Register account-state resources against the FastMCP server."""
     client = server._kalshi_client  # type: ignore[attr-defined]
     config = server._kalshi_config  # type: ignore[attr-defined]
+    safety = server._kalshi_safety  # type: ignore[attr-defined]
     rate_limiter = server._kalshi_rate_limiter  # type: ignore[attr-defined]
 
     @server.resource(
@@ -26,25 +27,25 @@ def register(server: FastMCP) -> None:
         name="Kalshi environment",
         description=(
             "Read-only snapshot of which Kalshi environment this MCP server "
-            "is connected to (demo vs prod), the trading-enabled flag, "
-            "configured safety caps, and the current local rate-limit "
-            "bucket headroom. Read this before any write action to confirm "
-            "you're operating in the expected environment."
+            "is connected to (demo vs prod), the trading-enabled flag, the "
+            "safety limits currently in force plus their env-configured "
+            "ceilings, and the current local rate-limit bucket headroom. "
+            "Read this before any write action to confirm you're operating "
+            "in the expected environment."
         ),
         mime_type="application/json",
     )
     async def environment() -> str:
+        effective = safety.effective_limits()
+        ceilings = safety.ceilings
         payload = {
             "env": config.env,
             "trading_enabled": config.trading_enabled,
             "rest_base": config.rest_base,
             "ws_url": config.ws_url,
-            "safety_limits": {
-                "max_order_size_usd": config.max_order_size_usd,
-                "daily_limit_usd": config.daily_limit_usd,
-                "max_contracts_per_order": config.max_contracts_per_order,
-                "cash_reserve_usd": config.cash_reserve_usd,
-            },
+            "safety_limits": effective.as_dict(),
+            "safety_ceilings": ceilings.as_dict(),
+            "safety_limits_persist": safety.persistence_durable,
             "rate_limit_headroom": {
                 "read_tokens": round(rate_limiter.read.tokens, 2),
                 "read_capacity": rate_limiter.read.capacity,

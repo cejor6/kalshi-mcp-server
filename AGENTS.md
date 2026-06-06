@@ -118,16 +118,51 @@ Two startup guards (`src/kalshi_mcp_server/config.py`):
    cancellation, and amendment tools refuse to execute. Set the flag to
    `1` to enable writes.
 
-Three per-order checks (`src/kalshi_mcp_server/safety.py`), all enforced
+Four per-order checks (`src/kalshi_mcp_server/safety.py`), all enforced
 locally before any request goes to Kalshi:
 
 - `MCP_MAX_ORDER_SIZE_USD` — refuse orders whose worst-case cost exceeds it.
 - `MCP_DAILY_LIMIT_USD` — refuse if projected daily spend would exceed it.
+- `MCP_MAX_CONTRACTS_PER_ORDER` — refuse orders with more contracts than this.
 - `MCP_CASH_RESERVE_USD` — refuse if the order would leave less than this
   in cash.
 
-All three are operator-configurable. The defaults are conservative on
-purpose — fork-and-adjust to your risk tolerance.
+All are operator-configurable. The defaults are conservative on purpose —
+fork-and-adjust to your risk tolerance.
+
+**Runtime adjustment (without a redeploy).** The env vars set the *hard
+ceiling*. The `kalshi_set_safety_limits` operator tool can tighten any of
+the four limits at runtime — but **never loosen one past its env ceiling**
+(`SafetyController` validates direction-aware: the three caps may only go
+down, `cash_reserve_usd` may only go up; the env value is the absolute
+loosest setting). This is the fail-closed property: a runtime actor or bug
+can shrink the risk envelope but never widen it. To raise a ceiling you
+must change the env var and redeploy. The limits in force vs. their
+ceilings are visible via `kalshi_get_environment` and the
+`kalshi://environment` resource. Non-finite values (`NaN`/`inf`) are
+rejected on every path — on a write, on load from the store, and on the
+env ceilings themselves — since they would otherwise slip past the
+`<`/`>` comparisons and silently disable a cap.
+
+The tool is gated by `MCP_ALLOW_RUNTIME_LIMIT_TUNING` (default on). Set it
+to `0` to not register `kalshi_set_safety_limits` at all — useful on a
+shared HTTP deploy where allowlisted users shouldn't be able to re-tune
+the safety envelope; limits then change only via env var + redeploy.
+
+**Persistence.** Runtime overrides live in a `LimitsStore`
+(`safety.py` / `safety_store.py`). The default is in-memory — a restart
+reverts to the env ceilings. When `MCP_REDIS_URL` is set (the same Redis
+the OAuth proxy can use), a Redis-backed store persists overrides across
+restarts/redeploys, so a "fast clamp-down" sticks. Two invariants hold
+the safety line: (1) only the *sparse* set of fields that differ from the
+ceiling is stored, and on load each is **re-clamped to the current env
+ceiling** — so a stale/corrupt stored value can only ever tighten, never
+loosen, and raising an env ceiling takes effect for any field not actively
+tightened; (2) the in-memory update always succeeds even if the store
+write fails (the emergency clamp-down is never blocked by a Redis blip).
+Caveat: persistence is single-replica-coherent (write-through + load-on-
+boot); if you scale past one instance, a mid-life change won't reach other
+replicas until they restart.
 
 A fourth gate fires at startup when HTTP transport is used:
 **`http` transport refuses to start without OAuth configured** unless

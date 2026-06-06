@@ -17,6 +17,7 @@ held here and consulted by `safety.py` before any write is attempted.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -44,9 +45,13 @@ def _get_float(name: str, default: float) -> float:
     if raw is None or raw.strip() == "":
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError as exc:
         raise ConfigError(f"Env var {name}={raw!r} is not a number.") from exc
+    if not math.isfinite(value):
+        # nan/inf would defeat the safety-limit comparisons downstream.
+        raise ConfigError(f"Env var {name}={raw!r} must be a finite number.")
+    return value
 
 
 def _get_int(name: str, default: int) -> int:
@@ -86,6 +91,13 @@ class Config:
     transport: Literal["stdio", "http"]
     port: int
     log_level: str
+
+    # When False, the kalshi_set_safety_limits operator tool is not
+    # registered — limits can then only be changed via env var + redeploy.
+    # Defaults True; set MCP_ALLOW_RUNTIME_LIMIT_TUNING=0 to disable (useful
+    # on a shared HTTP deploy where allowlisted users shouldn't re-tune the
+    # safety envelope). Has a default so existing constructors stay valid.
+    runtime_limit_tuning_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -137,6 +149,7 @@ class Config:
             transport=_resolve_transport(),
             port=_get_int("PORT", 8000),
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+            runtime_limit_tuning_enabled=_get_bool("MCP_ALLOW_RUNTIME_LIMIT_TUNING", default=True),
         )
 
 

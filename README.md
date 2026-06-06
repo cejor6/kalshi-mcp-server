@@ -254,7 +254,7 @@ the worked example.
 
 | Group | Tools |
 |---|---|
-| Exchange / account | `kalshi_get_exchange_status`, `kalshi_get_exchange_schedule`, `kalshi_get_api_limits`, `kalshi_get_environment` |
+| Exchange / account | `kalshi_get_exchange_status`, `kalshi_get_exchange_schedule`, `kalshi_get_api_limits`, `kalshi_get_environment`, `kalshi_set_safety_limits` |
 | Discovery | `kalshi_get_markets`, `kalshi_find_liquid_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_trades` |
 | Market data | `kalshi_get_orderbook`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_market_trades` |
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
@@ -301,7 +301,7 @@ real market tickers instead.
 
 | URI | Description |
 |---|---|
-| `kalshi://environment` | Current env, safety caps, rate-limit headroom (no API call) |
+| `kalshi://environment` | Current env, safety limits in force + their env ceilings, rate-limit headroom (no API call) |
 | `kalshi://balance` | Cash + buying power |
 | `kalshi://positions` | Open positions (unsettled) |
 | `kalshi://orders` | Resting orders (open / partially filled) |
@@ -323,6 +323,15 @@ ATM is — small mistakes shouldn't cost large amounts.
 - Per-order caps (`MCP_MAX_ORDER_SIZE_USD`, `MCP_DAILY_LIMIT_USD`,
   `MCP_MAX_CONTRACTS_PER_ORDER`, `MCP_CASH_RESERVE_USD`) are checked
   before the request reaches Kalshi.
+- **Tighten limits at runtime, no redeploy.** Those env vars are the hard
+  *ceiling*. The `kalshi_set_safety_limits` tool can tighten any limit
+  on a running server (e.g. a fast clamp-down) but can **never loosen one
+  past its env ceiling** — the three caps only go down, the cash reserve
+  only goes up. Raising a ceiling still requires changing the env var and
+  redeploying. The limits in force vs. their ceilings show up in
+  `kalshi_get_environment` and `kalshi://environment`. Set `MCP_REDIS_URL`
+  to make runtime changes survive a restart (otherwise they reset to the
+  env ceilings on reboot).
 
 See [AGENTS.md](AGENTS.md) for the full design.
 

@@ -77,6 +77,7 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_get_exchange_schedule",
         "kalshi_get_api_limits",
         "kalshi_get_environment",
+        "kalshi_set_safety_limits",
         # discovery.py
         "kalshi_get_markets",
         "kalshi_find_liquid_markets",
