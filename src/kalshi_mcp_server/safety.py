@@ -78,11 +78,14 @@ class LimitsStore(Protocol):
 
     durable: bool
 
-    async def load(self) -> dict[str, float | int] | None: ...
+    async def load(self) -> dict[str, float | int] | None:
+        """Return the stored sparse override map, or None if nothing is stored."""
 
-    async def save(self, overrides: dict[str, float | int]) -> None: ...
+    async def save(self, overrides: dict[str, float | int]) -> None:
+        """Persist the sparse override map (fields differing from the ceiling)."""
 
-    async def clear(self) -> None: ...
+    async def clear(self) -> None:
+        """Remove any persisted override."""
 
 
 class InMemoryLimitsStore:
