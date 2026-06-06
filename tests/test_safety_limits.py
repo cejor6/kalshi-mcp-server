@@ -14,6 +14,9 @@ couple of small fakes (recording / failing) that implement `LimitsStore`.
 
 from __future__ import annotations
 
+import asyncio
+import math
+
 import httpx
 import pytest
 from fastmcp import FastMCP
@@ -38,6 +41,7 @@ def _config(
     daily_limit_usd: float = 250.0,
     max_contracts_per_order: int = 100,
     cash_reserve_usd: float = 0.0,
+    runtime_limit_tuning_enabled: bool = True,
 ) -> Config:
     return Config(
         key_id="test-key",
@@ -54,6 +58,7 @@ def _config(
         transport="stdio",
         port=8000,
         log_level="INFO",
+        runtime_limit_tuning_enabled=runtime_limit_tuning_enabled,
     )
 
 
@@ -169,6 +174,33 @@ async def test_negative_value_rejected():
         await ctrl.set_limits(max_order_size_usd=-1.0)
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+async def test_non_finite_value_rejected_on_set(bad):
+    # NaN/inf would slip past the < / > comparisons and silently disable the
+    # cap (every NaN comparison is False). They must be rejected outright.
+    ctrl = SafetyController(_config(max_order_size_usd=25.0))
+    with pytest.raises(SafetyError):
+        await ctrl.set_limits(max_order_size_usd=bad)
+    # Nothing was applied: the original $25 cap is intact and still enforced.
+    assert ctrl.effective_limits().max_order_size_usd == 25.0
+    ctrl.check_order(_intent(count=40, price=50))  # $20 < $25 still passes
+    with pytest.raises(SafetyError):
+        ctrl.check_order(_intent(count=60, price=50))  # $30 > $25 still blocked
+
+
+async def test_inf_cash_reserve_rejected():
+    # +inf reserve would make every order fail (unsatisfiable) — reject it.
+    ctrl = SafetyController(_config(cash_reserve_usd=0.0))
+    with pytest.raises(SafetyError):
+        await ctrl.set_limits(cash_reserve_usd=math.inf)
+
+
+async def test_all_none_call_is_rejected():
+    ctrl = SafetyController(_config())
+    with pytest.raises(SafetyError):
+        await ctrl.set_limits()
+
+
 # --- partial updates / reset ----------------------------------------------
 
 
@@ -260,6 +292,20 @@ async def test_load_persisted_ignores_corrupt_field():
     assert eff.max_order_size_usd == 25.0  # fell back to ceiling
 
 
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+async def test_load_persisted_drops_non_finite_value(bad):
+    # json.loads accepts NaN/Infinity (CPython extension), so a corrupt or
+    # hostile Redis value could carry one. It must never become an effective
+    # limit — fall back to the ceiling.
+    store = InMemoryLimitsStore()
+    await store.save({"max_order_size_usd": bad})
+    ctrl = SafetyController(_config(max_order_size_usd=25.0), store=store)
+
+    eff = await ctrl.load_persisted()
+    assert eff.max_order_size_usd == 25.0
+    assert math.isfinite(eff.max_order_size_usd)
+
+
 # --- persistence failures degrade gracefully ------------------------------
 
 
@@ -281,11 +327,94 @@ async def test_load_persisted_propagates_store_error():
     assert ctrl.effective_limits() == ctrl.ceilings
 
 
+# --- concurrency: writers are serialized, persisted state isn't lost --------
+
+
+class _SlowStore:
+    """Durable store whose save yields control, to surface interleaving."""
+
+    durable = True
+
+    def __init__(self) -> None:
+        self._value: dict[str, float] | None = None
+        self.saves = 0
+
+    async def load(self):
+        return self._value
+
+    async def save(self, overrides):
+        # Yield so a concurrent set_limits would interleave here if the
+        # critical section didn't span the persist.
+        await asyncio.sleep(0)
+        self._value = dict(overrides)
+        self.saves += 1
+
+    async def clear(self):
+        await asyncio.sleep(0)
+        self._value = None
+
+
+async def test_concurrent_set_limits_do_not_lose_an_override():
+    store = _SlowStore()
+    ctrl = SafetyController(_config(max_order_size_usd=25.0, daily_limit_usd=250.0), store=store)
+
+    # Two concurrent tightenings of DIFFERENT fields. Because set_limits holds
+    # the lock across the persist, the second sees the first's result and the
+    # final stored state carries BOTH overrides (no last-writer-wins clobber).
+    await asyncio.gather(
+        ctrl.set_limits(max_order_size_usd=10.0),
+        ctrl.set_limits(daily_limit_usd=100.0),
+    )
+
+    eff = ctrl.effective_limits()
+    assert eff.max_order_size_usd == 10.0
+    assert eff.daily_limit_usd == 100.0
+    assert store._value == {"max_order_size_usd": 10.0, "daily_limit_usd": 100.0}
+
+
+# --- documented operator behaviors (regression guards) ----------------------
+
+
+async def test_tightening_daily_below_already_spent_blocks_further_orders():
+    ctrl = SafetyController(_config(daily_limit_usd=250.0))
+    # Spend $20 today.
+    ctrl.record_order_committed(_intent(count=40, price=50))
+    # Tighten the daily cap below what's already spent.
+    await ctrl.set_limits(daily_limit_usd=10.0)
+    # Any further order is now refused for the rest of the UTC day.
+    with pytest.raises(SafetyError):
+        ctrl.check_order(_intent(count=2, price=50))  # even $1 projects > $10
+
+
+async def test_max_contracts_zero_freezes_all_orders():
+    ctrl = SafetyController(_config(max_contracts_per_order=100))
+    await ctrl.set_limits(max_contracts_per_order=0)
+    with pytest.raises(SafetyError):
+        ctrl.check_order(_intent(count=1, price=1))
+
+
+# --- operator-tool gate -----------------------------------------------------
+
+
+async def test_tool_absent_when_runtime_tuning_disabled(rsa_private_key):
+    server = _make_server(rsa_private_key, config=_config(runtime_limit_tuning_enabled=False))
+    names = {t.name for t in await server.list_tools()}
+    assert "kalshi_set_safety_limits" not in names
+    # The read-only environment tool is still registered.
+    assert "kalshi_get_environment" in names
+
+
+async def test_tool_present_when_runtime_tuning_enabled(rsa_private_key):
+    server = _make_server(rsa_private_key, config=_config(runtime_limit_tuning_enabled=True))
+    names = {t.name for t in await server.list_tools()}
+    assert "kalshi_set_safety_limits" in names
+
+
 # --- tool wiring ----------------------------------------------------------
 
 
-def _make_server(rsa_private_key, *, store=None) -> FastMCP:
-    config = _config()
+def _make_server(rsa_private_key, *, store=None, config=None) -> FastMCP:
+    config = config or _config()
     signer = KalshiSigner(key_id="test-key", private_key=rsa_private_key)
     limiter = KalshiRateLimiter(TierLimits.basic())
     http = httpx.AsyncClient(

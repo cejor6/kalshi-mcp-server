@@ -10,7 +10,9 @@ before sending. The controller raises `SafetyError` on policy violations.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -76,9 +78,9 @@ class LimitsStore(Protocol):
 
     durable: bool
 
-    async def load(self) -> dict[str, float] | None: ...
+    async def load(self) -> dict[str, float | int] | None: ...
 
-    async def save(self, overrides: dict[str, float]) -> None: ...
+    async def save(self, overrides: dict[str, float | int]) -> None: ...
 
     async def clear(self) -> None: ...
 
@@ -93,12 +95,12 @@ class InMemoryLimitsStore:
     durable = False
 
     def __init__(self) -> None:
-        self._value: dict[str, float] | None = None
+        self._value: dict[str, float | int] | None = None
 
-    async def load(self) -> dict[str, float] | None:
+    async def load(self) -> dict[str, float | int] | None:
         return self._value
 
-    async def save(self, overrides: dict[str, float]) -> None:
+    async def save(self, overrides: dict[str, float | int]) -> None:
         self._value = dict(overrides)
 
     async def clear(self) -> None:
@@ -159,7 +161,12 @@ class SafetyController:
         self._ceilings = SafetyLimits.from_config(config)
         self._effective = self._ceilings
         self._store: LimitsStore = store if store is not None else InMemoryLimitsStore()
-        self._limits_lock = threading.Lock()
+        # Serializes writers (set_limits / load_persisted) so a concurrent
+        # pair can't race their persisted state. An asyncio.Lock (not a
+        # threading.Lock) is correct here because the writers are async and
+        # hold the lock across an `await` to the store. Readers do NOT take
+        # this lock — see effective_limits.
+        self._limits_lock = asyncio.Lock()
         self._daily = _DailyCounter()
 
     @property
@@ -168,9 +175,27 @@ class SafetyController:
         return self._ceilings
 
     def effective_limits(self) -> SafetyLimits:
-        """The limits currently in force (env ceiling, tightened by any runtime override)."""
-        with self._limits_lock:
-            return self._effective
+        """The limits currently in force (env ceiling, tightened by any runtime override).
+
+        Deliberately lock-free: `_effective` is an immutable frozen dataclass
+        and a writer swaps it with a single atomic reference assignment, so a
+        sync reader (check_order) sees either the old or the new snapshot in
+        full — never a torn read. This keeps the order hot path lock-free.
+        """
+        return self._effective
+
+    def environment_view(self) -> dict[str, object]:
+        """The safety fields for `kalshi_get_environment` / `kalshi://environment`.
+
+        Centralized here so the two callers can't drift: `safety_limits` are
+        the limits in force, `safety_ceilings` the env hard maximums, and
+        `safety_limits_persist` whether a runtime change survives a restart.
+        """
+        return {
+            "safety_limits": self._effective.as_dict(),
+            "safety_ceilings": self._ceilings.as_dict(),
+            "safety_limits_persist": self._store.durable,
+        }
 
     @property
     def persistence_durable(self) -> bool:
@@ -197,6 +222,7 @@ class SafetyController:
         best-effort: the in-memory update always succeeds (so an emergency
         clamp-down takes effect immediately even if the store is down), but
         `durably_persisted` is False if the change won't survive a restart.
+        Raises `SafetyError` if no field is supplied (this is a setter).
         """
         provided: dict[str, float] = {
             "max_order_size_usd": max_order_size_usd,
@@ -205,17 +231,34 @@ class SafetyController:
             "cash_reserve_usd": cash_reserve_usd,
         }
         provided = {name: value for name, value in provided.items() if value is not None}
+        if not provided:
+            raise SafetyError(
+                "kalshi_set_safety_limits needs at least one limit to change; all "
+                "fields were omitted. Use kalshi_get_environment to view the "
+                "current limits."
+            )
         for name, value in provided.items():
             self._validate_within_ceiling(name, value)
 
-        with self._limits_lock:
-            merged = self._effective.as_dict()
+        # Hold the lock across the compute, swap, AND persist so two
+        # concurrent set_limits calls can't interleave their store writes and
+        # leave Redis reflecting a stale subset of the overrides.
+        async with self._limits_lock:
+            previous = self._effective
+            merged = previous.as_dict()
             for name, value in provided.items():
                 merged[name] = int(value) if name == "max_contracts_per_order" else float(value)
             new_effective = SafetyLimits(**merged)  # type: ignore[arg-type]
             self._effective = new_effective
+            persisted = await self._persist(new_effective)
 
-        persisted = await self._persist(new_effective)
+        if new_effective != previous:
+            logger.info(
+                "Runtime safety limits changed: %s -> %s (persisted=%s)",
+                previous.as_dict(),
+                new_effective.as_dict(),
+                persisted,
+            )
         return new_effective, persisted
 
     async def load_persisted(self) -> SafetyLimits:
@@ -227,15 +270,20 @@ class SafetyController:
         unreachable — the caller (CLI boot) catches that and keeps the env
         ceilings, logging a warning.
         """
-        overrides = await self._store.load()
-        if not overrides:
-            return self._effective
-        merged = self._apply_overrides_clamped(overrides)
-        with self._limits_lock:
+        async with self._limits_lock:
+            overrides = await self._store.load()
+            if not overrides:
+                return self._effective
+            merged = self._apply_overrides_clamped(overrides)
             self._effective = merged
-        return merged
+            return merged
 
     def _validate_within_ceiling(self, name: str, value: float) -> None:
+        if not math.isfinite(value):
+            # NaN/inf would slip past the < / > comparisons below (every NaN
+            # comparison is False; +inf reserve is unsatisfiable), so reject
+            # them up front — they must never become an effective limit.
+            raise SafetyError(f"{name} must be a finite number, got {value}.")
         if value < 0:
             raise SafetyError(f"{name} must be non-negative, got {value}.")
         ceiling = getattr(self._ceilings, name)
@@ -255,7 +303,7 @@ class SafetyController:
                 f"redeploy to lift the ceiling."
             )
 
-    def _overrides_of(self, effective: SafetyLimits) -> dict[str, float]:
+    def _overrides_of(self, effective: SafetyLimits) -> dict[str, float | int]:
         """The fields where `effective` differs from the env ceiling (sparse)."""
         return {
             name: getattr(effective, name)
@@ -263,16 +311,20 @@ class SafetyController:
             if getattr(effective, name) != getattr(self._ceilings, name)
         }
 
-    def _apply_overrides_clamped(self, overrides: dict[str, float]) -> SafetyLimits:
+    def _apply_overrides_clamped(self, overrides: dict[str, float | int]) -> SafetyLimits:
         merged = self._ceilings.as_dict()
         for name in _ALL_LIMIT_FIELDS:
             if name not in overrides:
                 continue
+            # Coerce to float first so NaN/inf are caught by isfinite before
+            # any int() conversion (which would raise OverflowError on inf).
             try:
-                raw = overrides[name]
-                value = int(raw) if name == "max_contracts_per_order" else float(raw)
+                number = float(overrides[name])
             except (TypeError, ValueError):
                 continue  # corrupt field → leave at ceiling (fail safe)
+            if not math.isfinite(number):
+                continue  # NaN/inf in the store can never widen a limit
+            value = int(number) if name == "max_contracts_per_order" else number
             merged[name] = self._clamp(name, value, getattr(self._ceilings, name))
         return SafetyLimits(**merged)  # type: ignore[arg-type]
 

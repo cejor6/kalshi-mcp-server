@@ -139,7 +139,15 @@ loosest setting). This is the fail-closed property: a runtime actor or bug
 can shrink the risk envelope but never widen it. To raise a ceiling you
 must change the env var and redeploy. The limits in force vs. their
 ceilings are visible via `kalshi_get_environment` and the
-`kalshi://environment` resource.
+`kalshi://environment` resource. Non-finite values (`NaN`/`inf`) are
+rejected on every path — on a write, on load from the store, and on the
+env ceilings themselves — since they would otherwise slip past the
+`<`/`>` comparisons and silently disable a cap.
+
+The tool is gated by `MCP_ALLOW_RUNTIME_LIMIT_TUNING` (default on). Set it
+to `0` to not register `kalshi_set_safety_limits` at all — useful on a
+shared HTTP deploy where allowlisted users shouldn't be able to re-tune
+the safety envelope; limits then change only via env var + redeploy.
 
 **Persistence.** Runtime overrides live in a `LimitsStore`
 (`safety.py` / `safety_store.py`). The default is in-memory — a restart

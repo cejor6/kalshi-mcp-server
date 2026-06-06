@@ -812,6 +812,14 @@ Check what's in force any time with the `kalshi_get_environment` tool —
 it shows `safety_limits` (active) alongside `safety_ceilings` (env hard
 max) and a `safety_limits_persist` flag.
 
+**Disabling runtime tuning.** Set `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0` to
+drop the `kalshi_set_safety_limits` tool entirely. Limits then change only
+via env var + redeploy. Worth doing on a shared HTTP deploy where every
+allowlisted user can call tools — without it, any of them (or a
+prompt-injected agent) could clamp your limits down. The change is
+fail-safe either way (it can only tighten, never loosen past the ceiling),
+but dropping the tool removes the nuisance vector.
+
 **Persistence.** By default a runtime override is in-memory: a restart or
 redeploy reverts to the env ceilings. If `MCP_REDIS_URL` is set (the same
 Redis the OAuth proxy uses for DCR storage), overrides are written there

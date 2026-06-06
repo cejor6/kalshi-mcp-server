@@ -59,17 +59,20 @@ def register(server: FastMCP) -> None:
         tightened a limit at runtime. Useful for the agent to confirm whether
         a trade would hit real money — and under what caps — before placing one.
         """
-        effective = safety.effective_limits()
-        ceilings = safety.ceilings
         return {
             "env": config.env,
             "trading_enabled": config.trading_enabled,
             "rest_base": config.rest_base,
             "ws_url": config.ws_url,
-            "safety_limits": effective.as_dict(),
-            "safety_ceilings": ceilings.as_dict(),
-            "safety_limits_persist": safety.persistence_durable,
+            **safety.environment_view(),
         }
+
+    # Operator control to tighten the safety envelope at runtime. Gated by
+    # MCP_ALLOW_RUNTIME_LIMIT_TUNING (default on): a forker running a shared
+    # HTTP deploy can drop the tool entirely so allowlisted users can't
+    # re-tune limits. When disabled, limits change only via env + redeploy.
+    if not config.runtime_limit_tuning_enabled:
+        return
 
     @server.tool
     async def kalshi_set_safety_limits(
