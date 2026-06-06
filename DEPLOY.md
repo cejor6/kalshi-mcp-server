@@ -343,7 +343,7 @@ Back in Render → service → **Environment** tab → add these:
 | `MCP_BASE_URL` | `https://kalshi-mcp-XXXX.onrender.com` (no trailing slash) |
 | `MCP_ALLOWED_GITHUB_LOGINS` | your GitHub username (comma-separated for multiple users) |
 | `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above |
-| `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* |
+| `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* — also persists runtime safety-limit overrides (see "Tuning safety limits" below) |
 
 **Delete** the `MCP_ALLOW_INSECURE_HTTP` variable — it's no longer
 needed and the server's fail-closed check will refuse to start with it
@@ -770,9 +770,10 @@ Expected — by design. `KALSHI_TRADING_ENABLED=0` is the safe default.
 > [DISCLAIMER.md](DISCLAIMER.md). You are about to let an LLM place
 > orders on your behalf. Even in demo, this is the moment where AI
 > mistakes start having effects. Make sure your `MCP_MAX_ORDER_SIZE_USD`,
-> `MCP_DAILY_LIMIT_USD`, and `MCP_CASH_RESERVE_USD` are tuned to a
-> blast radius you can absorb, and that you've test-run the
-> prepare/confirm flow at small sizes in demo first.
+> `MCP_DAILY_LIMIT_USD`, `MCP_MAX_CONTRACTS_PER_ORDER`, and
+> `MCP_CASH_RESERVE_USD` are tuned to a blast radius you can absorb, and
+> that you've test-run the prepare/confirm flow at small sizes in demo
+> first.
 
 Set it to `1` in Render env vars and save + redeploy. The server will
 log:
@@ -784,6 +785,43 @@ WARNING  PROD MODE — orders will hit real markets. Trading enabled: true.
 (If you're in demo, "real markets" is misleading; ignore the warning
 text. The flag controls server behavior, not which markets it hits —
 that's `KALSHI_ENV`.)
+
+### Tuning safety limits (with or without a redeploy)
+
+The four numeric limits have two layers:
+
+**The env vars are the hard ceiling.** Set them in Render's Environment
+tab; they default to conservative values (`MCP_MAX_ORDER_SIZE_USD=25`,
+`MCP_DAILY_LIMIT_USD=250`, `MCP_MAX_CONTRACTS_PER_ORDER=100`,
+`MCP_CASH_RESERVE_USD=0`). Changing a ceiling — in particular *raising*
+one — requires editing the env var and redeploying. That friction is
+deliberate: only an operator with infra access can widen the risk
+envelope.
+
+**The `kalshi_set_safety_limits` tool tightens within that ceiling, live.**
+Call it from your MCP client to lower a cap (or raise the cash reserve)
+on a running server — no redeploy. Useful for tuning to a strategy, a
+tighter per-run budget, or an emergency clamp-down. It is fail-closed:
+it can only ever make the limits *tighter* than the env ceiling, never
+looser. Trying to loosen past a ceiling is rejected. The three caps may
+only go down; `MCP_CASH_RESERVE_USD` may only go up (a bigger reserve is
+more conservative). Setting a limit back to its ceiling clears the
+override.
+
+Check what's in force any time with the `kalshi_get_environment` tool —
+it shows `safety_limits` (active) alongside `safety_ceilings` (env hard
+max) and a `safety_limits_persist` flag.
+
+**Persistence.** By default a runtime override is in-memory: a restart or
+redeploy reverts to the env ceilings. If `MCP_REDIS_URL` is set (the same
+Redis the OAuth proxy uses for DCR storage), overrides are written there
+and restored on boot — so a clamp-down survives a redeploy. On load the
+stored value is always re-clamped to the *current* env ceiling, so a
+stale override can never loosen a limit, and lowering an env ceiling and
+redeploying still takes effect. If Redis is unreachable at boot, the
+server starts at the env ceilings and logs a warning rather than failing
+to start. (Single-instance coherent; if you scale past one replica, a
+mid-life change won't reach other replicas until they restart.)
 
 ### Demo orderbook prices come back as null
 
