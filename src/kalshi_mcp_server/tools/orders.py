@@ -24,7 +24,9 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import Field
 
 from kalshi_mcp_server.errors import SafetyError
 from kalshi_mcp_server.safety import OrderIntent
@@ -70,11 +72,11 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_prepare_order(
         ticker: str,
-        action: str,
-        side: str,
-        count: int,
-        limit_price_cents: int,
-        order_type: str = "limit",
+        action: Literal["buy", "sell"],
+        side: Literal["yes", "no"],
+        count: Annotated[int, Field(ge=1)],
+        limit_price_cents: Annotated[int, Field(ge=1, le=99)],
+        order_type: Literal["limit", "market"] = "limit",
         post_only: bool = False,
         expiration_ts: int | None = None,
     ) -> dict[str, Any]:
@@ -108,13 +110,18 @@ def register(server: FastMCP) -> None:
         On safety failure this tool raises rather than returning a
         token — there's no "rejected but here's a token" state.
         """
+        # The Literal[...] annotations make the schema reject non-matching
+        # values for MCP clients; these checks (with case-normalization,
+        # matching action/side) are the authoritative backstop for direct
+        # `.fn` callers, who bypass Pydantic.
         action_lc = action.lower()
         side_lc = side.lower()
+        order_type_lc = order_type.lower()
         if action_lc not in {"buy", "sell"}:
             raise SafetyError(f"action must be 'buy' or 'sell', got {action!r}")
         if side_lc not in {"yes", "no"}:
             raise SafetyError(f"side must be 'yes' or 'no', got {side!r}")
-        if order_type not in {"limit", "market"}:
+        if order_type_lc not in {"limit", "market"}:
             raise SafetyError(f"order_type must be 'limit' or 'market', got {order_type!r}")
 
         intent = OrderIntent(
@@ -134,7 +141,7 @@ def register(server: FastMCP) -> None:
         expires_at = time.time() + _PENDING_TTL_S
         pending[token] = _PendingOrder(
             intent=intent,
-            type=order_type,
+            type=order_type_lc,
             post_only=post_only,
             expiration_ts=expiration_ts,
             idempotency_key=idempotency_key,
@@ -152,7 +159,7 @@ def register(server: FastMCP) -> None:
                 "side": side_lc,
                 "count": count,
                 "limit_price_cents": limit_price_cents,
-                "order_type": order_type,
+                "order_type": order_type_lc,
                 "post_only": post_only,
                 "expiration_ts": expiration_ts,
             },
@@ -220,7 +227,7 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_decrease_order(
         order_id: str,
-        reduce_by: int,
+        reduce_by: Annotated[int, Field(ge=1)],
     ) -> dict[str, Any]:
         """Reduce the contract count on a resting order.
 

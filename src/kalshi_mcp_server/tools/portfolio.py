@@ -6,7 +6,9 @@ in `tools/orders.py`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import Field
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -32,11 +34,11 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_positions(
-        limit: int = 200,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 200,
         cursor: str | None = None,
         ticker: str | None = None,
         event_ticker: str | None = None,
-        settlement_status: str = "all",
+        settlement_status: Literal["all", "settled", "unsettled"] = "all",
         count_filter: str | None = None,
     ) -> dict[str, Any]:
         """List your positions.
@@ -74,7 +76,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_orders(
-        limit: int = 100,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
         cursor: str | None = None,
         ticker: str | None = None,
         event_ticker: str | None = None,
@@ -111,7 +113,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_fills(
-        limit: int = 100,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
         cursor: str | None = None,
         ticker: str | None = None,
         order_id: str | None = None,
@@ -143,7 +145,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_settlements(
-        limit: int = 100,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,

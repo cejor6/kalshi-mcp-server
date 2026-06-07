@@ -233,6 +233,52 @@ against Render before tagging a release.
 Tool naming convention: `kalshi_<verb>_<noun>`, lowercase, snake_case.
 Examples: `kalshi_search_markets`, `kalshi_get_balance`, `kalshi_place_order`.
 
+**Bake parameter constraints into the type, not just the body.** When a
+param has a fixed accepted-value set or a numeric range, encode it in the
+signature so it surfaces in the tool's JSON-Schema (`inputSchema`) and the
+client/LLM is steered to valid values at generation time:
+
+- discrete values → `Literal[...]` → emits a JSON-Schema `enum`
+  (e.g. `action: Literal["buy", "sell"]`, `period_interval: Literal[1, 60, 1440]`).
+  An *optional* enum is `Literal[...] | None` — the `enum` then nests under
+  `anyOf` (still honored).
+- numeric bounds → `Annotated[int, Field(ge=1, le=1000)]` → emits
+  `minimum`/`maximum` (e.g. every `limit`, `limit_price_cents` 1–99).
+
+This is **steering, not enforcement**: per the MCP spec the *server* MUST
+validate inputs and `inputSchema` is advisory. The schema steers the model
+and lets schema-aware clients reject early, but a direct `.fn` caller (and
+our own tests) bypass Pydantic, so where it matters keep a runtime check.
+"Where it matters" is the key distinction:
+
+- **Safety-relevant / state-mutating params** (anything on the order write
+  path — `count`, `limit_price_cents`, `action`, `side`, …): the runtime
+  guard is **mandatory and authoritative**. NEVER let the schema bound be
+  the only enforcement — `safety.check_order` / the `_validate_*` helpers
+  must still run and must remain the source of truth. The schema bound is
+  additive, never substitutive.
+- **Benign read / pagination params** passed straight through as Kalshi
+  query args (`limit`, `depth`, `scan_limit`, …): the schema steers and
+  Kalshi itself is the backstop (it 400s or clamps). A redundant local
+  guard is optional here; don't add guard-bloat for read knobs.
+
+Two things that deliberately stay *unconstrained* in the schema, so a future
+contributor doesn't "helpfully" add a `Literal`/range and break them:
+
+- **CSV multi-value params** (`status`, `count_filter`) accept
+  comma-separated values (`"open,closed"`), which a `Literal` enum can't
+  express — leave them free `str` and document the accepted tokens in the
+  docstring.
+- **Direction-relative limits** (`kalshi_set_safety_limits`' USD knobs) are
+  validated tighter-only against env ceilings in `SafetyController`, not by a
+  fixed range, so `ge`/`le` doesn't fit.
+
+Also: constraints that span *multiple* params (e.g. the candlestick
+≤5000-candle window cap, `(end_ts - start_ts) / (period_interval * 60)`)
+can't be expressed in JSON-Schema at all — those are runtime-only with an
+actionable error message. And don't put strategy/computed values in a
+constraint; just the API's own accepted ranges.
+
 Write tools (anything that mutates state) MUST:
 - Call `safety.assert_trading_enabled()` at the top
 - Build an `OrderIntent` and call `safety.check_order(...)`
@@ -283,6 +329,15 @@ tools encode these; don't regress them.
   tools call `_event_hint` on the failed path to raise an actionable error
   naming the real market tickers. `_event_hint` must **fail open** (return
   None on any error) so it never masks the caller's original problem.
+- **Candlesticks 400 on two silent footguns** (`market_data.py:_validate_candlestick_window`,
+  confirmed live). (1) `period_interval` accepts **only `1` / `60` / `1440`**
+  (minute/hour/day) — `5`, `240`, etc. return an opaque `400 bad request`
+  that an agent loops on. It's now a `Literal[1, 60, 1440]` enum in the
+  schema *and* a runtime check. (2) A window may span at most **5000
+  candles** — `(end_ts - start_ts) / (period_interval * 60) <= 5000` — or
+  Kalshi 400s; this is cross-param so it's runtime-only, with a message
+  telling the caller to widen the interval or narrow the window. Don't
+  regress either guard, and don't re-add `5`/`240` to the docstring.
 
 ---
 
@@ -298,6 +353,33 @@ tools encode these; don't regress them.
 - **Cover the canonical-message contract carefully** — `test_auth.py`
   checks query-string stripping, method casing, and timestamp inclusion
   precisely because these are the parts most likely to drift.
+
+---
+
+## Reviewing changes in this repo
+
+A short checklist for anyone — human or agent — reviewing a diff here. The
+author-conflict rule applies: if you wrote the code, the reviewers must be
+independent fresh-context agents.
+
+- **Validation is dual-layer — check both layers exist where they should.**
+  Tool params with a fixed value set or numeric range carry a JSON-Schema
+  `enum`/`minimum`/`maximum` (steering), AND a runtime check where it matters.
+  For safety / state-mutating params (the order write path) the runtime guard
+  (`safety.check_order`, the `_validate_*` helpers) MUST be authoritative —
+  the schema bound is additive, never the sole enforcement. Flag any
+  security-relevant bound that lives only in the schema. (See "How to add a
+  new tool" for the full rule, including the CSV / direction-relative
+  carve-outs.)
+- **Candlestick guards** (`market_data.py:_validate_candlestick_window`):
+  `period_interval` ∈ {1, 60, 1440}; window ≤ 5000 candles via `ceil` (the
+  comment explains why — it's live-verified; don't "simplify" to `floor`/`//`).
+  Both must reject *before* any HTTP call — the wiring tests assert
+  `calls == []`.
+- **No real API calls or account data in tests** — mock everything
+  (`httpx.MockTransport`), generate RSA keys at test time.
+- **Run it:** `uv run pytest` and `uv run pre-commit run --all-files` must be
+  green before the PR, and re-run after any further commit.
 
 ---
 

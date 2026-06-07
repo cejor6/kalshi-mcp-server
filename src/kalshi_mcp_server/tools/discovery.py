@@ -27,7 +27,9 @@ to stay under an LLM tool-result token cap even for combo markets.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError
 
@@ -369,7 +371,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_markets(
-        limit: int = 20,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 20,
         cursor: str | None = None,
         status: str | None = None,
         event_ticker: str | None = None,
@@ -377,7 +379,7 @@ def register(server: FastMCP) -> None:
         tickers: str | None = None,
         min_close_ts: int | None = None,
         max_close_ts: int | None = None,
-        mve_filter: str | None = None,
+        mve_filter: Literal["exclude", "only"] | None = None,
         compact: bool = False,
         minimal: bool = False,
         fields: str | None = None,
@@ -473,11 +475,11 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_find_liquid_markets(
-        limit: int = 20,
-        scan_limit: int = 200,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 20,
+        scan_limit: Annotated[int, Field(ge=1, le=1000)] = 200,
         status: str = "open",
         series_ticker: str | None = None,
-        min_volume: float = 0.0,
+        min_volume: Annotated[float, Field(ge=0)] = 0.0,
     ) -> dict[str, Any]:
         """Find the most liquid SINGLE (non-combo) markets, ranked by 24h volume.
 
@@ -492,9 +494,12 @@ def register(server: FastMCP) -> None:
             limit: Size of the returned shortlist (top-N by volume). Default 20.
             scan_limit: How many markets to fetch+rank before taking the top
                 `limit`. Higher = more thorough but more read-bucket cost.
-                Default 200, capped at 1000.
+                Default 200, range 1-1000 (the schema bounds it; direct
+                callers are clamped to the same range).
             status: Lifecycle filter (default "open"). Same values as
-                `kalshi_get_markets`.
+                `kalshi_get_markets` ("unopened"/"open"/"closed"/"settled";
+                multiple OK comma-separated, which is why this stays a free
+                string rather than an enum).
             series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
             min_volume: Drop markets whose 24h volume is below this (same
                 units as `volume_24h_fp`). Default 0.0 (keep all).
@@ -625,7 +630,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_events(
-        limit: int = 20,
+        limit: Annotated[int, Field(ge=1, le=200)] = 20,
         cursor: str | None = None,
         status: str | None = None,
         series_ticker: str | None = None,
@@ -641,7 +646,8 @@ def register(server: FastMCP) -> None:
             cursor: Pagination cursor. Kalshi silently returns an empty
                 list on a bad cursor — check carefully if you expected
                 results.
-            status: "unopened", "open", "closed", "settled".
+            status: "unopened", "open", "closed", "settled". Multiple OK
+                with comma-separated values.
             series_ticker: Return events from a specific series only.
             with_nested_markets: Include nested market data per event.
                 Default False — turning this on for a 20-event listing
@@ -701,7 +707,7 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_get_trades(
         ticker: str | None = None,
-        limit: int = 100,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
