@@ -233,6 +233,28 @@ against Render before tagging a release.
 Tool naming convention: `kalshi_<verb>_<noun>`, lowercase, snake_case.
 Examples: `kalshi_search_markets`, `kalshi_get_balance`, `kalshi_place_order`.
 
+**Bake parameter constraints into the type, not just the body.** When a
+param has a fixed accepted-value set or a numeric range, encode it in the
+signature so it surfaces in the tool's JSON-Schema (`inputSchema`) and the
+client/LLM is steered to valid values at generation time:
+
+- discrete values → `Literal[...]` → emits a JSON-Schema `enum`
+  (e.g. `action: Literal["buy", "sell"]`, `period_interval: Literal[1, 60, 1440]`).
+  An *optional* enum is `Literal[...] | None` — the `enum` then nests under
+  `anyOf` (still honored).
+- numeric bounds → `Annotated[int, Field(ge=1, le=1000)]` → emits
+  `minimum`/`maximum` (e.g. every `limit`, `limit_price_cents` 1–99).
+
+This is **steering, not enforcement**: per the MCP spec the *server* MUST
+validate inputs and `inputSchema` is advisory, so keep the runtime check
+too (e.g. `safety.check_order`, `_validate_*`). The schema steers the model
+and lets schema-aware clients reject early; the runtime guard is the
+authoritative backstop and covers direct callers. Constraints that span
+multiple params (e.g. the candlestick ≤5000-candle window cap) can't be
+expressed in JSON-Schema at all — those are runtime-only with an actionable
+error message. Don't put strategy/computed values in the constraint; just
+the API's own accepted ranges.
+
 Write tools (anything that mutates state) MUST:
 - Call `safety.assert_trading_enabled()` at the top
 - Build an `OrderIntent` and call `safety.check_order(...)`
@@ -283,6 +305,15 @@ tools encode these; don't regress them.
   tools call `_event_hint` on the failed path to raise an actionable error
   naming the real market tickers. `_event_hint` must **fail open** (return
   None on any error) so it never masks the caller's original problem.
+- **Candlesticks 400 on two silent footguns** (`market_data.py:_validate_candlestick_window`,
+  confirmed live). (1) `period_interval` accepts **only `1` / `60` / `1440`**
+  (minute/hour/day) — `5`, `240`, etc. return an opaque `400 bad request`
+  that an agent loops on. It's now a `Literal[1, 60, 1440]` enum in the
+  schema *and* a runtime check. (2) A window may span at most **5000
+  candles** — `(end_ts - start_ts) / (period_interval * 60) <= 5000` — or
+  Kalshi 400s; this is cross-param so it's runtime-only, with a message
+  telling the caller to widen the interval or narrow the window. Don't
+  regress either guard, and don't re-add `5`/`240` to the docstring.
 
 ---
 

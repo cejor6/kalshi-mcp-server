@@ -24,7 +24,9 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import Field
 
 from kalshi_mcp_server.errors import SafetyError
 from kalshi_mcp_server.safety import OrderIntent
@@ -70,11 +72,11 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_prepare_order(
         ticker: str,
-        action: str,
-        side: str,
-        count: int,
-        limit_price_cents: int,
-        order_type: str = "limit",
+        action: Literal["buy", "sell"],
+        side: Literal["yes", "no"],
+        count: Annotated[int, Field(ge=1)],
+        limit_price_cents: Annotated[int, Field(ge=1, le=99)],
+        order_type: Literal["limit", "market"] = "limit",
         post_only: bool = False,
         expiration_ts: int | None = None,
     ) -> dict[str, Any]:
@@ -220,7 +222,7 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_decrease_order(
         order_id: str,
-        reduce_by: int,
+        reduce_by: Annotated[int, Field(ge=1)],
     ) -> dict[str, Any]:
         """Reduce the contract count on a resting order.
 

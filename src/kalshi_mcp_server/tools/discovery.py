@@ -27,7 +27,9 @@ to stay under an LLM tool-result token cap even for combo markets.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError
 
@@ -369,7 +371,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_markets(
-        limit: int = 20,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 20,
         cursor: str | None = None,
         status: str | None = None,
         event_ticker: str | None = None,
@@ -377,7 +379,7 @@ def register(server: FastMCP) -> None:
         tickers: str | None = None,
         min_close_ts: int | None = None,
         max_close_ts: int | None = None,
-        mve_filter: str | None = None,
+        mve_filter: Literal["exclude", "only"] | None = None,
         compact: bool = False,
         minimal: bool = False,
         fields: str | None = None,
@@ -473,11 +475,11 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_find_liquid_markets(
-        limit: int = 20,
-        scan_limit: int = 200,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 20,
+        scan_limit: Annotated[int, Field(ge=1, le=1000)] = 200,
         status: str = "open",
         series_ticker: str | None = None,
-        min_volume: float = 0.0,
+        min_volume: Annotated[float, Field(ge=0)] = 0.0,
     ) -> dict[str, Any]:
         """Find the most liquid SINGLE (non-combo) markets, ranked by 24h volume.
 
@@ -625,7 +627,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_events(
-        limit: int = 20,
+        limit: Annotated[int, Field(ge=1, le=200)] = 20,
         cursor: str | None = None,
         status: str | None = None,
         series_ticker: str | None = None,
@@ -701,7 +703,7 @@ def register(server: FastMCP) -> None:
     @server.tool
     async def kalshi_get_trades(
         ticker: str | None = None,
-        limit: int = 100,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
         cursor: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
