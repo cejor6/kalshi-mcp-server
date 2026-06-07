@@ -356,6 +356,33 @@ tools encode these; don't regress them.
 
 ---
 
+## Reviewing changes in this repo
+
+A short checklist for anyone — human or agent — reviewing a diff here. The
+author-conflict rule applies: if you wrote the code, the reviewers must be
+independent fresh-context agents.
+
+- **Validation is dual-layer — check both layers exist where they should.**
+  Tool params with a fixed value set or numeric range carry a JSON-Schema
+  `enum`/`minimum`/`maximum` (steering), AND a runtime check where it matters.
+  For safety / state-mutating params (the order write path) the runtime guard
+  (`safety.check_order`, the `_validate_*` helpers) MUST be authoritative —
+  the schema bound is additive, never the sole enforcement. Flag any
+  security-relevant bound that lives only in the schema. (See "How to add a
+  new tool" for the full rule, including the CSV / direction-relative
+  carve-outs.)
+- **Candlestick guards** (`market_data.py:_validate_candlestick_window`):
+  `period_interval` ∈ {1, 60, 1440}; window ≤ 5000 candles via `ceil` (the
+  comment explains why — it's live-verified; don't "simplify" to `floor`/`//`).
+  Both must reject *before* any HTTP call — the wiring tests assert
+  `calls == []`.
+- **No real API calls or account data in tests** — mock everything
+  (`httpx.MockTransport`), generate RSA keys at test time.
+- **Run it:** `uv run pytest` and `uv run pre-commit run --all-files` must be
+  green before the PR, and re-run after any further commit.
+
+---
+
 ## Git author identity (recommended, not enforced)
 
 The maintainer uses a **GitHub noreply email** for commits in this
