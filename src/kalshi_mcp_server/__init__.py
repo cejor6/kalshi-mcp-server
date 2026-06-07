@@ -6,4 +6,4 @@ Public API (programmatic users):
     from kalshi_mcp_server.config import Config
 """
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"
