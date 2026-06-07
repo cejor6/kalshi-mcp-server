@@ -136,6 +136,10 @@ def register(server: FastMCP) -> None:
                             body=msg,
                         )
             except TimeoutError:
+                # Normal stop path, not an error: asyncio.wait_for raises
+                # TimeoutError once `remaining` elapses with no message in
+                # flight — i.e. we hit the sampling deadline. Fall through and
+                # return the trades collected so far.
                 pass
 
         return {
