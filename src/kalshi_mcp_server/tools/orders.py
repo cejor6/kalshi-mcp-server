@@ -110,13 +110,18 @@ def register(server: FastMCP) -> None:
         On safety failure this tool raises rather than returning a
         token — there's no "rejected but here's a token" state.
         """
+        # The Literal[...] annotations make the schema reject non-matching
+        # values for MCP clients; these checks (with case-normalization,
+        # matching action/side) are the authoritative backstop for direct
+        # `.fn` callers, who bypass Pydantic.
         action_lc = action.lower()
         side_lc = side.lower()
+        order_type_lc = order_type.lower()
         if action_lc not in {"buy", "sell"}:
             raise SafetyError(f"action must be 'buy' or 'sell', got {action!r}")
         if side_lc not in {"yes", "no"}:
             raise SafetyError(f"side must be 'yes' or 'no', got {side!r}")
-        if order_type not in {"limit", "market"}:
+        if order_type_lc not in {"limit", "market"}:
             raise SafetyError(f"order_type must be 'limit' or 'market', got {order_type!r}")
 
         intent = OrderIntent(
@@ -136,7 +141,7 @@ def register(server: FastMCP) -> None:
         expires_at = time.time() + _PENDING_TTL_S
         pending[token] = _PendingOrder(
             intent=intent,
-            type=order_type,
+            type=order_type_lc,
             post_only=post_only,
             expiration_ts=expiration_ts,
             idempotency_key=idempotency_key,
@@ -154,7 +159,7 @@ def register(server: FastMCP) -> None:
                 "side": side_lc,
                 "count": count,
                 "limit_price_cents": limit_price_cents,
-                "order_type": order_type,
+                "order_type": order_type_lc,
                 "post_only": post_only,
                 "expiration_ts": expiration_ts,
             },

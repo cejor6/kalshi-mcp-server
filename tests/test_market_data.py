@@ -115,6 +115,18 @@ def test_candlestick_window_rejects_over_max_periods():
     assert str(_MAX_CANDLESTICK_PERIODS) in exc.value.message
 
 
+def test_candlestick_window_one_second_over_max_rejected():
+    """One second past an exact 5000-bar multiple counts as a 5001st (partial)
+    trailing period — Kalshi 400s on it (confirmed live against prod: a
+    300000s window at 1m is OK, but 300001s is rejected). So the count MUST be
+    `ceil`, not `floor`/`//`; this guards against a future "simplify" that
+    would let the one-second-over case slip through to an opaque Kalshi 400."""
+    start = 1_000_000
+    end = start + _MAX_CANDLESTICK_PERIODS * 60 + 1  # ceil -> 5001, floor -> 5000
+    with pytest.raises(KalshiAPIError):
+        _validate_candlestick_window(start, end, 1)
+
+
 def test_candlestick_window_cap_scales_with_interval():
     """The 5000-candle cap is on the period COUNT, not the wall-clock span —
     so a larger interval permits a proportionally larger window."""
@@ -173,26 +185,64 @@ async def _get_tool_fn(server: FastMCP, name: str):
     return tool.fn
 
 
+_OVER_CAP_END = 1_000_000 + (_MAX_CANDLESTICK_PERIODS + 1) * 60  # 5001 one-min candles
+
+# Every candlestick failure mode (bad interval / over-cap / inverted window)
+# on BOTH tools. Each must raise BEFORE any HTTP call — closes the diagonal
+# coverage gap so a future reorder of the validate call can't regress silently.
+_MKT = {"ticker": "KX-T", "series_ticker": "KX"}
+_EVT = {"event_ticker": "KXEV", "series_ticker": "KX"}
+_CANDLE_BAD_CALLS = [
+    (
+        "kalshi_get_market_candlesticks",
+        "bad_interval",
+        {**_MKT, "start_ts": 1_000_000, "end_ts": 1_000_600, "period_interval": 240},
+    ),
+    (
+        "kalshi_get_market_candlesticks",
+        "over_cap",
+        {**_MKT, "start_ts": 1_000_000, "end_ts": _OVER_CAP_END, "period_interval": 1},
+    ),
+    (
+        "kalshi_get_market_candlesticks",
+        "inverted",
+        {**_MKT, "start_ts": 1_000_000, "end_ts": 999_000, "period_interval": 60},
+    ),
+    (
+        "kalshi_get_event_candlesticks",
+        "bad_interval",
+        {**_EVT, "start_ts": 1_000_000, "end_ts": 1_000_600, "period_interval": 240},
+    ),
+    (
+        "kalshi_get_event_candlesticks",
+        "over_cap",
+        {**_EVT, "start_ts": 1_000_000, "end_ts": _OVER_CAP_END, "period_interval": 1},
+    ),
+    (
+        "kalshi_get_event_candlesticks",
+        "inverted",
+        {**_EVT, "start_ts": 1_000_000, "end_ts": 999_000, "period_interval": 60},
+    ),
+]
+
+
 @pytest.mark.asyncio
-async def test_market_candlesticks_rejects_invalid_interval_before_request(rsa_private_key):
-    """An invalid period_interval must raise locally — no HTTP request goes
-    out — so the caller gets the actionable message, not Kalshi's 400."""
+@pytest.mark.parametrize(
+    "tool,case,kwargs", _CANDLE_BAD_CALLS, ids=[f"{t}-{c}" for t, c, _ in _CANDLE_BAD_CALLS]
+)
+async def test_candlestick_tools_validate_before_request(rsa_private_key, tool, case, kwargs):
+    """Bad candlestick params raise locally — no HTTP request goes out — so the
+    caller gets the actionable message, not Kalshi's opaque 400."""
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
-        return httpx.Response(200, json={"candlesticks": []})
+        return httpx.Response(200, json={})
 
     server = _make_server(rsa_private_key, handler)
-    fn = await _get_tool_fn(server, "kalshi_get_market_candlesticks")
+    fn = await _get_tool_fn(server, tool)
     with pytest.raises(KalshiAPIError):
-        await fn(
-            ticker="KX-T",
-            series_ticker="KX",
-            start_ts=1_000_000,
-            end_ts=1_000_600,
-            period_interval=240,
-        )
+        await fn(**kwargs)
     assert calls == []  # validation fired before any wire call
 
 
@@ -230,25 +280,3 @@ async def test_period_interval_enum_is_in_tool_schema(rsa_private_key):
         prop = tool.parameters["properties"]["period_interval"]
         assert prop["enum"] == [1, 60, 1440]
         assert prop["default"] == 60
-
-
-@pytest.mark.asyncio
-async def test_event_candlesticks_rejects_over_cap_before_request(rsa_private_key):
-    calls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.path)
-        return httpx.Response(200, json={})
-
-    server = _make_server(rsa_private_key, handler)
-    fn = await _get_tool_fn(server, "kalshi_get_event_candlesticks")
-    over_end = 1_000_000 + (_MAX_CANDLESTICK_PERIODS + 1) * 60  # 5001 one-min candles
-    with pytest.raises(KalshiAPIError):
-        await fn(
-            event_ticker="KXEV",
-            series_ticker="KX",
-            start_ts=1_000_000,
-            end_ts=over_end,
-            period_interval=1,
-        )
-    assert calls == []

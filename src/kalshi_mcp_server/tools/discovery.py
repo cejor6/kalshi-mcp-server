@@ -494,9 +494,12 @@ def register(server: FastMCP) -> None:
             limit: Size of the returned shortlist (top-N by volume). Default 20.
             scan_limit: How many markets to fetch+rank before taking the top
                 `limit`. Higher = more thorough but more read-bucket cost.
-                Default 200, capped at 1000.
+                Default 200, range 1-1000 (the schema bounds it; direct
+                callers are clamped to the same range).
             status: Lifecycle filter (default "open"). Same values as
-                `kalshi_get_markets`.
+                `kalshi_get_markets` ("unopened"/"open"/"closed"/"settled";
+                multiple OK comma-separated, which is why this stays a free
+                string rather than an enum).
             series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
             min_volume: Drop markets whose 24h volume is below this (same
                 units as `volume_24h_fp`). Default 0.0 (keep all).
@@ -643,7 +646,8 @@ def register(server: FastMCP) -> None:
             cursor: Pagination cursor. Kalshi silently returns an empty
                 list on a bad cursor — check carefully if you expected
                 results.
-            status: "unopened", "open", "closed", "settled".
+            status: "unopened", "open", "closed", "settled". Multiple OK
+                with comma-separated values.
             series_ticker: Return events from a specific series only.
             with_nested_markets: Include nested market data per event.
                 Default False — turning this on for a 20-event listing

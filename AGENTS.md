@@ -246,14 +246,38 @@ client/LLM is steered to valid values at generation time:
   `minimum`/`maximum` (e.g. every `limit`, `limit_price_cents` 1–99).
 
 This is **steering, not enforcement**: per the MCP spec the *server* MUST
-validate inputs and `inputSchema` is advisory, so keep the runtime check
-too (e.g. `safety.check_order`, `_validate_*`). The schema steers the model
-and lets schema-aware clients reject early; the runtime guard is the
-authoritative backstop and covers direct callers. Constraints that span
-multiple params (e.g. the candlestick ≤5000-candle window cap) can't be
-expressed in JSON-Schema at all — those are runtime-only with an actionable
-error message. Don't put strategy/computed values in the constraint; just
-the API's own accepted ranges.
+validate inputs and `inputSchema` is advisory. The schema steers the model
+and lets schema-aware clients reject early, but a direct `.fn` caller (and
+our own tests) bypass Pydantic, so where it matters keep a runtime check.
+"Where it matters" is the key distinction:
+
+- **Safety-relevant / state-mutating params** (anything on the order write
+  path — `count`, `limit_price_cents`, `action`, `side`, …): the runtime
+  guard is **mandatory and authoritative**. NEVER let the schema bound be
+  the only enforcement — `safety.check_order` / the `_validate_*` helpers
+  must still run and must remain the source of truth. The schema bound is
+  additive, never substitutive.
+- **Benign read / pagination params** passed straight through as Kalshi
+  query args (`limit`, `depth`, `scan_limit`, …): the schema steers and
+  Kalshi itself is the backstop (it 400s or clamps). A redundant local
+  guard is optional here; don't add guard-bloat for read knobs.
+
+Two things that deliberately stay *unconstrained* in the schema, so a future
+contributor doesn't "helpfully" add a `Literal`/range and break them:
+
+- **CSV multi-value params** (`status`, `count_filter`) accept
+  comma-separated values (`"open,closed"`), which a `Literal` enum can't
+  express — leave them free `str` and document the accepted tokens in the
+  docstring.
+- **Direction-relative limits** (`kalshi_set_safety_limits`' USD knobs) are
+  validated tighter-only against env ceilings in `SafetyController`, not by a
+  fixed range, so `ge`/`le` doesn't fit.
+
+Also: constraints that span *multiple* params (e.g. the candlestick
+≤5000-candle window cap, `(end_ts - start_ts) / (period_interval * 60)`)
+can't be expressed in JSON-Schema at all — those are runtime-only with an
+actionable error message. And don't put strategy/computed values in a
+constraint; just the API's own accepted ranges.
 
 Write tools (anything that mutates state) MUST:
 - Call `safety.assert_trading_enabled()` at the top

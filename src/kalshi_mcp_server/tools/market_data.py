@@ -29,9 +29,13 @@ if TYPE_CHECKING:
 # set named so the caller can self-correct. (Confirmed live against prod.)
 _VALID_PERIOD_INTERVALS: tuple[int, ...] = (1, 60, 1440)
 
-# Kalshi caps a single candlestick request at this many periods
-# (ceil((end_ts - start_ts) / (period_interval * 60))). Past it the API 400s
-# with the same opaque message. (Confirmed live: 5000 OK, 5100 rejected.)
+# Kalshi caps a single candlestick request at this many periods. The count is
+# CEIL((end_ts - start_ts) / (period_interval * 60)) — a partial TRAILING
+# period still counts toward the cap. Confirmed live against prod: a 300000s
+# window at 1m (exactly 5000) returns 200, but 300000+1s (ceil -> 5001) AND a
+# full 5001 periods BOTH 400. So this is `ceil`, NOT `floor`/`//` — do not
+# "simplify" it or the one-second-over case slips through to an opaque Kalshi
+# 400 (the exact failure this guard exists to prevent).
 _MAX_CANDLESTICK_PERIODS = 5000
 
 
