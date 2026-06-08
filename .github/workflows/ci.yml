@@ -50,3 +50,38 @@ jobs:
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --all-extras --dev
       - run: uv run pytest -v
+
+  # MCP conformance — lints this server's MCP setup with mcpconform
+  # (https://github.com/cejor6/mcpconform). Two surfaces:
+  #   1. server.json (the registry manifest) — static, via the published Action.
+  #   2. the live tool surface — via the MCP stdio handshake (`inspect`).
+  # Both are secret-free and make no Kalshi API calls: `tools/list` is local
+  # schema enumeration, so a throwaway RSA key + placeholder creds are enough to
+  # boot the server. Safe under `pull_request` (no secrets exposed to forks).
+  # Rule targeting + the two suppressed info-rules live in mcpconform.config.json.
+  mcp-conform:
+    name: MCP conformance (mcpconform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.0
+
+      # 1) Static lint of the registry manifest via the published Action.
+      - name: Lint server.json
+        uses: cejor6/mcpconform@6057597ad3cf938069c66ad5c483a40a9d28d439  # v0.1.0
+        with:
+          files: server.json
+          targets: anthropic,openai
+
+      # 2) Lint the live tool surface (language-agnostic) via the MCP handshake.
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v7.1.0
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --dev
+      - name: Generate throwaway signing key (never leaves the runner temp dir)
+        run: openssl genrsa -out "$RUNNER_TEMP/mcpconform-ci.pem" 2048
+      - name: Lint live tools/list
+        env:
+          KALSHI_API_KEY_ID: ci-placeholder
+          KALSHI_PRIVATE_KEY_PATH: ${{ runner.temp }}/mcpconform-ci.pem
+          KALSHI_ENV: demo
+        run: npx -y mcpconform@0.1.0 inspect -- uv run kalshi-mcp
