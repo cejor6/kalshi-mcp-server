@@ -74,9 +74,6 @@ def register(server: FastMCP) -> None:
     if not config.runtime_limit_tuning_enabled:
         return
 
-    # Keep the emitted tool DESCRIPTION (everything before "Args:") under 1024
-    # chars — OpenAI rejects longer tool descriptions. Per-field detail belongs
-    # in the Args: block, which FastMCP routes to the parameter schema.
     @server.tool
     async def kalshi_set_safety_limits(
         max_order_size_usd: float | None = None,
@@ -84,34 +81,32 @@ def register(server: FastMCP) -> None:
         max_contracts_per_order: int | None = None,
         cash_reserve_usd: float | None = None,
     ) -> dict[str, Any]:
-        """Tighten the numeric safety limits at runtime — no redeploy needed.
+        """Adjust the numeric safety limits at runtime — no redeploy needed.
 
-        This is an OPERATOR control. It can only ever make limits **tighter**
-        (more conservative) than the env-configured ceilings; it can never
-        loosen one past its ceiling. To raise a ceiling you must change the env
-        var and redeploy — intentional, so a runtime actor (or a bug) can't
-        widen your risk envelope. A value that would loosen past the ceiling is
-        rejected and nothing changes; tightening takes effect immediately for
-        the next order check. Pass only the fields you want to change.
+        This is an OPERATOR control. It can only ever make the limits
+        **tighter** (more conservative) than the env-configured ceilings; it
+        can never loosen a limit past its ceiling. To raise a ceiling you must
+        change the env var and redeploy — that is intentional, so a runtime
+        actor (or a bug) can't widen your risk envelope.
+
+        Pass only the fields you want to change; omit (leave `None`) the rest.
+        Direction of "tighter":
+        - `max_order_size_usd`, `daily_limit_usd`, `max_contracts_per_order`:
+          may only be set **<=** their env ceiling (a smaller cap is tighter).
+        - `cash_reserve_usd`: may only be set **>=** its env value (holding
+          back more cash is tighter).
+
+        A value that would loosen past the ceiling is rejected and nothing
+        changes. Tightening takes effect immediately for the next order check.
 
         Persistence: when `MCP_REDIS_URL` is configured the change survives a
         restart/redeploy; otherwise it is in-memory and reverts to the env
-        ceilings on restart (the returned `persisted` flag tells you which). A
-        limit reset back to its ceiling clears the override, so a later
-        env-ceiling change takes effect. Returns the new `safety_limits`, the
-        `safety_ceilings` for reference, `persisted`, and a human `note`.
+        ceilings on restart. The returned `persisted` flag tells you which.
+        A limit reset back to its ceiling is treated as "no override" and
+        clears the stored value, so a later env-ceiling change takes effect.
 
-        Args:
-            max_order_size_usd: Cap on a single order's worst-case cost (USD).
-                May only be set <= its env ceiling (smaller is tighter). Omit
-                to leave unchanged.
-            daily_limit_usd: Cap on projected cumulative daily spend (USD). May
-                only be set <= its env ceiling. Omit to leave unchanged.
-            max_contracts_per_order: Cap on contracts in one order. May only be
-                set <= its env ceiling. Omit to leave unchanged.
-            cash_reserve_usd: Minimum cash (USD) to keep un-committed. May only
-                be set >= its env floor (holding back more is tighter). Omit to
-                leave unchanged.
+        Returns the new `safety_limits`, the `safety_ceilings` for reference,
+        whether the change was `persisted` durably, and a human `note`.
         """
         new_limits, persisted = await safety.set_limits(
             max_order_size_usd=max_order_size_usd,

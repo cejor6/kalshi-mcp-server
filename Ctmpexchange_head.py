@@ -74,9 +74,6 @@ def register(server: FastMCP) -> None:
     if not config.runtime_limit_tuning_enabled:
         return
 
-    # Keep the emitted tool DESCRIPTION (everything before "Args:") under 1024
-    # chars — OpenAI rejects longer tool descriptions. Per-field detail belongs
-    # in the Args: block, which FastMCP routes to the parameter schema.
     @server.tool
     async def kalshi_set_safety_limits(
         max_order_size_usd: float | None = None,
@@ -110,7 +107,7 @@ def register(server: FastMCP) -> None:
             max_contracts_per_order: Cap on contracts in one order. May only be
                 set <= its env ceiling. Omit to leave unchanged.
             cash_reserve_usd: Minimum cash (USD) to keep un-committed. May only
-                be set >= its env floor (holding back more is tighter). Omit to
+                be set >= its env value (holding back more is tighter). Omit to
                 leave unchanged.
         """
         new_limits, persisted = await safety.set_limits(
