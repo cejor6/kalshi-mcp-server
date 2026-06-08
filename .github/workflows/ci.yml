@@ -78,10 +78,18 @@ jobs:
           enable-cache: true
       - run: uv sync --all-extras --dev
       - name: Generate throwaway signing key (never leaves the runner temp dir)
-        run: openssl genrsa -out "$RUNNER_TEMP/mcpconform-ci.pem" 2048
+        run: openssl genrsa -out "${{ runner.temp }}/mcpconform-ci.pem" 2048
       - name: Lint live tools/list
         env:
           KALSHI_API_KEY_ID: ci-placeholder
           KALSHI_PRIVATE_KEY_PATH: ${{ runner.temp }}/mcpconform-ci.pem
           KALSHI_ENV: demo
-        run: npx -y mcpconform@0.1.0 inspect -- uv run kalshi-mcp
+        # --dump + a count guard so a zero-tool result (e.g. tool imports
+        # silently broke) fails the build instead of passing green having
+        # linted nothing. mcpconform exits non-zero on error-tier findings or
+        # a server that fails to boot; the guard covers the boots-but-empty case.
+        run: |
+          npx -y mcpconform@0.1.0 inspect --dump "${{ runner.temp }}/tools.json" -- uv run kalshi-mcp
+          count=$(node -e "console.log(require('${{ runner.temp }}/tools.json').tools.length)")
+          echo "Linted $count live tools."
+          test "$count" -gt 0
