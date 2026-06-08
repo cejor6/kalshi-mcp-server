@@ -700,6 +700,9 @@ def register(server: FastMCP) -> None:
 
         A series is the template for a recurring event — e.g. "KXFED"
         is the series for Federal Reserve meeting events.
+
+        Args:
+            series_ticker: The series ticker, e.g. "KXFED".
         """
         series_ticker = _validate_ticker(series_ticker, name="series_ticker")
         return await client.get(f"/series/{series_ticker}")
