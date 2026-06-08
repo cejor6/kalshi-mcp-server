@@ -221,6 +221,9 @@ def register(server: FastMCP) -> None:
 
         Cancellation is always allowed — even when KALSHI_TRADING_ENABLED
         is off — because cancellation only reduces risk.
+
+        Args:
+            order_id: The Kalshi order id to cancel.
         """
         return await client.delete(f"/portfolio/orders/{order_id}")
 
@@ -250,5 +253,9 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_order(order_id: str) -> dict[str, Any]:
-        """Get the current state of a single order by id."""
+        """Get the current state of a single order by id.
+
+        Args:
+            order_id: The Kalshi order id to fetch.
+        """
         return await client.get(f"/portfolio/orders/{order_id}")

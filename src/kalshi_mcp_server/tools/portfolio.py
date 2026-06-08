@@ -150,7 +150,15 @@ def register(server: FastMCP) -> None:
         min_ts: int | None = None,
         max_ts: int | None = None,
     ) -> dict[str, Any]:
-        """List markets that have settled and the P&L impact on your account."""
+        """List markets that have settled and the P&L impact on your account.
+
+        Args:
+            limit: 1-1000. Default 100.
+            cursor: Pagination cursor. Kalshi silently returns an empty list
+                on a bad cursor.
+            min_ts: Lower bound on settlement timestamp (unix seconds).
+            max_ts: Upper bound on settlement timestamp (unix seconds).
+        """
         params: dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
