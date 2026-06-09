@@ -1,10 +1,5 @@
 {
   "targets": ["anthropic", "openai"],
 
-  "rules": {
-    "tool/meta-namespacing": "off",
-    "provider/schema-unenforced-keyword": "off"
-  },
-
-  "_comment": "mcpconform (https://github.com/cejor6/mcpconform) lints this server's MCP tool surface in CI. Two info-tier rules are turned off because both flag behavior that is known and intentional here, and would otherwise be dozens of lines of unactionable noise: (1) tool/meta-namespacing -- FastMCP injects a non-reverse-DNS '_meta.fastmcp' key on every tool, which this project doesn't control; (2) provider/schema-unenforced-keyword -- tool params carry minimum/maximum as deliberate LLM-steering (see AGENTS.md 'How to add a new tool'), and OpenAI not enforcing them is expected and backstopped by authoritative runtime guards. Every other rule keeps its default severity, and any error-tier finding fails the build."
+  "_comment": "mcpconform (https://github.com/cejor6/mcpconform) lints this server's MCP tool surface in CI; targets set the provider profiles to check against. No per-rule suppressions are needed: the CI step runs with --min-severity warn, so advisory info-tier findings don't clutter the gate -- including the two that flag known, intentional behavior here: tool/meta-namespacing (FastMCP injects a non-reverse-DNS '_meta.fastmcp' key on every tool, which this project doesn't control) and provider/schema-unenforced-keyword (tool params carry minimum/maximum as deliberate LLM-steering, see AGENTS.md 'How to add a new tool', backstopped by authoritative runtime guards). Any warn/error finding is still reported, and error-tier fails the build. Run `npx mcpconform inspect -- uv run kalshi-mcp` locally (no floor) to see info-tier findings; mcpconform >=0.2.0 auto-collapses framework-injected noise to a single line by default."
 }
