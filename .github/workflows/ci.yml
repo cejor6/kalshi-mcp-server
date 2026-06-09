@@ -58,7 +58,8 @@ jobs:
   # Both are secret-free and make no Kalshi API calls: `tools/list` is local
   # schema enumeration, so a throwaway RSA key + placeholder creds are enough to
   # boot the server. Safe under `pull_request` (no secrets exposed to forks).
-  # Rule targeting + the two suppressed info-rules live in mcpconform.config.json.
+  # Provider targeting lives in mcpconform.config.json; the live-surface gate uses
+  # --min-tools 1 (fail if no tools register) and --min-severity warn (info is advisory).
   mcp-conform:
     name: MCP conformance (mcpconform)
     runs-on: ubuntu-latest
@@ -67,7 +68,7 @@ jobs:
 
       # 1) Static lint of the registry manifest via the published Action.
       - name: Lint server.json
-        uses: cejor6/mcpconform@6057597ad3cf938069c66ad5c483a40a9d28d439  # v0.1.0
+        uses: cejor6/mcpconform@e9129fdfc3ec7006c75b8d0fbc9bad645d663888  # v0.2.0
         with:
           files: server.json
           targets: anthropic,openai
@@ -84,12 +85,9 @@ jobs:
           KALSHI_API_KEY_ID: ci-placeholder
           KALSHI_PRIVATE_KEY_PATH: ${{ runner.temp }}/mcpconform-ci.pem
           KALSHI_ENV: demo
-        # --dump + a count guard so a zero-tool result (e.g. tool imports
-        # silently broke) fails the build instead of passing green having
-        # linted nothing. mcpconform exits non-zero on error-tier findings or
-        # a server that fails to boot; the guard covers the boots-but-empty case.
-        run: |
-          npx -y mcpconform@0.1.0 inspect --dump "${{ runner.temp }}/tools.json" -- uv run kalshi-mcp
-          count=$(node -e "console.log(require('${{ runner.temp }}/tools.json').tools.length)")
-          echo "Linted $count live tools."
-          test "$count" -gt 0
+        # --min-tools 1 fails the build if the server boots but registers no tools
+        # (e.g. an import silently broke) instead of passing green having linted
+        # nothing. --min-severity warn keeps the gate to actionable findings; info
+        # is advisory (and framework noise is auto-collapsed by default anyway).
+        # mcpconform also exits non-zero on any error-tier finding or a boot failure.
+        run: npx -y mcpconform@0.2.0 inspect --min-tools 1 --min-severity warn -- uv run kalshi-mcp
