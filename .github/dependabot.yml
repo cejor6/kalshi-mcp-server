@@ -16,6 +16,18 @@ updates:
     labels: ["dependencies", "ci"]
     commit-message:
       prefix: "ci"
+    # Bundle every action bump into ONE weekly PR. Two reasons:
+    # 1. codeql-action/init and codeql-action/analyze are the same action
+    #    referenced by two subpaths; Dependabot treats them as separate deps
+    #    and would bump them in separate PRs. CodeQL hard-fails when init and
+    #    analyze run different versions ("Loaded a configuration file for
+    #    version X, but running version Y"), so they MUST move together.
+    # 2. The docker/* actions all live in release.yml; separate PRs conflict
+    #    on that file and need serial rebases. Grouping lands them atomically.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: "docker"
     directory: "/"
