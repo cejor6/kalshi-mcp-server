@@ -438,6 +438,25 @@ bypassed locally — discipline is the actual safeguard.
   Kalshi API. The decision of *what* to trade belongs in a separate
   program that consumes this MCP. Keeping that separation makes the
   server trustable and fork-able.
+- **Non-Kalshi data feeds — with ONE documented exception.** The rule
+  stands: this server exposes the Kalshi API, and strategy/signal
+  concerns live in the programs that consume it. The exception is
+  `kalshi_fetch_external_data` (`tools/external_data.py`, added
+  2026-07-10): a read-only, GET/https-only, exact-host-allowlisted
+  fetch of a handful of public data APIs (Polymarket, NWS, Open-Meteo,
+  Tennis Abstract, Deribit public). It exists because the claude.ai
+  cloud-routine environment that consumes this server cannot egress to
+  those hosts, and this server — already attached to every routine as
+  a connector, running with unrestricted egress — is the only channel
+  that reaches them. Decision notes: a single generic allowlisted tool
+  was chosen over N typed per-feed tools (one operator, tiny call
+  volume; the runtime allowlist + GET-only is the load-bearing control
+  either way, and N typed tools would 5× the surface to review); no
+  wildcard content hosts are allowlisted (a raw.githubusercontent.com
+  entry was removed in review); fetched bodies are delimiter-wrapped
+  UNTRUSTED data; DNS rebinding is an accepted, documented residual.
+  Forks that don't want this surface can delete the module + its
+  registration line — nothing else depends on it.
 - **Multi-user tenant isolation.** The server's identity is the
   operator's Kalshi key — there is one trading account per running
   process. `MCP_ALLOWED_GITHUB_LOGINS` controls *who can invoke tools*,

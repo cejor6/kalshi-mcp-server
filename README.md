@@ -260,6 +260,7 @@ the worked example.
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
 | Live (WebSocket) | `kalshi_get_live_orderbook`, `kalshi_sample_trades` |
+| External data (read-only) | `kalshi_fetch_external_data` — host-allowlisted, GET-only, https-only fetch of public data feeds (Polymarket gamma/clob, NWS `api.weather.gov`, Open-Meteo incl. ensemble, Tennis Abstract, Deribit public). No credentials attached (`trust_env=False`), redirects not followed, body size- and wall-clock-capped and returned wrapped in UNTRUSTED-EXTERNAL-DATA delimiters. Exists so clients whose own egress is restricted (e.g. claude.ai cloud routines) can reach the public feeds their read-only research needs; the allowlist is enforced at runtime, additions are a code change, and the boundary rationale lives in AGENTS.md. |
 
 Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
 local safety checks and returns a `confirmation_id`; nothing is sent to

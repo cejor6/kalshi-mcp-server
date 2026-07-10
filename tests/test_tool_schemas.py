@@ -116,6 +116,7 @@ async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
         ("kalshi_get_fills", "limit", 1, 1000),
         ("kalshi_get_settlements", "limit", 1, 1000),
         ("kalshi_prepare_order", "limit_price_cents", 1, 99),
+        ("kalshi_fetch_external_data", "max_bytes", 1_000, 500_000),
     ],
 )
 async def test_range_constraint_in_schema(rsa_private_key, tool, prop, lo, hi):
