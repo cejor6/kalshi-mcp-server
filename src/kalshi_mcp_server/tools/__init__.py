@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from kalshi_mcp_server.tools import (
     discovery,
     exchange,
+    external_data,
     live,
     market_data,
     orders,
@@ -34,3 +35,4 @@ def register_all_tools(server: FastMCP) -> None:
     portfolio.register(server)
     orders.register(server)
     live.register(server)
+    external_data.register(server)
