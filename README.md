@@ -2,10 +2,16 @@
 
 <!-- mcp-name: io.github.cejor6/kalshi-mcp-server -->
 
+[![PyPI](https://img.shields.io/pypi/v/kalshi-mcp-server.svg)](https://pypi.org/project/kalshi-mcp-server/)
 [![CI](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/cejor6/kalshi-mcp-server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
+📦 **[PyPI](https://pypi.org/project/kalshi-mcp-server/)** &nbsp;·&nbsp;
+🗂️ **[MCP Registry](https://registry.modelcontextprotocol.io/?search=io.github.cejor6/kalshi-mcp-server)** &nbsp;·&nbsp;
+🐳 **[Container image](https://github.com/cejor6/kalshi-mcp-server/pkgs/container/kalshi-mcp-server)** &nbsp;·&nbsp;
+🚀 **[Deploy guide](DEPLOY.md)**
 
 A Model Context Protocol server for [Kalshi](https://kalshi.com)
 prediction markets. Native RSA-PSS auth, async token-bucket rate
@@ -32,6 +38,77 @@ client in the future).
 
 ---
 
+## Quickstart (30 seconds)
+
+Read-only against Kalshi's **demo** environment — no real money, no trading
+flag. This is the safe way to try it.
+
+```bash
+pipx install kalshi-mcp-server        # or: pip install kalshi-mcp-server
+```
+
+Point any MCP client at it (this is the Claude Desktop / Claude Code shape —
+see the [full client matrix](#where-to-put-this-config) for others):
+
+```json
+{
+  "mcpServers": {
+    "kalshi": {
+      "command": "kalshi-mcp",
+      "args": ["--env-file", "/Users/you/.kalshi/.env"]
+    }
+  }
+}
+```
+
+Minimal `~/.kalshi/.env` (get a demo key at
+[demo.kalshi.co](https://demo.kalshi.co/account/profile) — it's shown once):
+
+```env
+KALSHI_API_KEY_ID=<your-demo-key-id>
+KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/demo_private_key.pem
+KALSHI_ENV=demo
+```
+
+Restart the client and ask it to run a Kalshi tool. Enabling **prod** and
+**trading** is a deliberate opt-in — a few more flags (`KALSHI_ALLOW_PROD=1`,
+`KALSHI_TRADING_ENABLED=1`) — see [Configure](#configure) and the
+[safety model](#safety-model).
+
+### What a call looks like
+
+Ask the agent for tradeable markets and `kalshi_find_liquid_markets` returns a
+volume-ranked, combo-excluded shortlist (trimmed, illustrative):
+
+```json
+{
+  "scanned": 300,
+  "markets": [
+    {
+      "ticker": "KXNBAGAME-25JUL12BOSLAL-BOS",
+      "title": "Will the Celtics beat the Lakers?",
+      "yes_bid_dollars": 0.58, "yes_ask_dollars": 0.60,
+      "volume_24h_fp": 41230, "open_interest_fp": 88400,
+      "status": "active", "close_time": "2026-07-12T23:30:00Z"
+    },
+    {
+      "ticker": "KXHIGHNY-26JUL12-B90.5",
+      "title": "Will NYC's high temp exceed 90.5°F today?",
+      "yes_bid_dollars": 0.31, "yes_ask_dollars": 0.34,
+      "volume_24h_fp": 12760, "open_interest_fp": 23110,
+      "status": "active", "close_time": "2026-07-13T04:00:00Z"
+    }
+  ]
+}
+```
+
+Placing a trade is a deliberate two step — `kalshi_prepare_order` runs the
+local safety checks and hands back a `confirmation_id`; nothing reaches Kalshi
+until you call `kalshi_confirm_order` with that token. An LLM can't place an
+order in a single call.
+
+---
+
 ## Why this server
 
 Most existing Kalshi MCPs are thin wrappers around a handful of REST
@@ -55,7 +132,17 @@ endpoints. This one aims to be:
 
 ## Install
 
-### From source (the only option until v0.1 is published)
+### From PyPI (recommended)
+
+Published as [`kalshi-mcp-server`](https://pypi.org/project/kalshi-mcp-server/).
+[pipx](https://pipx.pypa.io/) installs the `kalshi-mcp` entrypoint into its own
+isolated environment:
+
+```bash
+pipx install kalshi-mcp-server        # or: pip install kalshi-mcp-server
+```
+
+### From source
 
 ```bash
 git clone https://github.com/cejor6/kalshi-mcp-server.git
@@ -65,11 +152,14 @@ uv sync
 
 ### Docker
 
+Multi-arch (`amd64` + `arm64`) images are published to GHCR on every tagged
+release, tagged `:latest` and `:vX.Y.Z`:
+
 ```bash
 docker pull ghcr.io/cejor6/kalshi-mcp-server:latest
 ```
 
-(Image only exists once a `v*` tag is published. See [DEPLOY.md](DEPLOY.md).)
+See [DEPLOY.md](DEPLOY.md) for hosted deployment.
 
 ## Configure
 
@@ -123,7 +213,7 @@ file/UI where you put the config.
 
 Three install patterns work — pick whichever fits your environment.
 
-### Pattern A — `pipx install` (cleanest, recommended once published)
+### Pattern A — `pipx install` (cleanest, recommended)
 
 Installs `kalshi-mcp` to a globally-available, isolated environment.
 [pipx](https://pipx.pypa.io/) is the modern Python tool for this:
