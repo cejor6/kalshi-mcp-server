@@ -44,7 +44,7 @@ REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 # 2s, not the redis-py default of 5s. These are the dominant term in the
 # worst case: against a *blackholed* (not refused) Redis every leaf attempt
 # burns a full timeout, and the nesting below gives ~4 leaf attempts per
-# command across ~9 sequential store ops in a token exchange. At 5s that's
+# command across the 8 sequential store ops in a token exchange. At 5s that's
 # minutes on a hung request; at 2s it's ~1 min. Upstash round-trips are
 # single-digit ms, so 2s is still ~100x headroom.
 REDIS_CONNECT_TIMEOUT_SECONDS = 2
@@ -52,7 +52,8 @@ REDIS_SOCKET_TIMEOUT_SECONDS = 2
 # Deliberately 1, not 3. redis-py applies the retry policy at THREE nested
 # layers — `execute_command`, `connect`, and `check_health` — so the attempt
 # count multiplies to roughly (retries + 1) ** 2 TLS connects per command.
-# FastMCP issues ~8 sequential store ops per token exchange, so retries=3
+# FastMCP issues 8 sequential store ops inside `exchange_refresh_token`
+# (~10 for the whole /token request), so retries=3
 # turns a Redis outage into a multi-minute hang on an OAuth request (and
 # hammers a provider that bills per connection). `health_check_interval` is
 # what actually fixes the stale-socket case; the retry only covers a genuine
@@ -80,7 +81,9 @@ def _build_client_storage() -> tuple[object | None, str]:
     only when `client_storage is None` (`oauth_proxy/proxy.py`). Everything
     the proxy persists here — including `UpstreamTokenSet`, the live
     upstream access + refresh tokens — is therefore **plaintext JSON in
-    Redis**. The separate-DB advice above is key hygiene, not the security
+    Redis**. (FastMCP's *own* refresh tokens are the exception: only their
+    SHA-256 is stored, as a key, so those aren't recoverable from Redis.
+    The upstream ones are.) The separate-DB advice above is key hygiene, not the security
     boundary; treat read access to this Redis as equivalent to holding the
     upstream credentials. Encrypting at rest is tracked separately.
 
@@ -116,10 +119,12 @@ def _build_client_storage() -> tuple[object | None, str]:
     Don't quote a refresh cadence without checking which branch applies.
     The upstream's own `expires_in` wins whenever it is present; FastMCP's
     1h `DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS` is only the fallback for an
-    IdP that omits it. GitHub Apps — the GitHub config that issues refresh
-    tokens at all — do send `expires_in` (8h), so rotation there is a few
-    times a day, not hourly. A classic GitHub OAuth App returns no refresh
-    token, takes the no-refresh branch, and never rotates.
+    IdP that omits it. A GitHub App with "Expire user authorization tokens"
+    enabled — the GitHub config that issues refresh tokens — sends its own
+    `expires_in` (8h at time of writing), so rotation there is a few times a
+    day, not hourly. A classic OAuth App, or a GitHub App with expiration
+    turned off, returns no refresh token, takes the no-refresh branch, and
+    never rotates.
 
     Be precise about what the retry does and doesn't buy: it retries a
     *single* Redis command on a fresh connection. It does NOT make the

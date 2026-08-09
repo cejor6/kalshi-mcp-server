@@ -213,7 +213,8 @@ Be precise about the rest, because two reviewers have already misread it:
 - `REDIS_RETRIES` is **1 on purpose.** redis-py applies the retry policy at
   three nested layers (`execute_command`, `connect`, `check_health`), so the
   attempt count multiplies to roughly `(retries + 1) ** 2` TLS connects per
-  command. At ~8 store ops per token exchange, `retries=3` turns a Redis
+  command. At 8 store ops inside `exchange_refresh_token` (~10 for the whole
+  `/token` request), `retries=3` turns a Redis
   outage into a multi-minute hang on an OAuth request. Raising it trades a
   real availability regression for very little.
 - The retry covers a **single command** on a fresh connection. It does not
@@ -231,9 +232,10 @@ that's a silent outage.
 Don't quote a refresh cadence without checking which branch applies: the
 upstream's own `expires_in` wins whenever present, and FastMCP's 1h
 `DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS` is only the fallback for an IdP that
-omits it. GitHub Apps (the GitHub config that issues refresh tokens at all)
-send `expires_in` of 8h, so rotation is a few times a day. A classic GitHub
-OAuth App returns no refresh token and never rotates.
+omits it. A GitHub App with "Expire user authorization tokens" enabled (the
+GitHub config that issues refresh tokens) sends its own `expires_in` — 8h at
+time of writing — so rotation is a few times a day. A classic OAuth App, or a
+GitHub App with expiration off, returns no refresh token and never rotates.
 
 `tests/test_oauth.py` pins each kwarg and drives `Retry.call_with_retry`
 with the real configured policy, proving it survives one transient failure
@@ -245,7 +247,9 @@ Separately, and deliberately not fixed here: supplying `client_storage`
 makes FastMCP skip its `FernetEncryptionWrapper` (applied only when
 `client_storage is None`), so everything the proxy persists — including the
 live upstream access + refresh tokens — is **plaintext JSON in Redis**.
-Read access to that Redis is equivalent to holding the upstream
+FastMCP's own refresh tokens are the one exception: only their SHA-256 is
+stored, as a key, so those aren't recoverable. The upstream ones are, which
+makes read access to that Redis equivalent to holding the upstream
 credentials. Tracked as its own change.
 
 ---
