@@ -38,6 +38,13 @@ from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
+# Redis connection-resilience tuning for the OAuth DCR client store. See
+# `_build_client_storage` for why these are load-bearing for connector
+# durability rather than cosmetic.
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
+REDIS_CONNECT_TIMEOUT_SECONDS = 5
+REDIS_RETRIES = 3
+
 
 def _build_client_storage() -> tuple[object | None, str]:
     """Return `(storage, description)` for the OAuth proxy's DCR client store.
@@ -54,6 +61,27 @@ def _build_client_storage() -> tuple[object | None, str]:
 
     `decode_responses=True` is required: `RedisStore._get_managed_entry`
     rejects non-`str` responses and `Redis.from_url` defaults to False.
+
+    **Connection resilience is load-bearing, not a nicety.** redis-py
+    defaults to `health_check_interval=0` and `Retry(NoBackoff(), 0)` —
+    i.e. no liveness check and *zero* retries. A managed Redis (Upstash)
+    drops idle TLS connections, so the next pooled use of a dead socket
+    raises `ConnectionError: Error UNKNOWN while writing to socket.
+    Connection lost.` from `send_packed_command`.
+
+    That matters far beyond log noise. claude.ai refreshes its access
+    token roughly hourly (FastMCP's default access-token TTL is 1h), and
+    each refresh rotates the refresh token with one-time-use enforcement:
+    the proxy deletes the *old* refresh JTI before persisting the new
+    refresh metadata. A connection blip inside that window leaves the
+    client holding a refresh token the server has no record of — a
+    permanently dead connector that only a manual reconnect fixes. For an
+    unattended cron/routine consumer that's a silent outage.
+
+    So: `health_check_interval` pings a connection idle longer than the
+    interval before reusing it (killing the stale-grab), `socket_keepalive`
+    keeps the OS from silently dropping idle sockets, and the retry policy
+    covers a genuine mid-flight blip during the rotation window.
     """
     url = os.environ.get("MCP_REDIS_URL", "").strip()
     if not url:
@@ -64,6 +92,10 @@ def _build_client_storage() -> tuple[object | None, str]:
     try:
         from key_value.aio.stores.redis import RedisStore
         from redis.asyncio import Redis
+        from redis.asyncio.retry import Retry
+        from redis.backoff import ExponentialBackoff
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "MCP_REDIS_URL is set but the [oauth] extras aren't installed. "
@@ -71,7 +103,15 @@ def _build_client_storage() -> tuple[object | None, str]:
             "kalshi-mcp-server[oauth]`)."
         ) from exc
 
-    client = Redis.from_url(url, decode_responses=True)
+    client = Redis.from_url(
+        url,
+        decode_responses=True,
+        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+        socket_keepalive=True,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+        retry=Retry(ExponentialBackoff(), retries=REDIS_RETRIES),
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+    )
     return (
         RedisStore(client=client, default_collection="kalshi-oauth-proxy"),
         "redis (persistent)",

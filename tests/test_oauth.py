@@ -55,6 +55,68 @@ def test_build_auth_provider_strips_trailing_slash_from_base_url(monkeypatch):
     # it cleanly across versions, but the construction must not raise.
 
 
+# ── Redis client store: connection resilience ──────────────────────────────
+#
+# These assert on the *constructed connection kwargs*, not just that the
+# call doesn't raise. redis-py defaults to no health check and zero retries,
+# which leaves a dropped idle TLS connection to surface as a hard
+# ConnectionError — and one landing inside FastMCP's refresh-token rotation
+# window permanently kills a connector. Regressing these is silent in tests
+# and catastrophic in prod, so pin them explicitly.
+
+
+def _redis_store_client(monkeypatch):
+    """Build the Redis-backed store and return the underlying redis client."""
+    # No credentials in the URL — nothing here connects, and embedded
+    # basic-auth trips the detect-secrets hook.
+    monkeypatch.setenv("MCP_REDIS_URL", "rediss://example.invalid:6379")
+    from kalshi_mcp_server.oauth import _build_client_storage
+
+    storage, desc = _build_client_storage()
+    assert storage is not None
+    assert "redis" in desc
+    return storage._client
+
+
+def test_redis_store_sets_health_check_interval(monkeypatch):
+    """Without this, a stale pooled connection is used blind and throws."""
+    client = _redis_store_client(monkeypatch)
+    assert client.connection_pool.connection_kwargs["health_check_interval"] == 30
+
+
+def test_redis_store_enables_socket_keepalive(monkeypatch):
+    client = _redis_store_client(monkeypatch)
+    assert client.connection_pool.connection_kwargs["socket_keepalive"] is True
+
+
+def test_redis_store_retries_on_connection_and_timeout_errors(monkeypatch):
+    """The retry is what protects the refresh-token rotation window."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+
+    client = _redis_store_client(monkeypatch)
+    retry = client.connection_pool.connection_kwargs["retry"]
+    assert retry is not None
+    assert retry._retries == 3
+    supported = client.connection_pool.connection_kwargs["retry_on_error"]
+    assert RedisConnectionError in supported
+    assert RedisTimeoutError in supported
+
+
+def test_redis_store_preserves_decode_responses(monkeypatch):
+    """decode_responses=False makes RedisStore silently drop every read."""
+    client = _redis_store_client(monkeypatch)
+    assert client.connection_pool.connection_kwargs["decode_responses"] is True
+
+
+def test_build_client_storage_without_redis_url_is_ephemeral(monkeypatch):
+    from kalshi_mcp_server.oauth import _build_client_storage
+
+    storage, desc = _build_client_storage()
+    assert storage is None
+    assert "ephemeral" in desc
+
+
 def test_parse_allowed_logins_handles_whitespace_and_case():
     import os
 

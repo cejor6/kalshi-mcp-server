@@ -193,6 +193,25 @@ Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
 itself is the operator.
 
+**The Redis client's connection-resilience kwargs are load-bearing —
+don't strip them.** `_build_client_storage` passes
+`health_check_interval`, `socket_keepalive`, `socket_connect_timeout`,
+`retry` and `retry_on_error` to `Redis.from_url`. redis-py's defaults are
+`health_check_interval=0` and `Retry(NoBackoff(), 0)` — no liveness check
+and zero retries — so a managed Redis that drops idle TLS connections
+(Upstash does) makes the next pooled use raise `ConnectionError: Error
+UNKNOWN while writing to socket. Connection lost.`
+
+The blast radius is worse than log noise. claude.ai refreshes its access
+token about hourly (FastMCP's default access-token TTL is 1h) and each
+refresh **rotates** the refresh token with one-time-use enforcement — the
+proxy deletes the old refresh JTI *before* persisting the new refresh
+metadata. A blip inside that window strands the client with a refresh
+token the server has no record of, permanently killing the connector
+until a human reconnects it. For unattended cron/routine consumers that's
+a silent outage. `tests/test_oauth.py` pins each kwarg for this reason;
+if you change one, change the test deliberately, not incidentally.
+
 ---
 
 ## Deployment contracts
