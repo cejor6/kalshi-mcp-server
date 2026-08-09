@@ -361,9 +361,11 @@ Know the limits of that boundary before you rely on it:
   Redis URL can read and overwrite every prefix. It separates
   cooperating deployments; it is not a security boundary between
   untrusted ones.
-- Encryption gives confidentiality, not integrity — there's no
-  authentication tying a stored blob to this server, so a party who can
-  write to the DB can plant entries. Treat write access as trusted.
+- Planted entries are rejected, but write access is still damaging.
+  The server refuses any value that wasn't encrypted by it, so someone
+  with Redis write access can't forge an accepted record (e.g. a client
+  registration with their own redirect URI) without the key. They can
+  still delete or overwrite entries, which costs you a reconnect.
 - Collection and key names stay plaintext (client IDs, JTIs,
   refresh-token hashes). Only values are encrypted.
 - **Runtime safety-limit overrides are not namespaced** — `safety_store`

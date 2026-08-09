@@ -265,8 +265,14 @@ The store is `FernetEncryptionWrapper(PrefixCollectionsWrapper(RedisStore))`:
   `jwt_issuer.derive_jwt_key`, which could move under our wide
   `fastmcp>=2.0.0` floor. (FastMCP's own refresh tokens were never the
   exposure: only their SHA-256 is stored, as a key.)
-  Encryption buys **confidentiality only** — no integrity, and collection
-  and key names stay plaintext.
+  The wrapper is subclassed via `_strict_encryption_wrapper_class()` to
+  **reject values lacking the `__encrypted_data__` marker.** The stock one
+  returns them as-is, which would let anyone with Redis *write* access plant
+  an accepted plaintext record — an attacker-chosen `ProxyDCRClient` with its
+  own `redirect_uris`, say — without ever knowing the key. Don't unwrap that
+  back to the plain `FernetEncryptionWrapper`. Collection and key names are
+  still plaintext, and encryption remains confidentiality; the subclass is
+  what supplies the integrity half.
 - **Collection isolation.** The store's `default_collection` is inert —
   FastMCP passes its own names (`mcp-oauth-proxy-clients`,
   `mcp-refresh-tokens`, …) to each adapter, and those are identical in every
