@@ -102,7 +102,9 @@ def test_redis_store_retries_on_connection_and_timeout_errors(monkeypatch):
     client = _redis_store_client(monkeypatch)
     retry = client.connection_pool.connection_kwargs["retry"]
     assert retry is not None
-    # Public accessor — `retry._retries` is private and drifts across versions.
+    # `get_retries()` over the private `_retries`. It postdates the
+    # `redis>=5.0.0` floor, so a fork pinned to the floor would AttributeError
+    # here — CI installs the lock, so that's not us.
     assert retry.get_retries() == 1
     supported = client.connection_pool.connection_kwargs["retry_on_error"]
     assert RedisConnectionError in supported
@@ -110,7 +112,13 @@ def test_redis_store_retries_on_connection_and_timeout_errors(monkeypatch):
 
 
 def test_redis_store_backoff_is_jittered(monkeypatch):
-    """Unjittered backoff makes every pooled connection retry in lockstep."""
+    """Unjittered backoff makes every pooled connection retry in lockstep.
+
+    Reaches `_backoff` because redis-py exposes no public accessor for it
+    (`Retry` offers only get_retries/update_retries/update_supported_errors).
+    Unavoidable, not an oversight — don't "fix" it to match the public
+    `get_retries()` used above.
+    """
     from redis.backoff import FullJitterBackoff
 
     client = _redis_store_client(monkeypatch)
@@ -122,17 +130,20 @@ def test_redis_store_bounds_read_writes_with_socket_timeout(monkeypatch):
     """Without this, an older redis-py defaults to None and hangs forever."""
     client = _redis_store_client(monkeypatch)
     kwargs = client.connection_pool.connection_kwargs
-    assert kwargs["socket_timeout"] == 5
-    assert kwargs["socket_connect_timeout"] == 5
+    # 2s, not redis-py's 5s default: these dominate the worst-case hang
+    # against a blackholed Redis. See `_build_client_storage`.
+    assert kwargs["socket_timeout"] == 2
+    assert kwargs["socket_connect_timeout"] == 2
 
 
 async def test_retry_policy_actually_retries_a_failing_command(monkeypatch):
-    """Behavioral, not wiring: prove the configured retry really fires.
+    """Prove the configured retry really fires, not just that it's wired.
 
-    The other tests assert the kwargs land on the client. This one drives
-    `Retry.call_with_retry` with the exact policy we construct and asserts a
-    transient ConnectionError is survived — the single-command blip the
-    docstring claims to cover.
+    Scope honestly: this drives the real `Retry` object built by
+    `_build_client_storage` (so REDIS_RETRIES is end-to-end through
+    `from_url`), but with a hand-written coroutine rather than a real
+    command — so it covers the policy, NOT the send/reconnect path. A blip
+    during the actual rotation sequence remains untested.
     """
     from redis.exceptions import ConnectionError as RedisConnectionError
 

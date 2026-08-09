@@ -41,8 +41,14 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 # Redis connection-resilience tuning for the OAuth client store. See
 # `_build_client_storage` for what each one actually buys.
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
-REDIS_CONNECT_TIMEOUT_SECONDS = 5
-REDIS_SOCKET_TIMEOUT_SECONDS = 5
+# 2s, not the redis-py default of 5s. These are the dominant term in the
+# worst case: against a *blackholed* (not refused) Redis every leaf attempt
+# burns a full timeout, and the nesting below gives ~4 leaf attempts per
+# command across ~9 sequential store ops in a token exchange. At 5s that's
+# minutes on a hung request; at 2s it's ~1 min. Upstash round-trips are
+# single-digit ms, so 2s is still ~100x headroom.
+REDIS_CONNECT_TIMEOUT_SECONDS = 2
+REDIS_SOCKET_TIMEOUT_SECONDS = 2
 # Deliberately 1, not 3. redis-py applies the retry policy at THREE nested
 # layers — `execute_command`, `connect`, and `check_health` — so the attempt
 # count multiplies to roughly (retries + 1) ** 2 TLS connects per command.
@@ -69,6 +75,15 @@ def _build_client_storage() -> tuple[object | None, str]:
     two OAuth-proxy servers pointed at the same Redis DB would cross-read
     each other's registrations. Give each deployment its own Redis DB.
 
+    And know what you're protecting: supplying `client_storage` at all
+    means FastMCP skips its `FernetEncryptionWrapper`, which it applies
+    only when `client_storage is None` (`oauth_proxy/proxy.py`). Everything
+    the proxy persists here — including `UpstreamTokenSet`, the live
+    upstream access + refresh tokens — is therefore **plaintext JSON in
+    Redis**. The separate-DB advice above is key hygiene, not the security
+    boundary; treat read access to this Redis as equivalent to holding the
+    upstream credentials. Encrypting at rest is tracked separately.
+
     Uses `redis.asyncio.Redis.from_url` because `RedisStore(url=...)` in
     `py-key-value-aio` 0.4.4 ignores TLS on `rediss://` URLs. Upstash
     requires TLS so we construct the client manually.
@@ -89,16 +104,22 @@ def _build_client_storage() -> tuple[object | None, str]:
     ping a connection that has been idle longer than it before handing it
     out, which is what actually removes the error.
 
-    Why it's worth caring about: when GitHub issues a refresh token,
-    claude.ai refreshes roughly hourly (FastMCP's default access-token TTL
-    is 1h) and each refresh rotates the refresh token with one-time-use
-    enforcement — the proxy deletes the *old* refresh JTI before persisting
-    the new refresh metadata. A failure inside that sequence can leave the
-    client holding a refresh token the server has no record of: a dead
-    connector that only a manual reconnect fixes, which for an unattended
-    cron/routine consumer is a silent outage. (With a classic GitHub OAuth
-    App that returns no refresh token, the proxy takes the no-refresh
-    branch and never rotates at all.)
+    Why it's worth caring about: when the upstream issues a refresh token,
+    claude.ai periodically refreshes, and each refresh rotates the refresh
+    token with one-time-use enforcement — the proxy deletes the *old*
+    refresh JTI before persisting the new refresh metadata. A failure
+    inside that sequence can leave the client holding a refresh token the
+    server has no record of: a dead connector that only a manual reconnect
+    fixes, which for an unattended cron/routine consumer is a silent
+    outage.
+
+    Don't quote a refresh cadence without checking which branch applies.
+    The upstream's own `expires_in` wins whenever it is present; FastMCP's
+    1h `DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS` is only the fallback for an
+    IdP that omits it. GitHub Apps — the GitHub config that issues refresh
+    tokens at all — do send `expires_in` (8h), so rotation there is a few
+    times a day, not hourly. A classic GitHub OAuth App returns no refresh
+    token, takes the no-refresh branch, and never rotates.
 
     Be precise about what the retry does and doesn't buy: it retries a
     *single* Redis command on a fresh connection. It does NOT make the
@@ -125,11 +146,12 @@ def _build_client_storage() -> tuple[object | None, str]:
         from redis.asyncio import Redis
         from redis.asyncio.retry import Retry
 
-        # FullJitterBackoff, not ExponentialBackoff (unjittered — pooled
-        # connections would retry in lockstep) and not
-        # ExponentialWithJitterBackoff (absent on older releases the
-        # `redis>=5.0.0` floor allows; importing it here would surface as a
-        # misleading "extras aren't installed" RuntimeError below).
+        # FullJitterBackoff over ExponentialBackoff so pooled connections
+        # don't retry in lockstep — a small win at these delays (~0-16ms vs
+        # a flat 16ms), but free. Not ExponentialWithJitterBackoff: it
+        # landed in redis-py 6.0 and the `redis>=5.0.0` floor allows older
+        # releases, where importing it would surface as the misleading
+        # "extras aren't installed" RuntimeError below.
         from redis.backoff import FullJitterBackoff
         from redis.exceptions import ConnectionError as RedisConnectionError
         from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -148,9 +170,11 @@ def _build_client_storage() -> tuple[object | None, str]:
         socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
         socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
         retry=Retry(FullJitterBackoff(), retries=REDIS_RETRIES),
-        # A fresh list per call: redis-py stores this in `connection_kwargs`
-        # and `Connection.__init__` *appends* to it when `retry_on_timeout`
-        # is set, so a shared module-level list would grow per connection.
+        # `Connection.__init__` *appends* to this list when `retry_on_timeout`
+        # is truthy, and the pool hands the same list to every connection it
+        # makes — so what keeps it from growing unboundedly is leaving
+        # `retry_on_timeout` at its default False, not the fresh list here.
+        # If you ever set it, copy the list per connection.
         retry_on_error=[RedisConnectionError, RedisTimeoutError],
     )
     return (
