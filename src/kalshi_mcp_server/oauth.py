@@ -31,6 +31,7 @@ here — this module is policy-free and just builds what the env says.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from fastmcp.exceptions import ToolError
@@ -39,6 +40,8 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from kalshi_mcp_server.errors import ConfigError
+
+logger = logging.getLogger("kalshi_mcp_server")
 
 # Redis connection-resilience tuning for the OAuth client store. See
 # `_build_client_storage` for what each one actually buys.
@@ -72,6 +75,10 @@ DEFAULT_REDIS_COLLECTION_PREFIX = "kalshi"
 # Changing this makes every existing stored entry undecryptable (they degrade
 # to cache misses and clients re-register) — treat it as a key rotation.
 STORAGE_ENCRYPTION_SALT = "kalshi-mcp-storage-encryption-key"
+# Below this we warn (never fail — a short key still works). The salt above is
+# a fixed public constant, identical across forks, so precomputation amortizes
+# across deployments; length is what actually makes that infeasible.
+MIN_SIGNING_KEY_LENGTH = 32
 
 
 def _collection_prefix() -> str:
@@ -213,6 +220,21 @@ def _build_client_storage() -> tuple[object | None, str]:
             "secret to derive a storage-encryption key from. Set "
             'MCP_JWT_SIGNING_KEY (e.g. `python -c "import secrets; '
             'print(secrets.token_urlsafe(64))"`) or unset MCP_REDIS_URL.'
+        )
+
+    # Warn, don't fail — a short key still works, it's just weak. This string
+    # is now the *only* thing protecting the upstream OAuth tokens at rest, so
+    # a low-entropy value undoes the PBKDF2 stretching below. FastMCP warns
+    # below 12; the recommended value is token_urlsafe(64) ≈ 86 chars.
+    if len(signing_key) < MIN_SIGNING_KEY_LENGTH:
+        logger.warning(
+            "MCP_JWT_SIGNING_KEY is only %d characters. It is the sole "
+            "protection for the OAuth tokens encrypted in Redis — a "
+            "low-entropy value is brute-forceable offline by anyone who can "
+            "read that Redis. Use at least %d (recommended: "
+            "`secrets.token_urlsafe(64)`).",
+            len(signing_key),
+            MIN_SIGNING_KEY_LENGTH,
         )
 
     client = Redis.from_url(

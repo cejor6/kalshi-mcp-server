@@ -190,6 +190,10 @@ safety controls reduce blast radius but don't eliminate it.
   is derived from)
 - `MCP_REDIS_URL` — persistent DCR client storage (optional; in-memory
   if unset, requires reconnect after each redeploy)
+- `MCP_REDIS_COLLECTION_PREFIX` — collection namespace for this
+  deployment (default `kalshi`). Give every server sharing a Redis DB a
+  distinct value; changing it is a keyspace move, so treat it like a key
+  rotation
 
 Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
@@ -269,7 +273,7 @@ The store is `FernetEncryptionWrapper(PrefixCollectionsWrapper(RedisStore))`:
   FastMCP OAuth-proxy server. Without `PrefixCollectionsWrapper`, two
   servers sharing a Redis DB land in one keyspace and resolve each other's
   registrations and JTIs. The prefix is what makes one shared Redis safe —
-  give each deployment a distinct `REDIS_COLLECTION_PREFIX`.
+  give each deployment a distinct `MCP_REDIS_COLLECTION_PREFIX`.
 
 Consequence worth knowing: `MCP_REDIS_URL` now **requires**
 `MCP_JWT_SIGNING_KEY`, and `_build_client_storage` raises `ConfigError`
