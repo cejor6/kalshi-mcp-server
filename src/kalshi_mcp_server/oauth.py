@@ -31,6 +31,7 @@ here — this module is policy-free and just builds what the env says.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -79,6 +80,74 @@ STORAGE_ENCRYPTION_SALT = "kalshi-mcp-storage-encryption-key"
 # a fixed public constant, identical across forks, so precomputation amortizes
 # across deployments; length is what actually makes that infeasible.
 MIN_SIGNING_KEY_LENGTH = 32
+
+
+# The marker py-key-value-aio writes alongside every encrypted payload. Kept
+# as our own literal rather than imported: the upstream name is private, and a
+# rename should surface as a loud test failure (see
+# `test_encrypted_data_marker_matches_upstream`) rather than an import error
+# buried in the [oauth]-extras handler. If it ever did drift unnoticed, the
+# behavior stays fail-closed — every read becomes a miss and clients
+# re-register, rather than plaintext being silently accepted.
+_ENCRYPTED_DATA_MARKER = "__encrypted_data__"
+
+
+@functools.cache
+def _strict_encryption_wrapper_class() -> type:
+    """Return a `FernetEncryptionWrapper` that refuses unencrypted values.
+
+    The stock wrapper returns any value lacking the `__encrypted_data__`
+    marker **as-is** (`wrappers/encryption/base.py:_decrypt_value`). Fernet
+    itself is authenticated, so a reader reasonably assumes tampered data is
+    rejected — but that only covers payloads that went *through* Fernet. A
+    party who can write to Redis can skip it entirely and plant a plaintext
+    record, and the proxy will accept it: an attacker-chosen `ProxyDCRClient`
+    with its own `redirect_uris`, for instance.
+
+    Encryption gives us confidentiality; this closes the integrity half by
+    treating "not encrypted by us" as "not there". All four read paths
+    (`get` / `get_many` / `ttl` / `ttl_many`) funnel through `_decrypt_value`,
+    so overriding it covers everything.
+
+    The DCR-client store is the obvious example but not the sharpest one —
+    DCR is open anyway, and `get_client` re-imposes
+    `allowed_redirect_uri_patterns` from config on read. The authorization-code,
+    JTI-mapping and transaction stores are where a forged entry buys more.
+
+    Side benefit that matters during the upgrade: pre-existing *plaintext*
+    entries — the ones written before encryption was applied — become misses
+    too, so they can't be used even before they're purged.
+
+    Precisely: this rejects anything not encrypted under *this server's*
+    signing key and salt. A sibling deployment sharing both could still
+    produce entries we accept — which is exactly why co-deployed servers get
+    distinct collection prefixes.
+
+    Built by a factory rather than declared at module scope because the base
+    class lives behind the lazily-imported `[oauth]` extras. Cached so the
+    class has a stable identity across calls.
+    """
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    class StrictFernetEncryptionWrapper(FernetEncryptionWrapper):  # type: ignore[misc]
+        # Instance-level latch: a store full of legacy plaintext would
+        # otherwise log once per read, unbounded and unactionable.
+        _warned_unencrypted = False
+
+        def _decrypt_value(self, value):  # type: ignore[no-untyped-def]
+            if value is not None and _ENCRYPTED_DATA_MARKER not in value:
+                if not self._warned_unencrypted:
+                    self._warned_unencrypted = True
+                    logger.warning(
+                        "Discarding unencrypted entries from the OAuth store "
+                        "(logged once). Either they predate encryption — purge "
+                        "them, see DEPLOY.md — or something else is writing to "
+                        "this Redis."
+                    )
+                return None
+            return super()._decrypt_value(value)
+
+    return StrictFernetEncryptionWrapper
 
 
 def _collection_prefix() -> str:
@@ -184,7 +253,6 @@ def _build_client_storage() -> tuple[object | None, str]:
     # redis + py-key-value-aio. Those are part of the [oauth] extras.
     try:
         from key_value.aio.stores.redis import RedisStore
-        from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
         from key_value.aio.wrappers.prefix_collections import (
             PrefixCollectionsWrapper,
         )
@@ -271,7 +339,7 @@ def _build_client_storage() -> tuple[object | None, str]:
     # both FastMCP's own behavior and DEPLOY.md's documented rotation story
     # ("clients see a single reconnect prompt then are back").
     return (
-        FernetEncryptionWrapper(
+        _strict_encryption_wrapper_class()(
             key_value=PrefixCollectionsWrapper(
                 key_value=RedisStore(client=client),
                 prefix=_collection_prefix(),

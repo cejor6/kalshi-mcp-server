@@ -105,6 +105,10 @@ def test_redis_store_is_encrypted_at_rest(monkeypatch):
 
     storage = _redis_storage(monkeypatch)
     assert isinstance(storage, FernetEncryptionWrapper)
+    # isinstance alone passes for the stock class too, so reverting the call
+    # site to it would leave this green. Pin the strict behavior instead:
+    # an unencrypted value must read as absent.
+    assert storage._decrypt_value({"not": "encrypted"}) is None
 
 
 def test_redis_store_prefixes_collections(monkeypatch):
@@ -207,6 +211,101 @@ async def test_undecryptable_entry_degrades_to_a_cache_miss():
         raise_on_decryption_error=False,
     )
     assert await rotated.get(key="k", collection="c") is None
+
+
+def test_encrypted_data_marker_matches_upstream():
+    """Our copy of the marker must track py-key-value-aio's private constant.
+
+    If upstream renames it, the strict wrapper below would reject every entry
+    (fail-closed — misses, not plaintext acceptance), but the connector would
+    break. Fail here first, loudly, instead.
+    """
+    from key_value.aio.wrappers.encryption.base import _ENCRYPTED_DATA_KEY
+
+    from kalshi_mcp_server.oauth import _ENCRYPTED_DATA_MARKER
+
+    assert _ENCRYPTED_DATA_MARKER == _ENCRYPTED_DATA_KEY
+
+
+async def test_strict_wrapper_rejects_planted_plaintext():
+    """The stock wrapper returns unencrypted values as-is, so anyone who can
+    WRITE to Redis could plant an accepted record without knowing the key —
+    e.g. a ProxyDCRClient with attacker-chosen redirect_uris. Treat "not
+    encrypted by us" as "not there".
+    """
+    from key_value.aio.stores.memory import MemoryStore
+
+    from kalshi_mcp_server.oauth import (
+        STORAGE_ENCRYPTION_SALT,
+        _strict_encryption_wrapper_class,
+    )
+
+    inner = MemoryStore()
+    strict = _strict_encryption_wrapper_class()(
+        key_value=inner,
+        source_material="k" * 40,
+        salt=STORAGE_ENCRYPTION_SALT,
+        raise_on_decryption_error=False,
+    )
+
+    # Written straight to the backing store, bypassing encryption entirely.
+    await inner.put(
+        key="planted",
+        value={"redirect_uris": ["https://attacker.example/callback"]},
+        collection="mcp-oauth-proxy-clients",
+    )
+    assert await strict.get(key="planted", collection="mcp-oauth-proxy-clients") is None
+
+    # And the stock wrapper is what we're protecting against — confirm it
+    # really does accept the same record, so this test isn't guarding nothing.
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    lenient = FernetEncryptionWrapper(
+        key_value=inner,
+        source_material="k" * 40,
+        salt=STORAGE_ENCRYPTION_SALT,
+        raise_on_decryption_error=False,
+    )
+    assert await lenient.get(key="planted", collection="mcp-oauth-proxy-clients") is not None
+
+
+async def test_strict_wrapper_still_round_trips_its_own_writes():
+    """Rejecting plaintext must not break the normal path."""
+    from key_value.aio.stores.memory import MemoryStore
+
+    from kalshi_mcp_server.oauth import (
+        STORAGE_ENCRYPTION_SALT,
+        _strict_encryption_wrapper_class,
+    )
+
+    strict = _strict_encryption_wrapper_class()(
+        key_value=MemoryStore(),
+        source_material="k" * 40,
+        salt=STORAGE_ENCRYPTION_SALT,
+        raise_on_decryption_error=False,
+    )
+    payload = {"access_token": "ghu_x", "refresh_token": "ghr_y"}
+    await strict.put(key="t", value=payload, collection="mcp-upstream-tokens")
+    assert await strict.get(key="t", collection="mcp-upstream-tokens") == payload
+
+
+def test_short_signing_key_warns_but_still_starts(monkeypatch, caplog):
+    """Warn, don't fail — a short key works, it's just weak. It is the only
+    thing protecting the tokens encrypted in Redis, so silence is wrong."""
+    from kalshi_mcp_server.oauth import _build_client_storage
+
+    monkeypatch.setenv("MCP_REDIS_URL", "rediss://example.invalid:6379")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "short")
+    with caplog.at_level("WARNING", logger="kalshi_mcp_server"):
+        storage, _ = _build_client_storage()
+    assert storage is not None, "a short key must not block startup"
+    assert any("MCP_JWT_SIGNING_KEY is only 5 characters" in r.message for r in caplog.records)
+
+
+def test_adequate_signing_key_does_not_warn(monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="kalshi_mcp_server"):
+        _redis_storage(monkeypatch)
+    assert not [r for r in caplog.records if "MCP_JWT_SIGNING_KEY" in r.message]
 
 
 def test_collection_prefix_is_env_overridable(monkeypatch):
