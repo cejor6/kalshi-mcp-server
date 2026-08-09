@@ -193,6 +193,65 @@ Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
 itself is the operator.
 
+**`health_check_interval` on the Redis client is load-bearing — don't
+strip it.** On the `Redis.from_url` path, `Connection.__init__` ends up
+with `Retry(NoBackoff(), 0)` and `health_check_interval=0` — no liveness
+check and zero retries. (`Redis.__init__`'s `retries=10` default does not
+apply on this path; check with `pool.make_connection().retry.get_retries()`
+rather than reading the signature.) A managed Redis that drops idle TLS
+connections — Upstash does — then makes the next pooled use raise
+`ConnectionError: Error UNKNOWN while writing to socket. Connection lost.`
+Setting the interval is what removes that.
+
+Be precise about the rest, because two reviewers have already misread it:
+
+- `socket_keepalive` and `socket_connect_timeout` match redis-py 8's own
+  defaults. They're pinned so the guarantee survives the `redis>=5.0.0`
+  floor, not because they change behavior today. `socket_timeout` is the
+  one that genuinely matters across that floor — older releases default it
+  to `None`, where a blackholed connection blocks `read_response` forever.
+- `REDIS_RETRIES` is **1 on purpose.** redis-py applies the retry policy at
+  three nested layers (`execute_command`, `connect`, `check_health`), so the
+  attempt count multiplies to roughly `(retries + 1) ** 2` TLS connects per
+  command. At 8 store ops inside `exchange_refresh_token` (~10 for the whole
+  `/token` request), `retries=3` turns a Redis
+  outage into a multi-minute hang on an OAuth request. Raising it trades a
+  real availability regression for very little.
+- The retry covers a **single command** on a fresh connection. It does not
+  make rotation atomic — there's no transaction, so a process death or an
+  outage longer than the budget still strands the connector.
+
+Why any of it matters: when the upstream issues a refresh token, claude.ai
+refreshes periodically and each refresh **rotates** the refresh token with
+one-time-use enforcement — the proxy deletes the old refresh JTI *before*
+persisting the new refresh metadata. A failure inside that sequence strands
+the client with a refresh token the server has no record of, killing the
+connector until a human reconnects. For unattended cron/routine consumers
+that's a silent outage.
+
+Don't quote a refresh cadence without checking which branch applies: the
+upstream's own `expires_in` wins whenever present, and FastMCP's 1h
+`DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS` is only the fallback for an IdP that
+omits it. A GitHub App with "Expire user authorization tokens" enabled (the
+GitHub config that issues refresh tokens) sends its own `expires_in` — 8h at
+time of writing — so rotation is a few times a day. A classic OAuth App, or a
+GitHub App with expiration off, returns no refresh token and never rotates.
+
+`tests/test_oauth.py` pins each kwarg and drives `Retry.call_with_retry`
+with the real configured policy, proving it survives one transient failure
+and gives up after the budget. Read that as covering the *policy*, not the
+send/reconnect path — the calls use a hand-written coroutine, and nothing
+simulates a blip mid-rotation. That path stays unverified.
+
+Separately, and deliberately not fixed here: supplying `client_storage`
+makes FastMCP skip its `FernetEncryptionWrapper` (applied only when
+`client_storage is None`), so everything the proxy persists — including the
+live upstream access + refresh tokens — is **plaintext JSON in Redis**.
+FastMCP's own refresh tokens are the one exception: only their SHA-256 is
+stored, as a key, so those aren't recoverable. The upstream ones are, which
+makes read access to that Redis equivalent to holding the upstream
+credentials. Tracked as its own change.
+
 ---
 
 ## Deployment contracts
