@@ -24,6 +24,7 @@ def _clean_oauth_env(monkeypatch):
         "MCP_ALLOWED_GITHUB_LOGINS",
         "MCP_JWT_SIGNING_KEY",
         "MCP_REDIS_URL",
+        "MCP_REDIS_COLLECTION_PREFIX",
         "MCP_ALLOW_INSECURE_HTTP",
     ]:
         monkeypatch.delenv(var, raising=False)
@@ -114,10 +115,12 @@ def test_redis_store_prefixes_collections(monkeypatch):
     """
     from key_value.aio.wrappers.prefix_collections import PrefixCollectionsWrapper
 
+    from kalshi_mcp_server.oauth import DEFAULT_REDIS_COLLECTION_PREFIX
+
     storage = _redis_storage(monkeypatch)
     prefixed = storage.key_value
     assert isinstance(prefixed, PrefixCollectionsWrapper)
-    assert prefixed.prefix == "kalshi"
+    assert prefixed.prefix == DEFAULT_REDIS_COLLECTION_PREFIX
 
 
 def test_redis_store_requires_a_stable_signing_key(monkeypatch):
@@ -139,25 +142,24 @@ async def test_wrapper_stack_encrypts_and_isolates_end_to_end():
     that an unprefixed read (i.e. a sibling server) can't see the value.
 
     Wiring tests above assert the wrappers are present; this asserts they
-    actually do their job when composed in this order.
+    actually do their job when composed in this order. Uses the module's own
+    salt constant so changing the salt in oauth.py doesn't silently leave
+    this passing against a stale value.
     """
-    from cryptography.fernet import Fernet
-    from fastmcp.server.auth.jwt_issuer import derive_jwt_key
     from key_value.aio.stores.memory import MemoryStore
     from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
     from key_value.aio.wrappers.prefix_collections import PrefixCollectionsWrapper
 
-    from kalshi_mcp_server.oauth import REDIS_COLLECTION_PREFIX
+    from kalshi_mcp_server.oauth import (
+        DEFAULT_REDIS_COLLECTION_PREFIX,
+        STORAGE_ENCRYPTION_SALT,
+    )
 
     inner = MemoryStore()
     stack = FernetEncryptionWrapper(
-        key_value=PrefixCollectionsWrapper(key_value=inner, prefix=REDIS_COLLECTION_PREFIX),
-        fernet=Fernet(
-            key=derive_jwt_key(
-                high_entropy_material="k" * 40,
-                salt="kalshi-mcp-storage-encryption-key",
-            )
-        ),
+        key_value=PrefixCollectionsWrapper(key_value=inner, prefix=DEFAULT_REDIS_COLLECTION_PREFIX),
+        source_material="k" * 40,
+        salt=STORAGE_ENCRYPTION_SALT,
         raise_on_decryption_error=False,
     )
 
@@ -169,7 +171,7 @@ async def test_wrapper_stack_encrypts_and_isolates_end_to_end():
     assert await stack.get(key="tok1", collection="mcp-upstream-tokens") == secret
 
     at_rest = await inner.get(
-        key="tok1", collection=f"{REDIS_COLLECTION_PREFIX}__mcp-upstream-tokens"
+        key="tok1", collection=f"{DEFAULT_REDIS_COLLECTION_PREFIX}__mcp-upstream-tokens"
     )
     assert at_rest is not None, "prefixed collection should resolve"
     assert "SUPERSECRET" not in str(at_rest), "token must not be plaintext at rest"
@@ -178,17 +180,79 @@ async def test_wrapper_stack_encrypts_and_isolates_end_to_end():
     assert await inner.get(key="tok1", collection="mcp-upstream-tokens") is None
 
 
-def test_signing_key_derives_a_distinct_storage_key(monkeypatch):
-    """The storage key must not equal the JWT signing key itself."""
-    from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+async def test_undecryptable_entry_degrades_to_a_cache_miss():
+    """A key rotation must not hard-fail — FastMCP treats None as "unknown
+    client" and the client re-registers. Raising instead would wedge the
+    proxy for every stored entry until someone flushed Redis by hand.
+    """
+    from key_value.aio.stores.memory import MemoryStore
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    from kalshi_mcp_server.oauth import STORAGE_ENCRYPTION_SALT
+
+    inner = MemoryStore()
+    written = FernetEncryptionWrapper(
+        key_value=inner,
+        source_material="original-key",
+        salt=STORAGE_ENCRYPTION_SALT,
+        raise_on_decryption_error=False,
+    )
+    await written.put(key="k", value={"a": 1}, collection="c")
+
+    # Same store, different source material == a rotated key.
+    rotated = FernetEncryptionWrapper(
+        key_value=inner,
+        source_material="rotated-key",
+        salt=STORAGE_ENCRYPTION_SALT,
+        raise_on_decryption_error=False,
+    )
+    assert await rotated.get(key="k", collection="c") is None
+
+
+def test_collection_prefix_is_env_overridable(monkeypatch):
+    """Two instances of the same published image must be able to share a
+    Redis; a source-only constant would force a fork to do that."""
+    from kalshi_mcp_server.oauth import (
+        DEFAULT_REDIS_COLLECTION_PREFIX,
+        _collection_prefix,
+    )
+
+    monkeypatch.delenv("MCP_REDIS_COLLECTION_PREFIX", raising=False)
+    assert _collection_prefix() == DEFAULT_REDIS_COLLECTION_PREFIX
+
+    monkeypatch.setenv("MCP_REDIS_COLLECTION_PREFIX", "kalshi-demo")
+    assert _collection_prefix() == "kalshi-demo"
+
+    # Whitespace-only must not silently produce an empty namespace.
+    monkeypatch.setenv("MCP_REDIS_COLLECTION_PREFIX", "   ")
+    assert _collection_prefix() == DEFAULT_REDIS_COLLECTION_PREFIX
+
+
+def test_storage_key_is_stretched_not_a_bare_hash():
+    """The storage key derives via PBKDF2 (1.2M rounds), not a single hash.
+
+    A single-hash derivation would let anyone with Redis read access
+    brute-force a weak MCP_JWT_SIGNING_KEY offline at ~1 guess/hash.
+    """
+    import time
+
+    from key_value.aio.wrappers.encryption.fernet import (
+        KDF_ITERATIONS,
+        _generate_encryption_key,
+    )
+
+    from kalshi_mcp_server.oauth import STORAGE_ENCRYPTION_SALT
+
+    assert KDF_ITERATIONS >= 1_000_000
 
     material = "test-signing-key-not-a-real-secret"
-    storage_key = derive_jwt_key(
-        high_entropy_material=material, salt="kalshi-mcp-storage-encryption-key"
-    )
-    jwt_key = derive_jwt_key(high_entropy_material=material, salt="fastmcp-storage-encryption-key")
-    assert storage_key != jwt_key
-    assert storage_key != material.encode()
+    start = time.perf_counter()
+    key = _generate_encryption_key(source_material=material, salt=STORAGE_ENCRYPTION_SALT)
+    elapsed = time.perf_counter() - start
+
+    assert key != material.encode()
+    # A bare hash returns in microseconds; stretching cannot.
+    assert elapsed > 0.01, f"derivation too fast to be stretched ({elapsed:.4f}s)"
 
 
 def test_redis_store_sets_health_check_interval(monkeypatch):

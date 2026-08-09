@@ -32,9 +32,18 @@ from kalshi_mcp_server.safety import InMemoryLimitsStore, LimitsStore
 
 logger = logging.getLogger(__name__)
 
-# Single key holding the JSON override map. Namespaced so a shared Redis can
-# host this alongside the OAuth proxy's `kalshi-oauth-proxy` collection and
-# other apps without colliding.
+# Single key holding the JSON override map. The `kalshi-mcp:` prefix keeps it
+# clear of the OAuth proxy's collections (now `<prefix>__mcp-*`, see
+# `oauth.py`) and of other apps on a shared Redis.
+#
+# Note this key is NOT per-deployment: unlike the OAuth collections there is
+# no configurable namespace, so two kalshi deployments pointed at one Redis DB
+# share a single override record and a runtime clamp on either is what both
+# load at boot. Loading always re-clamps against the *current* env ceilings
+# (`safety.py`), so a stale value can only ever tighten, never loosen — but if
+# you run two deployments with different risk envelopes, give them separate
+# Redis databases. Changing this key would silently drop any active override
+# back to the env ceilings, i.e. loosen limits — don't do it casually.
 _REDIS_KEY = "kalshi-mcp:safety-limits"
 
 

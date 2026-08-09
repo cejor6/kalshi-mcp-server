@@ -252,9 +252,17 @@ The store is `FernetEncryptionWrapper(PrefixCollectionsWrapper(RedisStore))`:
 - **Encryption at rest.** FastMCP wraps storage in `FernetEncryptionWrapper`
   only when `client_storage is None`, so handing it a store silently
   persisted `UpstreamTokenSet` — the live upstream access + refresh tokens —
-  as plaintext JSON. We re-apply it, deriving the key from
-  `MCP_JWT_SIGNING_KEY` under our own salt. (FastMCP's own refresh tokens
-  were never the exposure: only their SHA-256 is stored, as a key.)
+  as plaintext JSON. We re-apply it via the wrapper's own
+  `source_material=`/`salt=` overload, which runs PBKDF2 at 1.2M iterations.
+  Use that overload, not `fernet=` with a hand-derived key: the stretching
+  is the point, since `MCP_JWT_SIGNING_KEY` is an operator-supplied string
+  and a single-hash derivation would let anyone with Redis read access
+  brute-force a weak one offline. It also keeps us off FastMCP's unexported
+  `jwt_issuer.derive_jwt_key`, which could move under our wide
+  `fastmcp>=2.0.0` floor. (FastMCP's own refresh tokens were never the
+  exposure: only their SHA-256 is stored, as a key.)
+  Encryption buys **confidentiality only** — no integrity, and collection
+  and key names stay plaintext.
 - **Collection isolation.** The store's `default_collection` is inert —
   FastMCP passes its own names (`mcp-oauth-proxy-clients`,
   `mcp-refresh-tokens`, …) to each adapter, and those are identical in every
