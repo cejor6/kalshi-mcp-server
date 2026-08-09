@@ -38,22 +38,36 @@ from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-# Redis connection-resilience tuning for the OAuth DCR client store. See
-# `_build_client_storage` for why these are load-bearing for connector
-# durability rather than cosmetic.
+# Redis connection-resilience tuning for the OAuth client store. See
+# `_build_client_storage` for what each one actually buys.
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 REDIS_CONNECT_TIMEOUT_SECONDS = 5
-REDIS_RETRIES = 3
+REDIS_SOCKET_TIMEOUT_SECONDS = 5
+# Deliberately 1, not 3. redis-py applies the retry policy at THREE nested
+# layers — `execute_command`, `connect`, and `check_health` — so the attempt
+# count multiplies to roughly (retries + 1) ** 2 TLS connects per command.
+# FastMCP issues ~8 sequential store ops per token exchange, so retries=3
+# turns a Redis outage into a multi-minute hang on an OAuth request (and
+# hammers a provider that bills per connection). `health_check_interval` is
+# what actually fixes the stale-socket case; the retry only covers a genuine
+# single-command blip, and 1 is enough for that.
+REDIS_RETRIES = 1
 
 
 def _build_client_storage() -> tuple[object | None, str]:
     """Return `(storage, description)` for the OAuth proxy's DCR client store.
 
-    With `MCP_REDIS_URL` set, builds a Redis-backed store keyed under a
-    Kalshi-specific collection name so a shared Redis can host multiple
-    MCP servers without colliding. Without the env var, falls back to
-    FastMCP's default in-container file store (ephemeral — every restart
-    forces clients to reconnect).
+    With `MCP_REDIS_URL` set, builds a Redis-backed store. Without the env
+    var, falls back to FastMCP's default in-container file store (ephemeral
+    — every restart forces clients to reconnect).
+
+    Note the `default_collection` below is effectively inert: FastMCP
+    constructs each `PydanticAdapter` with its *own* collection name
+    (`mcp-oauth-proxy-clients`, `mcp-refresh-tokens`, …) and the adapter
+    resolves `collection or self._default_collection` against that, never
+    consulting the store's default. So this does NOT namespace our keys —
+    two OAuth-proxy servers pointed at the same Redis DB would cross-read
+    each other's registrations. Give each deployment its own Redis DB.
 
     Uses `redis.asyncio.Redis.from_url` because `RedisStore(url=...)` in
     `py-key-value-aio` 0.4.4 ignores TLS on `rediss://` URLs. Upstash
@@ -62,26 +76,43 @@ def _build_client_storage() -> tuple[object | None, str]:
     `decode_responses=True` is required: `RedisStore._get_managed_entry`
     rejects non-`str` responses and `Redis.from_url` defaults to False.
 
-    **Connection resilience is load-bearing, not a nicety.** redis-py
-    defaults to `health_check_interval=0` and `Retry(NoBackoff(), 0)` —
-    i.e. no liveness check and *zero* retries. A managed Redis (Upstash)
-    drops idle TLS connections, so the next pooled use of a dead socket
-    raises `ConnectionError: Error UNKNOWN while writing to socket.
-    Connection lost.` from `send_packed_command`.
+    **`health_check_interval` is the load-bearing one.** Going through
+    `Redis.from_url` → `ConnectionPool.from_url` → `Connection.__init__`
+    with no `retry`/`retry_on_error` yields `Retry(NoBackoff(), 0)` and
+    `health_check_interval=0` — no liveness check and zero retries. (The
+    `retries=10` default on `Redis.__init__` never applies on this path;
+    verify with `pool.make_connection().retry.get_retries()` before
+    "simplifying" any of this away.) A managed Redis such as Upstash drops
+    idle TLS connections, so the next pooled use of a dead socket raises
+    `ConnectionError: Error UNKNOWN while writing to socket. Connection
+    lost.` from `send_packed_command`. Setting the interval makes redis-py
+    ping a connection that has been idle longer than it before handing it
+    out, which is what actually removes the error.
 
-    That matters far beyond log noise. claude.ai refreshes its access
-    token roughly hourly (FastMCP's default access-token TTL is 1h), and
-    each refresh rotates the refresh token with one-time-use enforcement:
-    the proxy deletes the *old* refresh JTI before persisting the new
-    refresh metadata. A connection blip inside that window leaves the
-    client holding a refresh token the server has no record of — a
-    permanently dead connector that only a manual reconnect fixes. For an
-    unattended cron/routine consumer that's a silent outage.
+    Why it's worth caring about: when GitHub issues a refresh token,
+    claude.ai refreshes roughly hourly (FastMCP's default access-token TTL
+    is 1h) and each refresh rotates the refresh token with one-time-use
+    enforcement — the proxy deletes the *old* refresh JTI before persisting
+    the new refresh metadata. A failure inside that sequence can leave the
+    client holding a refresh token the server has no record of: a dead
+    connector that only a manual reconnect fixes, which for an unattended
+    cron/routine consumer is a silent outage. (With a classic GitHub OAuth
+    App that returns no refresh token, the proxy takes the no-refresh
+    branch and never rotates at all.)
 
-    So: `health_check_interval` pings a connection idle longer than the
-    interval before reusing it (killing the stale-grab), `socket_keepalive`
-    keeps the OS from silently dropping idle sockets, and the retry policy
-    covers a genuine mid-flight blip during the rotation window.
+    Be precise about what the retry does and doesn't buy: it retries a
+    *single* Redis command on a fresh connection. It does NOT make the
+    delete-then-write rotation atomic — there is no transaction, so a
+    process death or an outage longer than the retry budget still strands
+    the connector. It lowers the odds of one command failing, nothing more.
+
+    `socket_timeout` is set explicitly rather than inherited: redis-py 8
+    defaults it to 5s, but the `redis>=5.0.0` floor permits versions that
+    default to `None`, where a blackholed connection blocks `read_response`
+    forever and `TimeoutError` never fires. `socket_keepalive` and
+    `socket_connect_timeout` likewise match redis-py 8's own defaults —
+    they're pinned so the guarantee doesn't drift across that floor, not
+    because they change behavior today.
     """
     url = os.environ.get("MCP_REDIS_URL", "").strip()
     if not url:
@@ -93,7 +124,13 @@ def _build_client_storage() -> tuple[object | None, str]:
         from key_value.aio.stores.redis import RedisStore
         from redis.asyncio import Redis
         from redis.asyncio.retry import Retry
-        from redis.backoff import ExponentialBackoff
+
+        # FullJitterBackoff, not ExponentialBackoff (unjittered — pooled
+        # connections would retry in lockstep) and not
+        # ExponentialWithJitterBackoff (absent on older releases the
+        # `redis>=5.0.0` floor allows; importing it here would surface as a
+        # misleading "extras aren't installed" RuntimeError below).
+        from redis.backoff import FullJitterBackoff
         from redis.exceptions import ConnectionError as RedisConnectionError
         from redis.exceptions import TimeoutError as RedisTimeoutError
     except ImportError as exc:  # pragma: no cover
@@ -109,7 +146,11 @@ def _build_client_storage() -> tuple[object | None, str]:
         health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
         socket_keepalive=True,
         socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
-        retry=Retry(ExponentialBackoff(), retries=REDIS_RETRIES),
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        retry=Retry(FullJitterBackoff(), retries=REDIS_RETRIES),
+        # A fresh list per call: redis-py stores this in `connection_kwargs`
+        # and `Connection.__init__` *appends* to it when `retry_on_timeout`
+        # is set, so a shared module-level list would grow per connection.
         retry_on_error=[RedisConnectionError, RedisTimeoutError],
     )
     return (

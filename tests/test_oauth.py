@@ -90,17 +90,91 @@ def test_redis_store_enables_socket_keepalive(monkeypatch):
 
 
 def test_redis_store_retries_on_connection_and_timeout_errors(monkeypatch):
-    """The retry is what protects the refresh-token rotation window."""
+    """Retry lowers the odds of a single command failing mid-rotation.
+
+    It does NOT make rotation atomic — see `_build_client_storage`. The
+    count is deliberately 1: redis-py applies the policy at three nested
+    layers, so it multiplies to ~(retries + 1) ** 2 connects per command.
+    """
     from redis.exceptions import ConnectionError as RedisConnectionError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 
     client = _redis_store_client(monkeypatch)
     retry = client.connection_pool.connection_kwargs["retry"]
     assert retry is not None
-    assert retry._retries == 3
+    # Public accessor — `retry._retries` is private and drifts across versions.
+    assert retry.get_retries() == 1
     supported = client.connection_pool.connection_kwargs["retry_on_error"]
     assert RedisConnectionError in supported
     assert RedisTimeoutError in supported
+
+
+def test_redis_store_backoff_is_jittered(monkeypatch):
+    """Unjittered backoff makes every pooled connection retry in lockstep."""
+    from redis.backoff import FullJitterBackoff
+
+    client = _redis_store_client(monkeypatch)
+    retry = client.connection_pool.connection_kwargs["retry"]
+    assert isinstance(retry._backoff, FullJitterBackoff)
+
+
+def test_redis_store_bounds_read_writes_with_socket_timeout(monkeypatch):
+    """Without this, an older redis-py defaults to None and hangs forever."""
+    client = _redis_store_client(monkeypatch)
+    kwargs = client.connection_pool.connection_kwargs
+    assert kwargs["socket_timeout"] == 5
+    assert kwargs["socket_connect_timeout"] == 5
+
+
+async def test_retry_policy_actually_retries_a_failing_command(monkeypatch):
+    """Behavioral, not wiring: prove the configured retry really fires.
+
+    The other tests assert the kwargs land on the client. This one drives
+    `Retry.call_with_retry` with the exact policy we construct and asserts a
+    transient ConnectionError is survived — the single-command blip the
+    docstring claims to cover.
+    """
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    client = _redis_store_client(monkeypatch)
+    retry = client.connection_pool.connection_kwargs["retry"]
+
+    attempts = 0
+
+    async def _flaky():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RedisConnectionError("Error UNKNOWN while writing to socket.")
+        return "ok"
+
+    async def _fail(_exc):
+        return None
+
+    assert await retry.call_with_retry(_flaky, _fail) == "ok"
+    assert attempts == 2  # failed once, retried once, succeeded
+
+
+async def test_retry_policy_gives_up_after_the_configured_budget(monkeypatch):
+    """A sustained outage must surface, not hang retrying indefinitely."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    client = _redis_store_client(monkeypatch)
+    retry = client.connection_pool.connection_kwargs["retry"]
+
+    attempts = 0
+
+    async def _always_fails():
+        nonlocal attempts
+        attempts += 1
+        raise RedisConnectionError("down")
+
+    async def _fail(_exc):
+        return None
+
+    with pytest.raises(RedisConnectionError):
+        await retry.call_with_retry(_always_fails, _fail)
+    assert attempts == 2  # initial attempt + REDIS_RETRIES(1)
 
 
 def test_redis_store_preserves_decode_responses(monkeypatch):
