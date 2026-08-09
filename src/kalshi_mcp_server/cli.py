@@ -246,7 +246,15 @@ def main(argv: list[str] | None = None) -> int:
         build_user_restriction_middleware,
     )
 
-    auth_provider, storage_desc = build_auth_provider()
+    # `build_auth_provider` raises ConfigError for a broken storage config
+    # (e.g. MCP_REDIS_URL without MCP_JWT_SIGNING_KEY). Catch it here so it
+    # prints the same clean startup-failure line as every other config
+    # problem instead of a raw traceback.
+    try:
+        auth_provider, storage_desc = build_auth_provider()
+    except KalshiMCPError as exc:
+        sys.stderr.write(f"\nStartup failed: {exc}\n\n")
+        return 2
     if auth_provider is not None:
         logger.info("OAuth: GitHub proxy enabled — DCR client storage: %s", storage_desc)
     if transport == "http":

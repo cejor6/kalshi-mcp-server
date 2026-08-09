@@ -342,8 +342,63 @@ Back in Render → service → **Environment** tab → add these:
 | `GITHUB_CLIENT_SECRET` | from step 5 |
 | `MCP_BASE_URL` | `https://kalshi-mcp-XXXX.onrender.com` (no trailing slash) |
 | `MCP_ALLOWED_GITHUB_LOGINS` | your GitHub username (comma-separated for multiple users) |
-| `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above |
+| `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above — **required if you set `MCP_REDIS_URL`** (the server refuses to start otherwise; it's also what the storage-encryption key is derived from) |
 | `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* — also persists runtime safety-limit overrides (see "Tuning safety limits" below) |
+| `MCP_REDIS_COLLECTION_PREFIX` | *(optional, default `kalshi`)* collection namespace. Set it only if another OAuth-proxy server shares this Redis — see below |
+
+**Sharing one Redis across several MCP servers works** — you don't need a
+paid instance per server. Stored *values* are encrypted at rest, and each
+server namespaces its collections via `MCP_REDIS_COLLECTION_PREFIX`
+(default `kalshi`). Give every server sharing the DB a distinct prefix:
+FastMCP's own collection names are identical across servers, so two
+sharing a prefix resolve each other's client registrations and tokens.
+That includes two deployments of *this* image (say a demo and a prod
+service) — they both default to `kalshi`, so set the var on at least one.
+
+Know the limits of that boundary before you rely on it:
+
+- The prefix prevents *collisions*, not *access*. Anything holding the
+  Redis URL can read and overwrite every prefix. It separates
+  cooperating deployments; it is not a security boundary between
+  untrusted ones.
+- Encryption gives confidentiality, not integrity — there's no
+  authentication tying a stored blob to this server, so a party who can
+  write to the DB can plant entries. Treat write access as trusted.
+- Collection and key names stay plaintext (client IDs, JTIs,
+  refresh-token hashes). Only values are encrypted.
+- **Runtime safety-limit overrides are not namespaced** — `safety_store`
+  uses a fixed key, so two kalshi deployments on one DB share one
+  override record and a clamp applied on either is what both load at
+  boot. Give them separate Redis databases if that matters.
+
+### Upgrading an existing deployment to encrypted storage
+
+If your Redis predates encrypted storage, the old entries are still there
+in **plaintext**, under the un-prefixed collection names, and nothing in
+the new code overwrites them. Upstream-token blobs do carry a TTL (up to
+GitHub's refresh lifetime, so months), but DCR client records are written
+with no TTL at all and never expire. Encrypting new writes does not
+un-expose old ones.
+
+1. Deploy this version.
+2. Purge the old keys: delete the **un-prefixed `mcp-*` keys**. That glob
+   matches exactly the stale OAuth entries — not the new
+   `<prefix>__mcp-*` ones, and not `kalshi-mcp:safety-limits`.
+
+   **Prefer that over `FLUSHDB`.** `FLUSHDB` also deletes
+   `kalshi-mcp:safety-limits`, so any runtime safety clamp you've applied
+   reverts to the (wider) env ceilings on the next boot — a silent
+   loosening of your risk envelope. If you do flush, re-apply the clamp
+   with `kalshi_set_safety_limits` afterwards.
+3. Reconnect the connector on claude.ai once (see below).
+4. **If that Redis was ever reachable by anyone else** — a shared
+   instance, a leaked URL, a public snapshot — treat the upstream GitHub
+   tokens it held as compromised: revoke the OAuth grant and rotate
+   `GITHUB_CLIENT_SECRET`.
+
+Expect **one reconnect** regardless: the new keyspace plus encryption
+makes existing state unreadable. That degrades to a cache miss, so
+clients re-register cleanly — you'll just see a single reconnect prompt.
 
 **Delete** the `MCP_ALLOW_INSECURE_HTTP` variable — it's no longer
 needed and the server's fail-closed check will refuse to start with it
@@ -354,7 +409,7 @@ next to "Save only"). Render rebuilds + redeploys. Watch the logs for:
 
 ```
 INFO:kalshi_mcp_server:Starting kalshi-mcp-server X.Y.Z (env=demo, trading_enabled=False)
-INFO:kalshi_mcp_server:OAuth: GitHub proxy enabled — DCR client storage: redis (persistent)
+INFO:kalshi_mcp_server:OAuth: GitHub proxy enabled — DCR client storage: redis (persistent, encrypted, prefixed)
 INFO:kalshi_mcp_server:OAuth: tool calls restricted to GitHub logins in MCP_ALLOWED_GITHUB_LOGINS
 INFO:kalshi_mcp_server:Transport: http
 INFO:kalshi_mcp_server:HTTP bind: 0.0.0.0:10000
@@ -665,10 +720,21 @@ personal use the Phase A workaround is easier.
 
 ### Rotating the JWT signing key
 
-Less important than the others — only affects sessions in flight at
-the time of rotation. Generate a new key, update `MCP_JWT_SIGNING_KEY`
-in Render, save + redeploy. Connected claude.ai clients will see a
-single "reconnect" prompt then be back.
+Generate a new key, update `MCP_JWT_SIGNING_KEY` in Render, save +
+redeploy. Connected claude.ai clients see a single "reconnect" prompt
+then are back.
+
+It reaches further than in-flight sessions, though: `MCP_JWT_SIGNING_KEY`
+is also the material the storage-encryption key derives from, so rotating
+it makes **every** persisted DCR registration and upstream-token blob
+undecryptable. Those degrade to cache misses (hence the clean reconnect),
+but the DCR records carry no TTL, so the orphaned ciphertext sits in Redis
+forever. Purge the old `<prefix>__mcp-*` keys after rotating — same
+caveat as the upgrade section: prefer the targeted delete over `FLUSHDB`,
+which would also drop your runtime safety-limit overrides.
+
+Changing `MCP_REDIS_COLLECTION_PREFIX` orphans the same records for the
+same reason — it's a keyspace move, so treat it like a rotation.
 
 ### Tracking what version is deployed
 

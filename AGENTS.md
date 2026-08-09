@@ -184,10 +184,16 @@ safety controls reduce blast radius but don't eliminate it.
 - `MCP_ALLOWED_GITHUB_LOGINS` — required for HTTP transport (defense in
   depth — the proxy lets anyone authenticate; the middleware rejects
   tool calls from logins outside this list)
-- `MCP_JWT_SIGNING_KEY` — stable key for proxy-issued JWTs (optional;
-  generated per-process if unset, invalidates tokens on restart)
+- `MCP_JWT_SIGNING_KEY` — stable key for proxy-issued JWTs (generated
+  per-process if unset, invalidating tokens on restart; **required** when
+  `MCP_REDIS_URL` is set, and also the material the storage-encryption key
+  is derived from)
 - `MCP_REDIS_URL` — persistent DCR client storage (optional; in-memory
   if unset, requires reconnect after each redeploy)
+- `MCP_REDIS_COLLECTION_PREFIX` — collection namespace for this
+  deployment (default `kalshi`). Give every server sharing a Redis DB a
+  distinct value; changing it is a keyspace move, so treat it like a key
+  rotation
 
 Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
@@ -243,14 +249,39 @@ and gives up after the budget. Read that as covering the *policy*, not the
 send/reconnect path — the calls use a hand-written coroutine, and nothing
 simulates a blip mid-rotation. That path stays unverified.
 
-Separately, and deliberately not fixed here: supplying `client_storage`
-makes FastMCP skip its `FernetEncryptionWrapper` (applied only when
-`client_storage is None`), so everything the proxy persists — including the
-live upstream access + refresh tokens — is **plaintext JSON in Redis**.
-FastMCP's own refresh tokens are the one exception: only their SHA-256 is
-stored, as a key, so those aren't recoverable. The upstream ones are, which
-makes read access to that Redis equivalent to holding the upstream
-credentials. Tracked as its own change.
+**Supplying `client_storage` opts out of two things FastMCP does for you.
+Both are re-applied by hand in `_build_client_storage` — don't unwrap them.**
+The store is `FernetEncryptionWrapper(PrefixCollectionsWrapper(RedisStore))`:
+
+- **Encryption at rest.** FastMCP wraps storage in `FernetEncryptionWrapper`
+  only when `client_storage is None`, so handing it a store silently
+  persisted `UpstreamTokenSet` — the live upstream access + refresh tokens —
+  as plaintext JSON. We re-apply it via the wrapper's own
+  `source_material=`/`salt=` overload, which runs PBKDF2 at 1.2M iterations.
+  Use that overload, not `fernet=` with a hand-derived key: the stretching
+  is the point, since `MCP_JWT_SIGNING_KEY` is an operator-supplied string
+  and a single-hash derivation would let anyone with Redis read access
+  brute-force a weak one offline. It also keeps us off FastMCP's unexported
+  `jwt_issuer.derive_jwt_key`, which could move under our wide
+  `fastmcp>=2.0.0` floor. (FastMCP's own refresh tokens were never the
+  exposure: only their SHA-256 is stored, as a key.)
+  Encryption buys **confidentiality only** — no integrity, and collection
+  and key names stay plaintext.
+- **Collection isolation.** The store's `default_collection` is inert —
+  FastMCP passes its own names (`mcp-oauth-proxy-clients`,
+  `mcp-refresh-tokens`, …) to each adapter, and those are identical in every
+  FastMCP OAuth-proxy server. Without `PrefixCollectionsWrapper`, two
+  servers sharing a Redis DB land in one keyspace and resolve each other's
+  registrations and JTIs. The prefix is what makes one shared Redis safe —
+  give each deployment a distinct `MCP_REDIS_COLLECTION_PREFIX`.
+
+Consequence worth knowing: `MCP_REDIS_URL` now **requires**
+`MCP_JWT_SIGNING_KEY`, and `_build_client_storage` raises `ConfigError`
+without it. That combination was already broken — an unset signing key is
+generated per process, so every restart invalidated all issued tokens and
+the persistent store bought nothing — and it leaves no stable secret to
+derive a storage key from. Failing closed beats encrypting with a key that
+dies with the process.
 
 ---
 
