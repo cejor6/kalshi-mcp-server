@@ -342,8 +342,16 @@ Back in Render → service → **Environment** tab → add these:
 | `GITHUB_CLIENT_SECRET` | from step 5 |
 | `MCP_BASE_URL` | `https://kalshi-mcp-XXXX.onrender.com` (no trailing slash) |
 | `MCP_ALLOWED_GITHUB_LOGINS` | your GitHub username (comma-separated for multiple users) |
-| `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above |
+| `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above — **required if you set `MCP_REDIS_URL`** (the server refuses to start otherwise; it's also what the storage-encryption key is derived from) |
 | `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* — also persists runtime safety-limit overrides (see "Tuning safety limits" below) |
+
+**Sharing one Redis across several MCP servers is fine** — you don't need
+a paid instance per server. Values are encrypted at rest and each server
+namespaces its own collections via `REDIS_COLLECTION_PREFIX` in
+`oauth.py`. If you run a second FastMCP OAuth-proxy server against the
+same Redis, give it a *different* prefix: FastMCP's own collection names
+are identical across servers, so two servers sharing a prefix would
+resolve each other's client registrations and tokens.
 
 **Delete** the `MCP_ALLOW_INSECURE_HTTP` variable — it's no longer
 needed and the server's fail-closed check will refuse to start with it

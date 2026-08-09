@@ -65,17 +65,130 @@ def test_build_auth_provider_strips_trailing_slash_from_base_url(monkeypatch):
 # and catastrophic in prod, so pin them explicitly.
 
 
-def _redis_store_client(monkeypatch):
-    """Build the Redis-backed store and return the underlying redis client."""
+def _redis_storage(monkeypatch):
+    """Build the Redis-backed store (wrappers included) and return it."""
     # No credentials in the URL — nothing here connects, and embedded
     # basic-auth trips the detect-secrets hook.
     monkeypatch.setenv("MCP_REDIS_URL", "rediss://example.invalid:6379")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "test-signing-key-not-a-real-secret")
     from kalshi_mcp_server.oauth import _build_client_storage
 
     storage, desc = _build_client_storage()
     assert storage is not None
     assert "redis" in desc
-    return storage._client
+    return storage
+
+
+def _redis_store_client(monkeypatch):
+    """Return the redis client underneath the wrapper stack."""
+    from key_value.aio.stores.redis import RedisStore
+
+    storage = _redis_storage(monkeypatch)
+    # Unwrap: FernetEncryptionWrapper -> PrefixCollectionsWrapper -> RedisStore
+    inner = storage
+    while not isinstance(inner, RedisStore):
+        inner = inner.key_value
+    return inner._client
+
+
+# ── Redis client store: isolation + encryption at rest ─────────────────────
+
+
+def test_redis_store_is_encrypted_at_rest(monkeypatch):
+    """Supplying client_storage opts out of FastMCP's own encryption.
+
+    Without re-applying it, UpstreamTokenSet — the live upstream access and
+    refresh tokens — sits in Redis as plaintext JSON.
+    """
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    storage = _redis_storage(monkeypatch)
+    assert isinstance(storage, FernetEncryptionWrapper)
+
+
+def test_redis_store_prefixes_collections(monkeypatch):
+    """FastMCP's collection names are identical across servers.
+
+    Without a prefix, two OAuth-proxy servers sharing a Redis DB resolve
+    each other's client registrations and JTIs.
+    """
+    from key_value.aio.wrappers.prefix_collections import PrefixCollectionsWrapper
+
+    storage = _redis_storage(monkeypatch)
+    prefixed = storage.key_value
+    assert isinstance(prefixed, PrefixCollectionsWrapper)
+    assert prefixed.prefix == "kalshi"
+
+
+def test_redis_store_requires_a_stable_signing_key(monkeypatch):
+    """Redis + no signing key is already broken; fail closed rather than
+    silently encrypt with a key that dies with the process."""
+    from kalshi_mcp_server.errors import ConfigError
+    from kalshi_mcp_server.oauth import _build_client_storage
+
+    monkeypatch.setenv("MCP_REDIS_URL", "rediss://example.invalid:6379")
+    monkeypatch.delenv("MCP_JWT_SIGNING_KEY", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        _build_client_storage()
+    assert "MCP_JWT_SIGNING_KEY" in str(exc.value)
+
+
+async def test_wrapper_stack_encrypts_and_isolates_end_to_end():
+    """Behavioral: build the same stack over MemoryStore and prove all four
+    properties at once — round-trip, prefixing, no plaintext at rest, and
+    that an unprefixed read (i.e. a sibling server) can't see the value.
+
+    Wiring tests above assert the wrappers are present; this asserts they
+    actually do their job when composed in this order.
+    """
+    from cryptography.fernet import Fernet
+    from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+    from key_value.aio.stores.memory import MemoryStore
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+    from key_value.aio.wrappers.prefix_collections import PrefixCollectionsWrapper
+
+    from kalshi_mcp_server.oauth import REDIS_COLLECTION_PREFIX
+
+    inner = MemoryStore()
+    stack = FernetEncryptionWrapper(
+        key_value=PrefixCollectionsWrapper(key_value=inner, prefix=REDIS_COLLECTION_PREFIX),
+        fernet=Fernet(
+            key=derive_jwt_key(
+                high_entropy_material="k" * 40,
+                salt="kalshi-mcp-storage-encryption-key",
+            )
+        ),
+        raise_on_decryption_error=False,
+    )
+
+    # `mcp-upstream-tokens` is the collection holding UpstreamTokenSet —
+    # the live upstream access + refresh tokens, i.e. the actual exposure.
+    secret = {"access_token": "ghu_SUPERSECRET", "refresh_token": "ghr_ALSOSECRET"}
+    await stack.put(key="tok1", value=secret, collection="mcp-upstream-tokens")
+
+    assert await stack.get(key="tok1", collection="mcp-upstream-tokens") == secret
+
+    at_rest = await inner.get(
+        key="tok1", collection=f"{REDIS_COLLECTION_PREFIX}__mcp-upstream-tokens"
+    )
+    assert at_rest is not None, "prefixed collection should resolve"
+    assert "SUPERSECRET" not in str(at_rest), "token must not be plaintext at rest"
+
+    # A sibling server on the same Redis, without our prefix, sees nothing.
+    assert await inner.get(key="tok1", collection="mcp-upstream-tokens") is None
+
+
+def test_signing_key_derives_a_distinct_storage_key(monkeypatch):
+    """The storage key must not equal the JWT signing key itself."""
+    from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+
+    material = "test-signing-key-not-a-real-secret"
+    storage_key = derive_jwt_key(
+        high_entropy_material=material, salt="kalshi-mcp-storage-encryption-key"
+    )
+    jwt_key = derive_jwt_key(high_entropy_material=material, salt="fastmcp-storage-encryption-key")
+    assert storage_key != jwt_key
+    assert storage_key != material.encode()
 
 
 def test_redis_store_sets_health_check_interval(monkeypatch):

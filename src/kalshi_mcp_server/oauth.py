@@ -38,6 +38,8 @@ from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
+from kalshi_mcp_server.errors import ConfigError
+
 # Redis connection-resilience tuning for the OAuth client store. See
 # `_build_client_storage` for what each one actually buys.
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
@@ -59,6 +61,10 @@ REDIS_SOCKET_TIMEOUT_SECONDS = 2
 # what actually fixes the stale-socket case; the retry only covers a genuine
 # single-command blip, and 1 is enough for that.
 REDIS_RETRIES = 1
+# Namespaces this server's collections so a single Redis instance can host
+# several OAuth-proxy servers. Must differ per deployment sharing a DB —
+# see `_build_client_storage`.
+REDIS_COLLECTION_PREFIX = "kalshi"
 
 
 def _build_client_storage() -> tuple[object | None, str]:
@@ -68,24 +74,25 @@ def _build_client_storage() -> tuple[object | None, str]:
     var, falls back to FastMCP's default in-container file store (ephemeral
     — every restart forces clients to reconnect).
 
-    Note the `default_collection` below is effectively inert: FastMCP
-    constructs each `PydanticAdapter` with its *own* collection name
-    (`mcp-oauth-proxy-clients`, `mcp-refresh-tokens`, …) and the adapter
-    resolves `collection or self._default_collection` against that, never
-    consulting the store's default. So this does NOT namespace our keys —
-    two OAuth-proxy servers pointed at the same Redis DB would cross-read
-    each other's registrations. Give each deployment its own Redis DB.
+    The returned store is `RedisStore` wrapped twice, and both wrappers
+    exist because supplying `client_storage` at all opts out of what
+    FastMCP would otherwise have done for you:
 
-    And know what you're protecting: supplying `client_storage` at all
-    means FastMCP skips its `FernetEncryptionWrapper`, which it applies
-    only when `client_storage is None` (`oauth_proxy/proxy.py`). Everything
-    the proxy persists here — including `UpstreamTokenSet`, the live
-    upstream access + refresh tokens — is therefore **plaintext JSON in
-    Redis**. (FastMCP's *own* refresh tokens are the exception: only their
-    SHA-256 is stored, as a key, so those aren't recoverable from Redis.
-    The upstream ones are.) The separate-DB advice above is key hygiene, not the security
-    boundary; treat read access to this Redis as equivalent to holding the
-    upstream credentials. Encrypting at rest is tracked separately.
+    1. `PrefixCollectionsWrapper` — the store's own `default_collection` is
+       inert. FastMCP constructs each `PydanticAdapter` with its *own*
+       collection name (`mcp-oauth-proxy-clients`, `mcp-refresh-tokens`, …)
+       and the adapter resolves `collection or self._default_collection`
+       against that, never consulting the store's. Those names are
+       identical across every FastMCP OAuth-proxy server, so without a
+       prefix two of them sharing a Redis DB land in one keyspace and can
+       resolve each other's registrations and JTIs. The prefix is what
+       makes a single shared Redis instance safe.
+    2. `FernetEncryptionWrapper` — FastMCP applies its own only when
+       `client_storage is None`, so a supplied store silently persisted
+       `UpstreamTokenSet` (the live upstream access + refresh tokens) as
+       plaintext JSON. We re-apply it, keyed off `MCP_JWT_SIGNING_KEY`.
+       (FastMCP's *own* refresh tokens were never the exposure — only
+       their SHA-256 is stored, as a key. The upstream ones were.)
 
     Uses `redis.asyncio.Redis.from_url` because `RedisStore(url=...)` in
     `py-key-value-aio` 0.4.4 ignores TLS on `rediss://` URLs. Upstash
@@ -147,7 +154,13 @@ def _build_client_storage() -> tuple[object | None, str]:
     # Imports are inside the function so the base install doesn't need
     # redis + py-key-value-aio. Those are part of the [oauth] extras.
     try:
+        from cryptography.fernet import Fernet
+        from fastmcp.server.auth.jwt_issuer import derive_jwt_key
         from key_value.aio.stores.redis import RedisStore
+        from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+        from key_value.aio.wrappers.prefix_collections import (
+            PrefixCollectionsWrapper,
+        )
         from redis.asyncio import Redis
         from redis.asyncio.retry import Retry
 
@@ -182,9 +195,52 @@ def _build_client_storage() -> tuple[object | None, str]:
         # If you ever set it, copy the list per connection.
         retry_on_error=[RedisConnectionError, RedisTimeoutError],
     )
+    signing_key = os.environ.get("MCP_JWT_SIGNING_KEY", "").strip()
+    if not signing_key:
+        raise ConfigError(
+            "MCP_REDIS_URL is set but MCP_JWT_SIGNING_KEY is not. That "
+            "combination is already broken before encryption enters the "
+            "picture: without a stable signing key FastMCP generates one per "
+            "process, so every restart invalidates all issued tokens and the "
+            "persistent store buys you nothing. It also leaves no stable "
+            "secret to derive a storage-encryption key from. Set "
+            'MCP_JWT_SIGNING_KEY (e.g. `python -c "import secrets; '
+            'print(secrets.token_urlsafe(64))"`) or unset MCP_REDIS_URL.'
+        )
+
+    # Encrypt at rest. FastMCP applies its own FernetEncryptionWrapper ONLY
+    # when `client_storage is None` (oauth_proxy/proxy.py), so supplying a
+    # store silently opts out of it — leaving the upstream access + refresh
+    # tokens as plaintext JSON in Redis. Re-apply it ourselves, deriving the
+    # key from MCP_JWT_SIGNING_KEY exactly as FastMCP does, but under our own
+    # salt so the two keys are independent.
+    #
+    # `raise_on_decryption_error=False` makes a key rotation degrade to a
+    # cache miss (clients re-register) instead of a hard failure — matching
+    # both FastMCP's own behavior and DEPLOY.md's documented rotation story
+    # ("clients see a single reconnect prompt then are back").
+    fernet = Fernet(
+        key=derive_jwt_key(
+            high_entropy_material=signing_key,
+            salt="kalshi-mcp-storage-encryption-key",
+        )
+    )
+
+    # Namespace the collections. The store's own `default_collection` is
+    # inert (see above), so without this every OAuth-proxy server sharing a
+    # Redis DB lands in the same keyspace and can resolve the others'
+    # client registrations and JTIs. The prefix is what actually isolates
+    # them, which is what makes one shared Redis instance safe.
     return (
-        RedisStore(client=client, default_collection="kalshi-oauth-proxy"),
-        "redis (persistent)",
+        FernetEncryptionWrapper(
+            key_value=PrefixCollectionsWrapper(
+                key_value=RedisStore(client=client),
+                prefix=REDIS_COLLECTION_PREFIX,
+            ),
+            fernet=fernet,
+            raise_on_decryption_error=False,
+        ),
+        "redis (persistent, encrypted, prefixed)",
     )
 
 
