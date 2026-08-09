@@ -105,6 +105,10 @@ def test_redis_store_is_encrypted_at_rest(monkeypatch):
 
     storage = _redis_storage(monkeypatch)
     assert isinstance(storage, FernetEncryptionWrapper)
+    # isinstance alone passes for the stock class too, so reverting the call
+    # site to it would leave this green. Pin the strict behavior instead:
+    # an unencrypted value must read as absent.
+    assert storage._decrypt_value({"not": "encrypted"}) is None
 
 
 def test_redis_store_prefixes_collections(monkeypatch):

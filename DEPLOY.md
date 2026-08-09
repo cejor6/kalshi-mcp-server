@@ -362,10 +362,13 @@ Know the limits of that boundary before you rely on it:
   cooperating deployments; it is not a security boundary between
   untrusted ones.
 - Planted entries are rejected, but write access is still damaging.
-  The server refuses any value that wasn't encrypted by it, so someone
-  with Redis write access can't forge an accepted record (e.g. a client
-  registration with their own redirect URI) without the key. They can
-  still delete or overwrite entries, which costs you a reconnect.
+  The server refuses any value not encrypted under **its own**
+  `MCP_JWT_SIGNING_KEY` and salt, so someone with Redis write access
+  can't forge an accepted record (e.g. an authorization code or JTI
+  mapping) without that key. Two caveats: a co-deployed server sharing
+  the same signing key *could* produce entries this one accepts — which
+  is another reason to give each its own prefix — and deleting or
+  overwriting entries is still possible, costing you a reconnect.
 - Collection and key names stay plaintext (client IDs, JTIs,
   refresh-token hashes). Only values are encrypted.
 - **Runtime safety-limit overrides are not namespaced** — `safety_store`

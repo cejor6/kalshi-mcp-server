@@ -31,6 +31,7 @@ here — this module is policy-free and just builds what the env says.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -91,6 +92,7 @@ MIN_SIGNING_KEY_LENGTH = 32
 _ENCRYPTED_DATA_MARKER = "__encrypted_data__"
 
 
+@functools.cache
 def _strict_encryption_wrapper_class() -> type:
     """Return a `FernetEncryptionWrapper` that refuses unencrypted values.
 
@@ -107,23 +109,41 @@ def _strict_encryption_wrapper_class() -> type:
     (`get` / `get_many` / `ttl` / `ttl_many`) funnel through `_decrypt_value`,
     so overriding it covers everything.
 
+    The DCR-client store is the obvious example but not the sharpest one —
+    DCR is open anyway, and `get_client` re-imposes
+    `allowed_redirect_uri_patterns` from config on read. The authorization-code,
+    JTI-mapping and transaction stores are where a forged entry buys more.
+
     Side benefit that matters during the upgrade: pre-existing *plaintext*
     entries — the ones written before encryption was applied — become misses
     too, so they can't be used even before they're purged.
 
+    Precisely: this rejects anything not encrypted under *this server's*
+    signing key and salt. A sibling deployment sharing both could still
+    produce entries we accept — which is exactly why co-deployed servers get
+    distinct collection prefixes.
+
     Built by a factory rather than declared at module scope because the base
-    class lives behind the lazily-imported `[oauth]` extras.
+    class lives behind the lazily-imported `[oauth]` extras. Cached so the
+    class has a stable identity across calls.
     """
     from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
     class StrictFernetEncryptionWrapper(FernetEncryptionWrapper):  # type: ignore[misc]
+        # Instance-level latch: a store full of legacy plaintext would
+        # otherwise log once per read, unbounded and unactionable.
+        _warned_unencrypted = False
+
         def _decrypt_value(self, value):  # type: ignore[no-untyped-def]
             if value is not None and _ENCRYPTED_DATA_MARKER not in value:
-                logger.warning(
-                    "Discarding an unencrypted entry from the OAuth store. "
-                    "Either it predates encryption (purge it — see DEPLOY.md) "
-                    "or something else is writing to this Redis."
-                )
+                if not self._warned_unencrypted:
+                    self._warned_unencrypted = True
+                    logger.warning(
+                        "Discarding unencrypted entries from the OAuth store "
+                        "(logged once). Either they predate encryption — purge "
+                        "them, see DEPLOY.md — or something else is writing to "
+                        "this Redis."
+                    )
                 return None
             return super()._decrypt_value(value)
 
