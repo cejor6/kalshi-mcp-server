@@ -323,11 +323,17 @@ def register(server: FastMCP) -> None:
         keeps the read bucket for the next sweep, and the shallow default
         depth keeps 25 books inside a normal tool-result budget.
 
-        Errors are isolated per ticker. An unknown or event-level ticker yields
-        an `error` entry for THAT ticker only — the batch still returns every
-        book it could resolve. (A structurally invalid ticker, i.e. empty or
-        blank, is different: it fails the whole call up front, because it means
-        the argument itself is malformed rather than one entry being wrong.)
+        Failures are isolated, never fatal. If the batch request itself is
+        rejected (one malformed ticker can 400 the whole thing), this falls
+        back to per-ticker fetches and each bad ticker becomes an `error` entry
+        while the good ones still return. Note the live nuance: Kalshi's batch
+        endpoint returns an EMPTY book (not an error, not an omission) for an
+        unknown or event-level ticker, so those come back as an empty
+        `orderbook_fp` rather than an `error` entry — a caller can't distinguish
+        "dead market" from "bad ticker" from the batch result alone. (A
+        structurally invalid ticker — empty or blank string — is different: it
+        fails the whole call up front, because the argument itself is
+        malformed.)
 
         Args:
             tickers: 1-25 MARKET tickers (with outcome suffixes, e.g.
@@ -336,8 +342,8 @@ def register(server: FastMCP) -> None:
                 collapsed, so 25 entries with repeats fetch fewer than 25
                 books; that's fine, just don't pad the list past 25 expecting
                 de-duping to rescue it.) The cap protects your context, not
-                Kalshi — its endpoint allows 100. An EVENT ticker has no single
-                book and comes back as an error entry. An empty or
+                Kalshi — its endpoint allows 100. An EVENT ticker (no single
+                book) comes back as an EMPTY book, not an error. An empty or
                 blank-string entry rejects the whole call.
             depth: Price levels to keep PER SIDE, 1-100. Default 5 — enough
                 for top-of-book plus a few levels of context, which is what a
@@ -667,6 +673,16 @@ def register(server: FastMCP) -> None:
         Returns `forecast_history`: per period, an `end_period_ts` plus
         `percentile_points` giving each requested percentile's raw, numeric,
         and formatted forecast value.
+
+        CAVEAT — not all events expose this. As of this writing, plausible,
+        doc-valid requests (weather and index events alike) come back `400 bad
+        request` from Kalshi, which suggests forecast-percentile data is
+        published for only some event types / windows. This tool sends the
+        exact request the API reference specifies (percentiles as a repeated
+        `percentiles=` param, timestamps in seconds); if you get the 400-with-
+        guidance error below, it is Kalshi refusing the request, not a
+        malformed call on our side — try a different event or check with Kalshi
+        which series carry percentile forecasts.
         """
         event_ticker = _validate_ticker(event_ticker, name="event_ticker")
         series_ticker = _validate_ticker(series_ticker, name="series_ticker")
@@ -695,10 +711,33 @@ def register(server: FastMCP) -> None:
             "end_ts": end_ts,
             "period_interval": period_interval,
         }
-        return await client.get(
-            f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
-            params=params,
-        )
+        try:
+            return await client.get(
+                f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
+                params=params,
+            )
+        except KalshiAPIError as exc:
+            # Kalshi 400s here even on doc-valid requests (see the CAVEAT in the
+            # docstring). Its own error body is unhelpful ("bad request"), so
+            # turn the opaque 400 into an actionable message naming the likely
+            # cause rather than letting an agent loop on it — the same policy as
+            # the candlestick guards. Only reshape the 400; re-raise anything
+            # else untouched.
+            if exc.status == 400:
+                raise KalshiAPIError(
+                    status=400,
+                    message=(
+                        f"Kalshi returned 400 for forecast history on "
+                        f"{event_ticker!r} (series {series_ticker!r}). The request shape "
+                        "is valid per Kalshi's API reference, so this most likely means "
+                        "this event/series does not publish percentile-forecast data, or "
+                        "not for this window. Not all events do. Try a different event, or "
+                        "confirm with Kalshi which series carry forecasts. "
+                        f"Kalshi said: {exc.message!r}."
+                    ),
+                    body=exc.body,
+                ) from exc
+            raise
 
     @server.tool
     async def kalshi_get_market_trades(

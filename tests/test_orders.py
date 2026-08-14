@@ -16,7 +16,7 @@ from fastmcp import FastMCP
 from kalshi_mcp_server.auth import KalshiSigner
 from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
-from kalshi_mcp_server.errors import SafetyError, TradingDisabledError
+from kalshi_mcp_server.errors import KalshiAPIError, SafetyError, TradingDisabledError
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import SafetyController
 from kalshi_mcp_server.tools import orders
@@ -206,3 +206,61 @@ async def test_cancel_works_even_when_trading_disabled(rsa_private_key):
     assert response["order"]["status"] == "canceled"
     assert received_method["method"] == "DELETE"
     assert received_method["path"] == "/trade-api/v2/portfolio/orders/ord_a"
+
+
+# ── order_id path-segment validation (security hardening) ───────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["kalshi_cancel_order", "kalshi_get_order"])
+async def test_order_id_with_query_injection_is_rejected_before_the_wire(
+    rsa_private_key, tool_name
+):
+    """`order_id` is interpolated into the request path, and auth.py strips the
+    query BEFORE signing — so `order_id="abc?foo=bar"` would produce a
+    signature-VALID request carrying caller-chosen query params. That must be
+    rejected locally, before any wire call."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    server = _make_server(rsa_private_key, handler, trading_enabled=True)
+    fn = await _get_tool_fn(server, tool_name)
+
+    for bad in ("abc?foo=bar", "../balance", "ord/../../x", "ord a", "."):
+        with pytest.raises(KalshiAPIError) as exc:
+            await fn(order_id=bad)
+        assert "order_id" in exc.value.message
+    assert calls == []  # nothing reached Kalshi
+
+
+@pytest.mark.asyncio
+async def test_decrease_order_validates_order_id_before_the_wire(rsa_private_key):
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    server = _make_server(rsa_private_key, handler, trading_enabled=True)
+    fn = await _get_tool_fn(server, "kalshi_decrease_order")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(order_id="abc?foo=bar", reduce_by=1)
+    assert "order_id" in exc.value.message
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_order_id_accepts_a_real_uuid(rsa_private_key):
+    """The guard must not reject a genuine Kalshi order id (a UUID)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"order": {"id": "ok"}})
+
+    server = _make_server(rsa_private_key, handler, trading_enabled=True)
+    fn = await _get_tool_fn(server, "kalshi_get_order")
+    out = await fn(order_id="a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d")
+    assert out["order"]["id"] == "ok"

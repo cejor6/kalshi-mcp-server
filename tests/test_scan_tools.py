@@ -452,3 +452,161 @@ async def test_get_orderbooks_rejects_empty_and_blank_tickers(rsa_private_key):
     with pytest.raises(KalshiAPIError):
         await fn(tickers=["KX-A", "   "])
     assert calls == []
+
+
+# ── kalshi_get_series_list (context-blowup hardening) ──────────────────────
+
+
+def _series_catalog_handler(n: int):
+    """A /series handler returning `n` series with descending volume plus the
+    bulky fields the minimal projection must strip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/series")
+        series = [
+            {
+                "ticker": f"KXS{i:04d}",
+                "title": f"Series {i}",
+                "category": "Economics",
+                "volume_fp": str((n - i) * 100),  # S0 highest, descending
+                "settlement_sources": [{"name": "src", "url": "https://x"}] * 20,
+                "product_metadata": {"blob": "x" * 500},
+            }
+            for i in range(n)
+        ]
+        return httpx.Response(200, json={"series": series})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_series_list_projects_and_caps_by_volume(rsa_private_key):
+    """The live failure: one category returned 556KB. The tool must bound the
+    result — top-`limit` by volume, minimal projection — not dump everything."""
+    server = _make_server(rsa_private_key, _series_catalog_handler(500))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+
+    out = await fn(category="Economics", limit=10)
+
+    assert out["total_matched"] == 500  # Kalshi returned all 500
+    assert out["returned"] == 10  # but we cap the response
+    assert out["truncated"] is True
+    # Highest volume first (S0000 has the largest), minimal projection.
+    assert out["series"][0]["ticker"] == "KXS0000"
+    for entry in out["series"]:
+        assert "settlement_sources" not in entry
+        assert "product_metadata" not in entry
+        assert set(entry) <= {
+            "ticker",
+            "title",
+            "category",
+            "frequency",
+            "tags",
+            "fee_type",
+            "volume_fp",
+            "last_updated_ts",
+        }
+
+
+@pytest.mark.asyncio
+async def test_series_list_include_full_keeps_everything(rsa_private_key):
+    """The escape hatch for a narrow query must return the full objects and
+    request the product-metadata blob."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={"series": [{"ticker": "KXA", "settlement_sources": [{"name": "s"}]}]},
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+
+    out = await fn(tags="rare", include_full=True)
+
+    assert "settlement_sources" in out["series"][0]  # full object kept
+    assert seen[0].url.params["include_product_metadata"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_series_list_not_truncated_when_under_limit(rsa_private_key):
+    server = _make_server(rsa_private_key, _series_catalog_handler(3))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    out = await fn(limit=100)
+    assert out["total_matched"] == 3
+    assert out["returned"] == 3
+    assert out["truncated"] is False
+
+
+# ── kalshi_get_event_forecast_history (opaque-400 → actionable) ────────────
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_reshapes_kalshis_opaque_400(rsa_private_key):
+    """Live, this endpoint 400s on doc-valid requests. The tool must turn the
+    bare 'bad request' into an actionable message instead of passing it through
+    for an agent to loop on."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+            period_interval=60,
+        )
+    msg = exc.value.message
+    assert exc.value.status == 400
+    assert "does not publish percentile-forecast data" in msg
+    assert "KXHIGHNY-26AUG14" in msg
+    assert "bad request" in msg  # Kalshi's own text is preserved
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_passes_percentiles_as_repeated_params(rsa_private_key):
+    """Encoding is confirmed correct against Kalshi's API reference (exploded
+    form), so pin it: percentiles go out as repeated `percentiles=` params."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"forecast_history": []})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    await fn(
+        event_ticker="KXHIGHNY-26AUG14",
+        series_ticker="KXHIGHNY",
+        start_ts=1_000_000,
+        end_ts=1_086_400,
+        percentiles=[2500, 5000, 7500],
+    )
+    assert seen[0].url.params.get_list("percentiles") == ["2500", "5000", "7500"]
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert exc.value.status == 500
+    assert "does not publish" not in exc.value.message

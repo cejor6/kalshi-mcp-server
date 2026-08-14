@@ -30,6 +30,7 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import SafetyError
 from kalshi_mcp_server.safety import OrderIntent
+from kalshi_mcp_server.tools.discovery import _validate_path_segment
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -225,6 +226,7 @@ def register(server: FastMCP) -> None:
         Args:
             order_id: The Kalshi order id to cancel.
         """
+        order_id = _validate_path_segment(order_id, name="order_id", kind="identifier")
         return await client.delete(f"/portfolio/orders/{order_id}")
 
     @server.tool
@@ -245,6 +247,7 @@ def register(server: FastMCP) -> None:
         """
         if reduce_by <= 0:
             raise SafetyError(f"reduce_by must be positive, got {reduce_by}.")
+        order_id = _validate_path_segment(order_id, name="order_id", kind="identifier")
         body = {"reduce_by": reduce_by}
         return await client.post(
             f"/portfolio/orders/{order_id}/decrease",
@@ -258,4 +261,5 @@ def register(server: FastMCP) -> None:
         Args:
             order_id: The Kalshi order id to fetch.
         """
+        order_id = _validate_path_segment(order_id, name="order_id", kind="identifier")
         return await client.get(f"/portfolio/orders/{order_id}")

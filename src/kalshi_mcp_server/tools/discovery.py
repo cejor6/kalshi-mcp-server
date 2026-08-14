@@ -99,56 +99,74 @@ def _validate_ticker(ticker: str, *, name: str = "ticker") -> str:
     return ticker.strip()
 
 
-# Characters a real Kalshi ticker uses: upper/lower alphanumerics plus `-`,
-# `.` and `_` (e.g. "KXFED-26MAR19-B5.25", "KXMVECROSSCATEGORY-SHARD1-R").
-_TICKER_ALLOWED_CHARS = frozenset(
+# Characters that are safe in a value we interpolate into a URL PATH segment:
+# upper/lower alphanumerics plus `-`, `.` and `_`. Covers real Kalshi tickers
+# ("KXFED-26MAR19-B5.25", "KXMVECROSSCATEGORY-SHARD1-R") and order-id UUIDs
+# ("a1b2c3d4-...") alike. Every character NOT in this set that could appear is
+# a URL separator (`/`, `?`, `#`, `&`, whitespace, …).
+_PATH_SEGMENT_ALLOWED_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._"
 )
 
 
-def _validate_path_ticker(ticker: str, *, name: str = "ticker") -> str:
-    """Validate a ticker that will be INTERPOLATED INTO A URL PATH.
+def _validate_path_segment(value: str, *, name: str = "ticker", kind: str = "ticker") -> str:
+    """Validate a value that will be INTERPOLATED INTO A URL PATH segment.
 
-    Tools build paths with f-strings (`/markets/{ticker}/orderbook`), and the
-    path we sign is reconstructed the same way. A ticker containing `/`, `?`,
-    `#`, or a `..` segment would therefore change which endpoint the request
-    reaches — and the canonical message we sign along with it. That is a
-    problem worth closing on any path, and a genuine one on the POST path
-    (`/multivariate_event_collections/{collection_ticker}`), where a
-    model-supplied string would otherwise steer a state-mutating call.
+    Tools build paths with f-strings (`/markets/{ticker}/orderbook`,
+    `/portfolio/orders/{order_id}`), and the canonical message we sign is
+    reconstructed the same way — critically, `auth._path_without_query` strips
+    the query string before signing. So a value containing `/`, `?`, `#`, or a
+    `..` segment changes which endpoint the request reaches while STILL
+    producing a valid signature: `order_id="abc?foo=bar"` signs `/…/abc` but
+    sends `/…/abc?foo=bar` with caller-chosen query params. It matters most on
+    the state-mutating paths (order cancel/decrease, combo creation), where the
+    value is model-supplied.
 
-    Restricting to the charset real tickers actually use is the whole fix:
-    every dangerous character is a separator, and none of them are legal in a
-    ticker. Rejecting is correct rather than escaping — an escaped `/` would
-    just 404 more confusingly.
+    Restricting to the charset real tickers / order-ids use is the whole fix:
+    every dangerous character is a separator and none are legal in either.
+    Rejecting beats escaping — an escaped `/` would just 404 more confusingly.
+
+    `kind` names the value in the error message ("ticker" / "identifier").
     """
-    ticker = _validate_ticker(ticker, name=name)
-    bad = sorted(set(ticker) - _TICKER_ALLOWED_CHARS)
+    value = _validate_ticker(value, name=name)
+    bad = sorted(set(value) - _PATH_SEGMENT_ALLOWED_CHARS)
     if bad:
+        example = (
+            "'KXFED-26MAR19-B5.25'"
+            if kind == "ticker"
+            else "an alphanumeric id with '-', '.' or '_'"
+        )
         raise KalshiAPIError(
             status=0,
             message=(
-                f"{name} contains characters that are not valid in a Kalshi ticker: "
-                f"{''.join(bad)!r}. Tickers are alphanumerics plus '-', '.' and '_' "
-                f"(e.g. 'KXFED-26MAR19-B5.25'). Got {ticker!r}."
+                f"{name} contains characters that are not valid in a Kalshi {kind}: "
+                f"{''.join(bad)!r}. Allowed: alphanumerics plus '-', '.' and '_' "
+                f"(e.g. {example}). Got {value!r}."
             ),
         )
-    # `.` is legal INSIDE a ticker ("…-B5.25"), so the charset check above lets
-    # a bare "." or ".." through — and those are dot-SEGMENTS, which httpx
-    # resolves away: "." collapses the path to its parent (the LIST endpoint),
-    # ".." climbs above it. The signer signs the un-normalized path, so the
-    # request would land somewhere other than what was signed. Reject the whole
-    # ticker when it is nothing but dots.
-    if set(ticker) == {"."}:
+    # `.` is legal inside a value ("…-B5.25"), so the charset check above lets a
+    # bare "." or ".." through — and those are dot-SEGMENTS, which httpx
+    # resolves away: "." collapses the path to its parent, ".." climbs above it.
+    # The signer signs the un-normalized path, so the request would land
+    # somewhere other than what was signed. Reject a value that is nothing but
+    # dots.
+    if set(value) == {"."}:
         raise KalshiAPIError(
             status=0,
             message=(
-                f"{name}={ticker!r} is a path segment, not a ticker — '.' and '..' "
-                "resolve to a different endpoint than the one we sign. Pass a real "
-                "ticker like 'KXFED-26MAR19-B5.25'."
+                f"{name}={value!r} is a path segment, not a {kind} — '.' and '..' "
+                "resolve to a different endpoint than the one we sign."
             ),
         )
-    return ticker
+    return value
+
+
+def _validate_path_ticker(ticker: str, *, name: str = "ticker") -> str:
+    """Back-compat alias: validate a TICKER interpolated into a URL path.
+
+    Thin wrapper over `_validate_path_segment` — see it for the why.
+    """
+    return _validate_path_segment(ticker, name=name, kind="ticker")
 
 
 # Whitelist for `minimal=True`. Unlike `compact` (a blacklist), this keeps
@@ -174,6 +192,37 @@ _MINIMAL_MARKET_FIELDS: tuple[str, ...] = (
     "open_interest_fp",
     "market_type",
 )
+
+
+# Whitelist for the `minimal` view of a SERIES catalog entry. `GET /series`
+# does not paginate — a single busy category (Economics: 612 series, ~556KB on
+# prod) blows an LLM tool-result cap even with `include_product_metadata=false`,
+# because each entry also carries `settlement_sources`, `contract_url`,
+# `additional_prohibitions`, etc. This keeps only the fields that identify and
+# rank a series; the full entry is one `include_full=True` read away.
+_MINIMAL_SERIES_FIELDS: tuple[str, ...] = (
+    "ticker",
+    "title",
+    "category",
+    "frequency",
+    "tags",
+    "fee_type",
+    "volume_fp",
+    "last_updated_ts",
+)
+
+
+def _minimal_series(series: dict[str, Any]) -> dict[str, Any]:
+    return {k: series[k] for k in _MINIMAL_SERIES_FIELDS if k in series}
+
+
+def _series_volume(series: dict[str, Any]) -> float:
+    """Best-effort parse of a series' lifetime `volume_fp` (string). 0 on miss —
+    so a catalog fetched without `include_volume` sorts stably by insertion."""
+    try:
+        return float(series.get("volume_fp") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _compact_market(market: dict[str, Any]) -> dict[str, Any]:
@@ -336,9 +385,15 @@ class _TopKByVolume:
 # sweep is bounded by ALL THREE of these; whichever binds first stops the scan
 # and is reported back as `stopped_by`, so `complete` is never a guess.
 #
-# Sizing (Aug 2026): the open, non-combo listing is a few thousand markets, so
-# a full sweep is ~5-10 pages. 30 pages x 1000/page = 30k markets of headroom
-# — generous now, and the wall-clock cap is the real backstop if that changes.
+# Sizing (measured live on prod, Aug 2026): the open, non-combo listing is
+# LARGER than these caps — a full sweep hit 30 requests / 30k markets and still
+# reported `complete: false, stopped_by: "market_cap"`. Index strike-ladders
+# (KXNASDAQ100U alone ~2800 markets) and per-minute crypto markets balloon the
+# count. So on the current listing `scan_all` ranks "the busiest ~30k scanned",
+# not a truly global set — the caps bound cost/latency and the honest
+# `complete`/`stopped_by` reporting is what keeps that from being a silent lie.
+# Raising the caps trades read budget + wall-clock for a marginally-less-partial
+# ranking; that's a deliberate tuning call, not a default to bump casually.
 _SCAN_PAGE_SIZE = 1000  # Kalshi's max `limit` on GET /markets
 _SCAN_ALL_MAX_REQUESTS = 30
 _SCAN_ALL_MAX_SECONDS = 25.0
@@ -811,12 +866,16 @@ def register(server: FastMCP) -> None:
             series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
             min_volume: Drop markets whose 24h volume is below this (same
                 units as `volume_24h_fp`). Default 0.0 (keep all).
-            scan_all: Sweep the ENTIRE matching listing before ranking, instead
-                of the first `scan_limit` markets. This is what makes the
-                ranking exchange-wide rather than an arbitrary slice. Costs
-                one read per 1000 markets (~5-10 requests for the open listing
-                as of Aug 2026) and is bounded by internal request / wall-clock
-                / market caps, so it always terminates. Default False.
+            scan_all: Sweep as much of the matching listing as the internal
+                caps allow before ranking, instead of just the first
+                `scan_limit` markets — a far wider ranking than a fixed window.
+                Costs one read per 1000 markets and is bounded by internal
+                request / wall-clock / market caps, so it always terminates.
+                Reality check (measured on prod): the open listing is LARGER
+                than the cap, so a full sweep currently returns `complete:
+                false, stopped_by: "market_cap"` — the ranking is "the busiest
+                ~30k markets scanned", not the whole exchange. Still far better
+                than a 200-market window; just read `complete`. Default False.
 
         IMPORTANT — windowed ranking: Kalshi has no server-side sort, so with
         `scan_all=False` the ranking is over the SCANNED WINDOW only (the top
@@ -1051,42 +1110,58 @@ def register(server: FastMCP) -> None:
         tags: str | None = None,
         include_volume: bool = True,
         min_updated_ts: int | None = None,
-        include_product_metadata: bool = False,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+        include_full: bool = False,
     ) -> dict[str, Any]:
         """List Kalshi's SERIES catalog — the authoritative names behind the tickers.
 
         Where `kalshi_get_series_summary` derives series from ticker prefixes
         and measures live activity, this returns Kalshi's own catalog entry
-        per series: real title, category, tags, settlement sources, fee type,
-        and (with `include_volume`) lifetime traded volume. Pair them — the
-        summary tells you what's active, this tells you what it IS.
+        per series: real title, category, tags, fee type, and (with
+        `include_volume`) lifetime traded volume. Pair them — the summary tells
+        you what's active, this tells you what it IS.
 
         `min_updated_ts` makes this a cheap change-feed: pass yesterday's
-        timestamp to get only series whose metadata moved, which is the low-
-        cost way to spot a new event class listing.
+        timestamp to get only series whose metadata moved.
+
+        This endpoint does NOT paginate — Kalshi returns EVERY matching series
+        at once, and a busy category is enormous (Economics is 600+). So the
+        result is bounded by default: a small field whitelist per series, and
+        only the top `limit` by lifetime volume. Don't reach for `include_full`
+        on a broad query.
 
         Args:
-            category: Filter to one category (e.g. "Sports", "Economics",
-                "Politics"). Omit for all.
+            category: Filter to one category. NOTE Kalshi's exact spelling —
+                it is "Economics", "Politics", "Sports", etc. An unrecognized
+                value is not an error; Kalshi ignores it and returns the whole
+                catalog, which is exactly the overflow case `limit` guards.
             tags: Filter by tag. Omit for all.
-            include_volume: Include `volume_fp`, total volume traded across
-                all events in each series. Default True — it's the single
-                most useful ranking field here and costs nothing extra.
-            min_updated_ts: Only series whose metadata was updated after this
-                unix timestamp (seconds). The change-feed knob described above.
-            include_product_metadata: Include Kalshi's internal
-                `product_metadata` blob. Default False — it is verbose and
-                rarely useful to a trading agent.
+            include_volume: Include `volume_fp` (lifetime volume). Default True
+                — it is the ranking key for `limit`, so turning it off makes
+                the top-`limit` selection fall back to Kalshi's own order.
+            min_updated_ts: Only series updated after this unix ts (seconds).
+            limit: Max series to RETURN, 1-1000, ranked by lifetime volume
+                (descending). Default 100. This caps the response, not the
+                fetch — `total_matched` always reports how many Kalshi actually
+                returned, so you can tell when you're seeing a slice.
+            include_full: Return each series' FULL object (settlement sources,
+                contract URLs, prohibitions, product metadata) instead of the
+                minimal projection. Default False. Only safe on an already-
+                narrow query (a specific `tags`, or a tight `min_updated_ts`) —
+                on a broad one it will overflow.
 
-        Token-cap note: this endpoint does NOT paginate — it returns every
-        matching series in one response. Unfiltered that is the whole catalog
-        (hundreds of entries, each with settlement sources and tags), so
-        prefer `category=` or `min_updated_ts=` when you can, and leave
-        `include_product_metadata` off.
+        Returns:
+            `series`: up to `limit` entries, highest lifetime volume first
+                (minimal projection unless `include_full`).
+            `total_matched`: how many series Kalshi returned before the local
+                top-`limit` cut — `> len(series)` means you're seeing a slice.
+            `returned`, `truncated`: convenience counts.
         """
         params: dict[str, Any] = {
             "include_volume": str(include_volume).lower(),
-            "include_product_metadata": str(include_product_metadata).lower(),
+            # The full product-metadata blob is the single largest field; never
+            # fetch it unless the caller explicitly wants the full objects.
+            "include_product_metadata": str(include_full).lower(),
         }
         if category:
             params["category"] = category
@@ -1094,7 +1169,22 @@ def register(server: FastMCP) -> None:
             params["tags"] = tags
         if min_updated_ts is not None:
             params["min_updated_ts"] = min_updated_ts
-        return await client.get("/series", params=params)
+        body = await client.get("/series", params=params)
+
+        series = body.get("series") or []
+        total = len(series)
+        # Rank by lifetime volume so a truncated result keeps the series that
+        # matter, not an arbitrary prefix. Stable, so equal-volume order is
+        # Kalshi's own.
+        ranked = sorted(series, key=_series_volume, reverse=True)[:limit]
+        if not include_full:
+            ranked = [_minimal_series(s) for s in ranked]
+        return {
+            "series": ranked,
+            "total_matched": total,
+            "returned": len(ranked),
+            "truncated": total > len(ranked),
+        }
 
     @server.tool
     async def kalshi_get_milestones(
@@ -1189,9 +1279,13 @@ def register(server: FastMCP) -> None:
                 (descending) for raw supply — the right one for spotting a
                 newly-listed event class; "soonest_close" (ascending) for what
                 is about to resolve.
-            scan_all: Sweep the entire listing (default True — a partial census
-                is a misleading one). Set False to cap the scan at 1000 markets
-                for a fast, deliberately partial sample.
+            scan_all: Sweep as much of the listing as the internal caps allow
+                (default True — a 1000-market sample is a misleading census).
+                Set False to cap the scan at 1000 for a fast, deliberately
+                partial sample. NOTE: the prod listing exceeds the cap, so even
+                `scan_all=True` currently returns `complete: false, stopped_by:
+                "market_cap"` — `series_count` is a floor on the true number of
+                open series, not the exact count. Read `complete`.
 
         Multivariate (`KXMVE…`) combos are excluded server-side, matching
         `kalshi_find_liquid_markets`. A combo census would be dominated by

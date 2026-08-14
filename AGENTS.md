@@ -451,6 +451,19 @@ URI scheme: `kalshi://<noun>[/<id>][/<subresource>]`. Examples:
 Hard-won lessons from running scan agents against prod. The discovery
 tools encode these; don't regress them.
 
+- **Every list tool needs a projection AND a bound — the market tools aren't
+  special.** The #1 failure mode here is blowing the caller's context, and it
+  is not limited to markets. Confirmed live: `GET /series` does not paginate
+  and one category (Economics) returned **556KB**; `GET
+  /multivariate_event_collections` at `limit=3` returned **312KB** because each
+  collection carries an 863-entry `associated_event_tickers` universe. So
+  `kalshi_get_series_list` projects to a field whitelist + caps to top-`limit`
+  by volume (the endpoint has no `limit`, so it's a client-side cut after
+  fetch), and the combo-collection tools drop the universe arrays for an
+  `associated_event_count` by default. When you add a tool that lists or
+  fetches Kalshi objects, ask "how big is this on prod, unfiltered?" — a mock
+  fixture is tiny and will not warn you. Give it a projection default and a
+  size bound before it ships, not after a live blowup.
 - **Two projection axes on `kalshi_get_markets`.** `compact` is a
   *blacklist* (`_VERBOSE_MARKET_FIELDS`) — preserves forward-compat as
   Kalshi adds fields. `minimal` is a *whitelist* (`_MINIMAL_MARKET_FIELDS`)
@@ -539,12 +552,15 @@ tools encode these; don't regress them.
   resolves away (`.` collapses to the LIST endpoint). Rejecting beats
   escaping.
 
-  **Scope, so nobody assumes blanket coverage:** this is currently applied to
-  `collection_ticker` on the multivariate GET/POST only. Other f-string path
-  sites still use the looser `_validate_ticker`, and `order_id` in `orders.py`
-  has no charset check at all — worth closing, since `auth.py` strips the
-  query before signing, so an `order_id` containing `?` yields a
-  *signature-valid* request carrying caller-chosen query params.
+  The core is `_validate_path_segment(value, name, kind)`; `_validate_path_ticker`
+  is a thin alias over it. Applied to `collection_ticker` on the multivariate
+  GET/POST **and** to `order_id` on the order cancel / decrease / get tools —
+  the latter matters because `auth.py` strips the query before signing, so an
+  `order_id` containing `?` would otherwise yield a *signature-valid* request
+  carrying caller-chosen query params. Reuse `_validate_path_segment` for any
+  new tool that interpolates a model-supplied value into a request path; the
+  remaining plain-ticker path sites (single market/orderbook lookups) are read
+  paths and lower-risk, but there's no reason not to migrate them too.
 - **Combo legs live on the MARKET, not on the collection.**
   `/multivariate_event_collections/{ticker}` describes the *universe* a combo
   may be built from (`associated_event_tickers`, `size_min`/`size_max`,

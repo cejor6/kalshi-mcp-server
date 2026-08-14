@@ -19,15 +19,18 @@ from kalshi_mcp_server.tools.discovery import (
     _finalize_series,
     _fold_series_page,
     _minimal_market,
+    _minimal_series,
     _parse_fields,
     _project_market,
     _rank_liquid_markets,
     _record_event_hint_miss,
     _scan_markets_excluding_mve,
     _series_of,
+    _series_volume,
     _single_ticker,
     _TopKByVolume,
     _validate_mve_filter,
+    _validate_path_segment,
     _validate_path_ticker,
     _validate_ticker,
     _volume_24h,
@@ -149,6 +152,88 @@ def test_validate_path_ticker_still_rejects_empty():
     with pytest.raises(KalshiAPIError) as exc:
         _validate_path_ticker("   ", name="collection_ticker")
     assert "collection_ticker" in exc.value.message
+
+
+# ── _validate_path_segment (generalized — now also guards order_id) ─────────
+
+
+def test_validate_path_segment_accepts_uuid_order_ids():
+    """Order ids are UUIDs; the generalized guard must pass them."""
+    uid = "a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+    assert _validate_path_segment(uid, name="order_id", kind="identifier") == uid
+
+
+@pytest.mark.parametrize("bad", ["abc?foo=bar", "../balance", "ord/../x", "ord a", ".", ".."])
+def test_validate_path_segment_rejects_separators_for_identifiers(bad):
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_segment(bad, name="order_id", kind="identifier")
+    assert "order_id" in exc.value.message
+
+
+def test_validate_path_segment_message_uses_the_kind_noun():
+    """The error names the value kind so it reads right for a non-ticker."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_segment("a?b", name="order_id", kind="identifier")
+    assert "identifier" in exc.value.message
+    assert "ticker" not in exc.value.message.replace("order_id", "")
+
+
+def test_validate_path_ticker_is_a_thin_alias():
+    """The back-compat alias still behaves as before for tickers."""
+    assert _validate_path_ticker("KXFED-26MAR19-B5.25") == "KXFED-26MAR19-B5.25"
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker("KX/../x", name="collection_ticker")
+    assert "collection_ticker" in exc.value.message
+
+
+# ── _minimal_series / _series_volume (series_list projection) ──────────────
+
+
+def _full_series() -> dict:
+    return {
+        "ticker": "KXNASDAQ100U",
+        "title": "Nasdaq-100 above X",
+        "category": "Economics",
+        "frequency": "hourly",
+        "tags": ["indices"],
+        "fee_type": "quadratic",
+        "volume_fp": "65502.31",
+        "last_updated_ts": "2026-08-14T13:00:00Z",
+        # The bulk that must be dropped by the minimal projection:
+        "settlement_sources": [{"name": "Nasdaq", "url": "https://x"}] * 10,
+        "contract_url": "https://kalshi.com/...",
+        "contract_terms_url": "https://kalshi.com/...",
+        "additional_prohibitions": ["a", "b", "c"],
+        "product_metadata": {"lots": "of stuff"},
+    }
+
+
+def test_minimal_series_keeps_only_the_whitelist():
+    minimal = _minimal_series(_full_series())
+    assert set(minimal) <= {
+        "ticker",
+        "title",
+        "category",
+        "frequency",
+        "tags",
+        "fee_type",
+        "volume_fp",
+        "last_updated_ts",
+    }
+    for dropped in ("settlement_sources", "contract_url", "product_metadata"):
+        assert dropped not in minimal
+    assert minimal["ticker"] == "KXNASDAQ100U"
+
+
+def test_minimal_series_does_not_fabricate_missing_fields():
+    assert _minimal_series({"ticker": "KX"}) == {"ticker": "KX"}
+
+
+def test_series_volume_parses_and_defaults():
+    assert _series_volume({"volume_fp": "65502.31"}) == pytest.approx(65502.31)
+    assert _series_volume({}) == 0.0
+    assert _series_volume({"volume_fp": None}) == 0.0
+    assert _series_volume({"volume_fp": "garbage"}) == 0.0
 
 
 # ── _TopKByVolume (streaming fold for scan_all) ────────────────────────────

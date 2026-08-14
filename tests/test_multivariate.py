@@ -677,6 +677,82 @@ async def test_get_combo_collections_passes_filters(rsa_private_key):
     assert seen[0].url.params["limit"] == "5"
 
 
+def _fat_collection(ticker: str = "KXMVE-R") -> dict:
+    """A collection carrying the two heavy universe arrays that blew the token
+    cap live (863 entries each on prod)."""
+    return {
+        "collection_ticker": ticker,
+        "series_ticker": "KXMVE",
+        "title": "Cross-category",
+        "size_min": 2,
+        "size_max": 9,
+        "is_all_yes": True,
+        "is_single_market_per_event": True,
+        "functional_description": "pick N legs",
+        "associated_event_tickers": [f"EV-{i}" for i in range(863)],
+        "associated_events": [{"ticker": f"EV-{i}", "active_quoters": []} for i in range(863)],
+    }
+
+
+@pytest.mark.asyncio
+async def test_combo_collections_strips_the_universe_arrays_by_default(rsa_private_key):
+    """The live failure: limit=3 still returned 312KB because each collection
+    carried 863 associated_event_tickers. By default the tool must drop those
+    arrays and report a count, keeping the construction rules."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"multivariate_contracts": [_fat_collection()], "cursor": ""}
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_collections")
+
+    out = await fn(status="open")
+    c = out["multivariate_contracts"][0]
+    assert "associated_event_tickers" not in c
+    assert "associated_events" not in c
+    assert c["associated_event_count"] == 863
+    # Construction rules — the part a caller needs — survive.
+    for kept in ("size_min", "size_max", "is_all_yes", "is_single_market_per_event"):
+        assert kept in c
+
+
+@pytest.mark.asyncio
+async def test_combo_collections_include_event_tickers_restores_arrays(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"multivariate_contracts": [_fat_collection()], "cursor": ""}
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_collections")
+
+    out = await fn(status="open", include_event_tickers=True)
+    c = out["multivariate_contracts"][0]
+    assert len(c["associated_event_tickers"]) == 863
+    assert "associated_event_count" not in c
+
+
+@pytest.mark.asyncio
+async def test_combo_collection_single_defaults_to_full_universe(rsa_private_key):
+    """The single-object fetch keeps the universe by default (that's the point
+    of drilling into one), but can drop it on request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"multivariate_contract": _fat_collection()})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_collection")
+
+    full = await fn(collection_ticker="KXMVE-R")
+    assert len(full["multivariate_contract"]["associated_event_tickers"]) == 863
+
+    lean = await fn(collection_ticker="KXMVE-R", include_event_tickers=False)
+    assert "associated_event_tickers" not in lean["multivariate_contract"]
+    assert lean["multivariate_contract"]["associated_event_count"] == 863
+
+
 @pytest.mark.asyncio
 async def test_get_combo_events_rejects_mutually_exclusive_filters(rsa_private_key):
     """Kalshi rejects collection_ticker + series_ticker together; catch it
