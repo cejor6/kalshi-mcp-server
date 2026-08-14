@@ -58,6 +58,13 @@ def register(server: FastMCP) -> None:
         can never loosen past it. When the two differ, an operator has
         tightened a limit at runtime. Useful for the agent to confirm whether
         a trade would hit real money — and under what caps — before placing one.
+
+        `combo_creation_enabled` reports the SEPARATE gate on
+        `kalshi_create_combo_market` (`MCP_ALLOW_COMBO_CREATION`), with
+        `combo_creations_today` / `max_combo_creations_per_day` showing how
+        much of today's local creation budget is left. That budget bounds the
+        draw on Kalshi's 5000-per-week account quota; it is in-process and
+        resets on restart as well as at UTC midnight.
         """
         return {
             "env": config.env,
@@ -65,6 +72,7 @@ def register(server: FastMCP) -> None:
             "rest_base": config.rest_base,
             "ws_url": config.ws_url,
             **safety.environment_view(),
+            **safety.combo_creation_view(),
         }
 
     # Operator control to tighten the safety envelope at runtime. Gated by

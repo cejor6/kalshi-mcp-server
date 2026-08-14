@@ -19,7 +19,11 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from kalshi_mcp_server.config import Config
-from kalshi_mcp_server.errors import SafetyError, TradingDisabledError
+from kalshi_mcp_server.errors import (
+    ComboCreationDisabledError,
+    SafetyError,
+    TradingDisabledError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +140,39 @@ class _DailyCounter:
             self.cost_usd = 0.0
 
     def add(self, cost_usd: float) -> float:
+        """Add to today's total. `cost_usd` must be non-negative.
+
+        Rejecting negatives is structural, not pedantic: `add(-1)` is how a
+        decrement gets written by accident, and every such decrement is a
+        latent day-roll bug (see `subtract`). Making the only downward path
+        `subtract` means a future caller cannot reintroduce one — this already
+        happened twice, once in `release_combo_creation` and once in
+        `reserve_combo_creation`'s rollback.
+        """
+        if cost_usd < 0:
+            raise ValueError(
+                f"_DailyCounter.add takes a non-negative amount, got {cost_usd}. "
+                "Use subtract() to give budget back — it clamps at zero and is "
+                "atomic with the UTC day roll."
+            )
         with self._lock:
             self._maybe_roll()
             self.cost_usd += cost_usd
+            return self.cost_usd
+
+    def subtract(self, amount: float) -> float:
+        """Give back `amount`, clamped at zero, atomically with the day roll.
+
+        The ONLY downward path. Must NOT be expressed as `peek()` then
+        `add(-amount)`, nor as a bare `add(-amount)`: those take the lock
+        separately from (or without) the roll check, so a UTC-midnight rollover
+        landing in between rolls the counter to 0 and then applies the
+        decrement, leaving the NEW day at -1 and silently widening that day's
+        ceiling by one.
+        """
+        with self._lock:
+            self._maybe_roll()
+            self.cost_usd = max(0.0, self.cost_usd - amount)
             return self.cost_usd
 
     def peek(self) -> tuple[str, float]:
@@ -171,6 +205,9 @@ class SafetyController:
         # this lock — see effective_limits.
         self._limits_lock = asyncio.Lock()
         self._daily = _DailyCounter()
+        # Separate counter: combo creations draw on Kalshi's weekly creation
+        # quota, not on the USD spend budget, so they must not share a bucket.
+        self._combo_creations = _DailyCounter()
 
     @property
     def ceilings(self) -> SafetyLimits:
@@ -417,6 +454,93 @@ class SafetyController:
                     f"Order would leave ${remaining_after:.2f} in cash, below the "
                     f"active reserve floor (${limits.cash_reserve_usd:.2f})."
                 )
+
+    # ── Combo (parlay) creation ────────────────────────────────────────────
+    #
+    # `POST /multivariate_event_collections/{ticker}` materializes a combo
+    # market ticker. It commits no money, so it is gated separately from
+    # `trading_enabled` (see Config.combo_creation_enabled) — but it is still
+    # a POST creating exchange state, AND Kalshi caps creations at 5000 per
+    # WEEK per account. Burning that quota is the real failure mode here: an
+    # agent retrying a bad leg set could eat a meaningful slice of the week's
+    # budget in minutes. The per-day ceiling is what bounds that.
+    #
+    # Caveat, deliberately mirrored from the daily spend counter: this count
+    # is IN-PROCESS and resets on restart. It bounds a runaway loop within a
+    # session; it is not a durable ledger of the weekly quota.
+
+    def assert_combo_creation_enabled(self) -> None:
+        if not self._config.combo_creation_enabled:
+            raise ComboCreationDisabledError(
+                "Combo (parlay) creation is disabled. Set MCP_ALLOW_COMBO_CREATION=1 "
+                "and restart to allow this server to materialize combo market "
+                "tickers. This is a separate gate from KALSHI_TRADING_ENABLED — "
+                "creating a combo commits no money, but it does create exchange "
+                "state under your account and draws on Kalshi's 5000-per-week "
+                "creation quota."
+            )
+
+    def reserve_combo_creation(self) -> None:
+        """Gate + claim one unit of today's creation budget, BEFORE the POST.
+
+        Reserve-then-release rather than check-then-record, for two reasons the
+        naive ordering gets wrong:
+
+        1. **Concurrency.** Check-then-await-then-record leaves the whole
+           network round trip between the check and the increment, so N
+           concurrent calls all read the same count and every one of them
+           passes a ceiling only one should have. Claiming the slot up front
+           closes that window.
+        2. **Ambiguous failures.** If the POST times out, Kalshi may well have
+           created the combo — and a timeout is precisely the case that
+           triggers a retry loop, which is the thing this ceiling exists to
+           bound. Counting optimistically means an ambiguous outcome costs
+           budget; only an unambiguous rejection gives it back.
+        """
+        self.assert_combo_creation_enabled()
+        ceiling = self._config.max_combo_creations_per_day
+        used_after = self._combo_creations.add(1.0)
+        if used_after > ceiling:
+            # Over the line — hand the slot straight back, then refuse.
+            # `subtract`, not `add(-1)`: the decrement has to be atomic with
+            # the day roll or a midnight rollover here leaves the new day at -1.
+            self._combo_creations.subtract(1.0)
+            raise SafetyError(
+                f"Refusing to create another combo market: {int(used_after) - 1} created "
+                f"today, at the per-day ceiling of {ceiling}. Kalshi allows 5000 per "
+                "WEEK per account and this server bounds the daily draw so a retry "
+                "loop can't burn it. Raise MCP_MAX_COMBO_CREATIONS_PER_DAY and restart "
+                "if you genuinely need more. Resets at UTC midnight."
+            )
+
+    def release_combo_creation(self) -> None:
+        """Return a reserved slot when nothing was created.
+
+        Call only for outcomes where Kalshi certainly created nothing — an
+        unambiguous 4xx, a local refusal, or a failure before the POST was
+        dispatched. Never on a timeout or a 5xx once the POST is in flight:
+        the combo may exist, and crediting the budget back would let a retry
+        loop spin freely.
+
+        Known imprecision, deliberately not engineered away: this returns *a*
+        slot for the current day, not specifically the one this caller
+        reserved. If a request reserves just before UTC midnight and releases
+        just after, it credits the new day instead — granting at most one
+        extra creation, self-correcting, and requiring a sub-second window.
+        Threading a day-stamped reservation token through every call path
+        costs more complexity than that is worth.
+        """
+        self._combo_creations.subtract(1.0)
+
+    def combo_creation_view(self) -> dict[str, object]:
+        """Combo-creation state for `kalshi_get_environment` / the resource."""
+        day, used_today = self._combo_creations.peek()
+        return {
+            "combo_creation_enabled": self._config.combo_creation_enabled,
+            "combo_creations_today": int(used_today),
+            "max_combo_creations_per_day": self._config.max_combo_creations_per_day,
+            "combo_creation_day_utc": day,
+        }
 
     def record_order_committed(self, intent: OrderIntent) -> None:
         """Call AFTER the order is successfully accepted by Kalshi."""

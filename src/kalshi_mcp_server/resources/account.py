@@ -29,9 +29,10 @@ def register(server: FastMCP) -> None:
             "Read-only snapshot of which Kalshi environment this MCP server "
             "is connected to (demo vs prod), the trading-enabled flag, the "
             "safety limits currently in force plus their env-configured "
-            "ceilings, and the current local rate-limit bucket headroom. "
-            "Read this before any write action to confirm you're operating "
-            "in the expected environment."
+            "ceilings, the separate combo-creation gate and today's remaining "
+            "creation budget, and the current local rate-limit bucket "
+            "headroom. Read this before any write action to confirm you're "
+            "operating in the expected environment."
         ),
         mime_type="application/json",
     )
@@ -46,6 +47,10 @@ def register(server: FastMCP) -> None:
             "safety_limits": effective.as_dict(),
             "safety_ceilings": ceilings.as_dict(),
             "safety_limits_persist": safety.persistence_durable,
+            # The combo-creation gate is separate from `trading_enabled` and
+            # draws on a different budget (Kalshi's weekly creation quota, not
+            # dollars), so it is surfaced alongside rather than folded in.
+            **safety.combo_creation_view(),
             "rate_limit_headroom": {
                 "read_tokens": round(rate_limiter.read.tokens, 2),
                 "read_capacity": rate_limiter.read.capacity,

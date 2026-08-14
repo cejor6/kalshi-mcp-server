@@ -16,16 +16,22 @@ from kalshi_mcp_server.tools.discovery import (
     _compact_market,
     _event_hint,
     _event_hint_misses,
+    _finalize_series,
+    _fold_series_page,
     _minimal_market,
     _parse_fields,
     _project_market,
     _rank_liquid_markets,
     _record_event_hint_miss,
     _scan_markets_excluding_mve,
+    _series_of,
     _single_ticker,
+    _TopKByVolume,
     _validate_mve_filter,
+    _validate_path_ticker,
     _validate_ticker,
     _volume_24h,
+    _yes_spread,
 )
 
 # Note: the `_event_hint_misses` negative cache is reset around every test by
@@ -87,6 +93,116 @@ def test_validate_ticker_custom_param_name():
     with pytest.raises(KalshiAPIError) as exc:
         _validate_ticker("", name="event_ticker")
     assert "event_ticker" in exc.value.message
+
+
+# ── _validate_path_ticker (charset guard on URL-path interpolation) ────────
+
+
+def test_validate_path_ticker_accepts_real_ticker_shapes():
+    for good in (
+        "KXFED-26MAR19-B5.25",
+        "KXMVECROSSCATEGORY-SHARD1-R",
+        "KXMLBGAME-26AUG141910SDCLE-CLE",
+        "KX_TEST.1",
+    ):
+        assert _validate_path_ticker(good) == good
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../portfolio/orders",
+        "KX-R/../../x",
+        "KX-R?limit=1",
+        "KX-R#frag",
+        "KX R",
+        "KX-R%2F",
+        "KX\nR",
+    ],
+)
+def test_validate_path_ticker_rejects_separators_and_whitespace(bad):
+    """These strings get interpolated into a request path AND into the message
+    we sign, so a separator would change which endpoint is hit. Rejecting beats
+    escaping — an escaped '/' would just 404 more confusingly."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker(bad)
+    assert "not valid in a Kalshi ticker" in exc.value.message
+
+
+@pytest.mark.parametrize("dots", [".", "..", "...."])
+def test_validate_path_ticker_rejects_bare_dot_segments(dots):
+    """REGRESSION: '.' is legal INSIDE a ticker ("…-B5.25"), so the charset
+    check alone let a bare '.'/'..' through — and those are dot-SEGMENTS that
+    httpx resolves away, sending the request to a different endpoint than the
+    one we signed ('.' collapses to the LIST endpoint, '..' climbs above it)."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker(dots, name="collection_ticker")
+    assert "path segment" in exc.value.message
+
+
+def test_validate_path_ticker_still_allows_dots_inside_a_ticker():
+    """The guard must not overreach — real strike tickers carry a decimal."""
+    assert _validate_path_ticker("KXFED-26MAR19-B5.25") == "KXFED-26MAR19-B5.25"
+
+
+def test_validate_path_ticker_still_rejects_empty():
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker("   ", name="collection_ticker")
+    assert "collection_ticker" in exc.value.message
+
+
+# ── _TopKByVolume (streaming fold for scan_all) ────────────────────────────
+
+
+def test_topk_by_volume_matches_a_full_sort():
+    """Top-K of the union equals top-K of the running top-K — the property the
+    streaming fold relies on. Pin it against the batch implementation."""
+    pages = [
+        [{"ticker": f"P{p}-{i}", "volume_24h_fp": str((p * 7 + i * 3) % 20)} for i in range(5)]
+        for p in range(4)
+    ]
+    fold = _TopKByVolume(limit=3)
+    for page in pages:
+        fold(page)
+    streamed = fold.result()
+
+    flat = [m for page in pages for m in page]
+    batched = _rank_liquid_markets(flat, limit=3)
+    assert [m["ticker"] for m in streamed] == [m["ticker"] for m in batched]
+
+
+def test_topk_by_volume_bounds_retention():
+    fold = _TopKByVolume(limit=2)
+    for p in range(50):
+        fold([{"ticker": f"T{p}-{i}", "volume_24h_fp": str(p)} for i in range(100)])
+    assert len(fold.result()) == 2
+    # Highest volume wins; 5000 markets crossed, 2 retained.
+    assert all(m["volume_24h_fp"] == "49" for m in fold.result())
+
+
+def test_topk_by_volume_applies_min_volume():
+    fold = _TopKByVolume(limit=10, min_volume=5)
+    fold([{"ticker": "A", "volume_24h_fp": "10"}, {"ticker": "B", "volume_24h_fp": "1"}])
+    assert [m["ticker"] for m in fold.result()] == ["A"]
+
+
+def test_topk_by_volume_projects_minimally():
+    fold = _TopKByVolume(limit=1)
+    fold([{"ticker": "A", "volume_24h_fp": "10", "rules_primary": "long text"}])
+    assert "rules_primary" not in fold.result()[0]
+
+
+@pytest.mark.parametrize("limit", [0, -1, -5])
+def test_topk_and_batch_agree_on_degenerate_limits(limit):
+    """The schema's `ge=1` only binds MCP clients; a direct `.fn` caller can
+    pass 0 or a negative. The two ranking paths must not disagree there — an
+    unclamped negative would slice from the END via `list[:-1]` and return a
+    near-full list from one path and nothing from the other."""
+    markets = [{"ticker": f"M{i}", "volume_24h_fp": str(i)} for i in range(5)]
+    fold = _TopKByVolume(limit=limit)
+    fold(markets)
+    assert fold.result() == []
+    assert _rank_liquid_markets(markets, limit=limit) == []
 
 
 # ── _compact_market ────────────────────────────────────────────────────────
@@ -401,9 +517,12 @@ async def test_scan_excludes_mve_and_paginates():
             {"markets": [{"ticker": "C"}], "cursor": ""},  # "" = terminal cursor
         ]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=200, status="open")
-    assert [m["ticker"] for m in out] == ["A", "B", "C"]
-    assert exhausted is True  # terminal cursor reached
+    scan = await _scan_markets_excluding_mve(client, scan_limit=200, status="open")
+    assert [m["ticker"] for m in scan.markets] == ["A", "B", "C"]
+    assert scan.complete is True  # terminal cursor reached
+    assert scan.stopped_by is None
+    assert scan.scanned == 3
+    assert scan.requests == 2
     # every request excluded combos server-side
     assert all(params["mve_filter"] == "exclude" for _, params in client.calls)
     # the second request carried the first page's cursor
@@ -412,42 +531,44 @@ async def test_scan_excludes_mve_and_paginates():
 
 async def test_scan_caps_result_at_scan_limit():
     client = _FakeClient(responses=[{"markets": [{"ticker": str(i)} for i in range(5)]}])
-    out, _ = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
     # first request asked for exactly scan_limit
     assert client.calls[0][1]["limit"] == 3
     # one page already satisfied the window — no second request
     assert len(client.calls) == 1
     # result is capped at scan_limit even if the page came back larger
-    assert [m["ticker"] for m in out] == ["0", "1", "2"]
+    assert [m["ticker"] for m in scan.markets] == ["0", "1", "2"]
 
 
 async def test_scan_exhausted_true_when_terminal_at_exactly_scan_limit():
     """Regression: a terminal cursor that fires exactly when the window is
-    full must still report exhausted=True (the exchange ran out), not False."""
+    full must still report complete=True (the exchange ran out), not False."""
     client = _FakeClient(
         responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": ""}]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
-    assert len(out) == 3
-    assert exhausted is True
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(scan.markets) == 3
+    assert scan.complete is True
+    assert scan.stopped_by is None
 
 
 async def test_scan_not_exhausted_when_window_fills_with_more_available():
     client = _FakeClient(
         responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": "more"}]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
-    assert len(out) == 3
-    assert exhausted is False  # window filled, a live cursor means more remain
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(scan.markets) == 3
+    assert scan.complete is False  # window filled, a live cursor means more remain
+    assert scan.stopped_by == "scan_limit"
     assert len(client.calls) == 1
 
 
 async def test_scan_clamps_nonpositive_scan_limit():
     client = _FakeClient(responses=[{"markets": [{"ticker": "A"}], "cursor": ""}])
-    out, _ = await _scan_markets_excluding_mve(client, scan_limit=0, status="open")
+    scan = await _scan_markets_excluding_mve(client, scan_limit=0, status="open")
     # scan_limit clamped up to 1 — one request asking for 1
     assert client.calls[0][1]["limit"] == 1
-    assert len(out) == 1
+    assert len(scan.markets) == 1
 
 
 async def test_scan_dedupes_and_stops_on_nonadvancing_cursor():
@@ -459,9 +580,10 @@ async def test_scan_dedupes_and_stops_on_nonadvancing_cursor():
             {"markets": [{"ticker": "A"}], "cursor": "stuck"},  # same page + cursor
         ]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=10, status="open")
-    assert [m["ticker"] for m in out] == ["A"]  # de-duped
-    assert exhausted is True  # no forward progress == exhausted
+    scan = await _scan_markets_excluding_mve(client, scan_limit=10, status="open")
+    assert [m["ticker"] for m in scan.markets] == ["A"]  # de-duped
+    assert scan.complete is True  # no forward progress == exhausted
+    assert scan.scanned == 1
     assert len(client.calls) == 2  # one fetch, one to discover the cursor is stuck
 
 
@@ -471,6 +593,87 @@ async def test_scan_passes_series_ticker_when_given():
         client, scan_limit=50, status="open", series_ticker="KXMLBGAME"
     )
     assert client.calls[0][1]["series_ticker"] == "KXMLBGAME"
+
+
+# ── scan_all: full-sweep paging + its budgets ──────────────────────────────
+
+
+def _pages(count: int, *, per_page: int = 2, terminal: bool = True) -> list[dict]:
+    """`count` pages of `per_page` distinct markets, each with a live cursor.
+    The last page's cursor is terminal ("") when `terminal`, so the sweep
+    reports complete; otherwise every page advertises more."""
+    pages = []
+    for p in range(count):
+        markets = [{"ticker": f"M{p}-{i}"} for i in range(per_page)]
+        last = p == count - 1
+        pages.append({"markets": markets, "cursor": "" if (last and terminal) else f"c{p}"})
+    return pages
+
+
+async def test_scan_all_pages_past_scan_limit_to_exhaustion():
+    """The whole point of scan_all: `scan_limit` no longer bounds the sweep,
+    so the ranking input is the full listing, not an arbitrary slice."""
+    client = _FakeClient(responses=_pages(4))
+    scan = await _scan_markets_excluding_mve(client, scan_limit=2, status="open", scan_all=True)
+    # scan_limit=2 would have stopped after one page in windowed mode.
+    assert scan.scanned == 8
+    assert len(client.calls) == 4
+    assert scan.complete is True
+    assert scan.stopped_by is None
+    # Full-sweep pages request Kalshi's max page size, not scan_limit.
+    assert client.calls[0][1]["limit"] == 1000
+
+
+async def test_scan_all_respects_request_budget():
+    """A listing that never terminates must stop at the request cap and say
+    so — an honest `complete: false`, not an unbounded cursor chase."""
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_requests=3
+    )
+    assert len(client.calls) == 3  # the cap is a ceiling, not cap+1
+    assert scan.scanned == 6
+    assert scan.complete is False
+    assert scan.stopped_by == "request_budget"
+
+
+async def test_scan_all_respects_time_budget():
+    """The wall-clock cap is the backstop for a listing that pages forever
+    within the request budget. One page always goes out, then it stops."""
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_seconds=0.0
+    )
+    assert len(client.calls) == 1
+    assert scan.complete is False
+    assert scan.stopped_by == "time_budget"
+
+
+async def test_scan_all_respects_market_cap():
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_markets=5
+    )
+    assert scan.scanned == 5
+    assert scan.complete is False
+    assert scan.stopped_by == "market_cap"
+
+
+async def test_scan_on_page_folds_without_retaining_markets():
+    """`on_page` is what keeps a full sweep from holding every market dict in
+    memory: pages are handed to the fold and NOT accumulated."""
+    seen: list[str] = []
+    client = _FakeClient(responses=_pages(3))
+    scan = await _scan_markets_excluding_mve(
+        client,
+        scan_limit=2,
+        status="open",
+        scan_all=True,
+        on_page=lambda page: seen.extend(m["ticker"] for m in page),
+    )
+    assert scan.markets == []  # nothing retained
+    assert scan.scanned == 6  # but everything counted
+    assert len(seen) == 6  # and everything folded
 
 
 # ── _event_hint (issue #30) ────────────────────────────────────────────────
@@ -551,6 +754,158 @@ async def test_event_hint_ignores_markets_without_ticker():
     client = _FakeClient(responses=[{"markets": [{"no_ticker": "x"}, {"ticker": "EVT-A"}]}])
     hint = await _event_hint(client, "EVT")
     assert "EVT-A" in hint
+
+
+# ── series rollup (kalshi_get_series_summary) ──────────────────────────────
+
+
+def test_series_of_derives_prefix_from_event_ticker():
+    assert _series_of({"event_ticker": "KXMLBGAME-26AUG141910SDCLE"}) == "KXMLBGAME"
+
+
+def test_series_of_falls_back_to_market_ticker():
+    assert _series_of({"ticker": "KXFED-26MAR19-B5.25"}) == "KXFED"
+
+
+def test_series_of_none_when_underivable():
+    assert _series_of({}) is None
+    assert _series_of({"event_ticker": "   "}) is None
+    assert _series_of({"event_ticker": 42}) is None
+
+
+def test_yes_spread_requires_a_two_sided_book():
+    """An empty/one-sided book reports 0.0000 on a side. Treating that as a
+    0.00 spread would rank every dead market as the tightest in its series —
+    exactly backwards, so those must be skipped entirely."""
+    assert _yes_spread({"yes_bid_dollars": "0.4600", "yes_ask_dollars": "0.4800"}) == pytest.approx(
+        0.02
+    )
+    assert _yes_spread({"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}) is None
+    assert _yes_spread({"yes_bid_dollars": "0.0000", "yes_ask_dollars": "1.0000"}) is None
+    assert _yes_spread({"yes_bid_dollars": "0.5000"}) is None  # no ask at all
+    assert _yes_spread({"yes_bid_dollars": "x", "yes_ask_dollars": "0.5"}) is None
+    # Crossed book (ask below bid) is nonsense data, not a negative spread.
+    assert _yes_spread({"yes_bid_dollars": "0.6000", "yes_ask_dollars": "0.5000"}) is None
+
+
+def _series_markets() -> list[dict]:
+    return [
+        {
+            "ticker": "KXA-E1-X",
+            "event_ticker": "KXA-E1",
+            "volume_24h_fp": "100.00",
+            "yes_bid_dollars": "0.4000",
+            "yes_ask_dollars": "0.4500",
+            "close_time": "2026-08-20T00:00:00Z",
+        },
+        {
+            "ticker": "KXA-E1-Y",
+            "event_ticker": "KXA-E1",
+            "volume_24h_fp": "50.00",
+            "yes_bid_dollars": "0.4000",
+            "yes_ask_dollars": "0.4100",  # tighter — becomes the series min
+            "close_time": "2026-08-18T00:00:00Z",  # earlier — becomes soonest
+        },
+        {
+            "ticker": "KXA-E2-X",
+            "event_ticker": "KXA-E2",  # second event in the same series
+            "volume_24h_fp": "5.00",
+            "yes_bid_dollars": "0.0000",  # dead book — must not set min spread
+            "yes_ask_dollars": "0.0000",
+            "close_time": "2026-09-01T00:00:00Z",
+        },
+        {
+            "ticker": "KXB-E1-X",
+            "event_ticker": "KXB-E1",
+            "volume_24h_fp": "1000.00",
+            "yes_bid_dollars": "0.1000",
+            "yes_ask_dollars": "0.9000",
+            "close_time": "2026-12-01T00:00:00Z",
+        },
+    ]
+
+
+def test_fold_series_page_aggregates_across_pages():
+    """The fold must be incremental — two calls with half the markets each
+    must produce exactly what one call with all of them would."""
+    acc: dict = {}
+    markets = _series_markets()
+    _fold_series_page(acc, markets[:2])
+    _fold_series_page(acc, markets[2:])
+
+    assert set(acc) == {"KXA", "KXB"}
+    kxa = acc["KXA"]
+    assert kxa["market_count"] == 3
+    assert kxa["events"] == {"KXA-E1", "KXA-E2"}
+    assert kxa["volume_24h"] == pytest.approx(155.0)
+    assert kxa["min_spread_dollars"] == pytest.approx(0.01)  # not 0.00 from the dead book
+    assert kxa["soonest_close_time"] == "2026-08-18T00:00:00Z"
+
+
+def test_fold_series_page_skips_markets_without_a_derivable_series():
+    acc: dict = {}
+    _fold_series_page(acc, [{"volume_24h_fp": "10"}, {"event_ticker": "KXA-E1"}])
+    assert set(acc) == {"KXA"}
+    assert acc["KXA"]["market_count"] == 1
+
+
+def test_finalize_series_sorts_by_volume_and_caps_at_top():
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    rows = _finalize_series(acc, top=1, sort_by="volume_24h")
+    assert len(rows) == 1
+    assert rows[0]["series_ticker"] == "KXB"  # 1000 > 155
+    assert rows[0]["volume_24h"] == 1000.0
+
+
+def test_finalize_series_sort_modes():
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    by_count = _finalize_series(acc, top=10, sort_by="market_count")
+    assert [r["series_ticker"] for r in by_count] == ["KXA", "KXB"]  # 3 markets vs 1
+    by_close = _finalize_series(acc, top=10, sort_by="soonest_close")
+    assert [r["series_ticker"] for r in by_close] == ["KXA", "KXB"]  # Aug 18 before Dec 1
+
+
+def test_finalize_series_row_shape_is_json_safe():
+    """The accumulator holds a `set` of event tickers; the emitted row must
+    carry a count instead, or the tool result won't serialize."""
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    row = next(
+        r
+        for r in _finalize_series(acc, top=10, sort_by="volume_24h")
+        if r["series_ticker"] == "KXA"
+    )
+    assert row == {
+        "series_ticker": "KXA",
+        "market_count": 3,
+        "event_count": 2,
+        "volume_24h": 155.0,
+        "min_spread_dollars": 0.01,
+        "soonest_close_time": "2026-08-18T00:00:00Z",
+    }
+
+
+def test_finalize_series_null_spread_when_no_two_sided_book():
+    acc: dict = {}
+    _fold_series_page(
+        acc, [{"event_ticker": "KXZ-1", "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}]
+    )
+    assert _finalize_series(acc, top=10, sort_by="volume_24h")[0]["min_spread_dollars"] is None
+
+
+def test_finalize_series_sorts_missing_close_time_last():
+    acc: dict = {}
+    _fold_series_page(
+        acc,
+        [
+            {"event_ticker": "KXNOCLOSE-1"},
+            {"event_ticker": "KXHASCLOSE-1", "close_time": "2026-08-18T00:00:00Z"},
+        ],
+    )
+    rows = _finalize_series(acc, top=10, sort_by="soonest_close")
+    assert [r["series_ticker"] for r in rows] == ["KXHASCLOSE", "KXNOCLOSE"]
 
 
 # ── _single_ticker (issue #30 gate) ────────────────────────────────────────

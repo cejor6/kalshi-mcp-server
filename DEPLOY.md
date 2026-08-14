@@ -883,6 +883,28 @@ Check what's in force any time with the `kalshi_get_environment` tool —
 it shows `safety_limits` (active) alongside `safety_ceilings` (env hard
 max) and a `safety_limits_persist` flag.
 
+**Combo (parlay) creation — a separate gate.** `kalshi_create_combo_market`
+POSTs to Kalshi to materialize a combo market ticker. It places **no order and
+commits no money** (money is only at risk later, through the normal order
+path), so it is deliberately *not* gated on `KALSHI_TRADING_ENABLED` — that
+would block parlay building in exactly the read-only posture you want it in.
+It has its own flag instead:
+
+```bash
+MCP_ALLOW_COMBO_CREATION=0        # default; 1 registers the tool
+MCP_MAX_COMBO_CREATIONS_PER_DAY=100
+```
+
+When the flag is `0` the tool isn't registered at all, so a read-only deploy
+doesn't advertise the capability to the model. When it's `1`, the per-day
+ceiling bounds your draw on **Kalshi's 5000-creations-per-week account
+quota** — a scarce shared resource an agent in a retry loop could otherwise
+burn through. The counter is in-process: it resets at UTC midnight *and* on
+restart, so treat it as a runaway-loop bound, not a durable ledger of the
+weekly quota. `kalshi_get_environment` and the `kalshi://environment` resource
+both report `combo_creation_enabled`, `combo_creations_today`, and
+`max_combo_creations_per_day`.
+
 **Disabling runtime tuning.** Set `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0` to
 drop the `kalshi_set_safety_limits` tool entirely. Limits then change only
 via env var + redeploy. Worth doing on a shared HTTP deploy where every

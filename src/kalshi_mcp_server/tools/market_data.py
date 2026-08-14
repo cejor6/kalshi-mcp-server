@@ -11,12 +11,14 @@ commit).
 
 from __future__ import annotations
 
+import asyncio
 import math
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field
 
-from kalshi_mcp_server.errors import KalshiAPIError
+from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError
+from kalshi_mcp_server.rate_limit import DEFAULT_ENDPOINT_COST
 from kalshi_mcp_server.tools.discovery import _event_hint, _validate_ticker
 
 if TYPE_CHECKING:
@@ -37,6 +39,24 @@ _VALID_PERIOD_INTERVALS: tuple[int, ...] = (1, 60, 1440)
 # "simplify" it or the one-second-over case slips through to an opaque Kalshi
 # 400 (the exact failure this guard exists to prevent).
 _MAX_CANDLESTICK_PERIODS = 5000
+
+# `GET /markets/candlesticks` (the batch form) accepts up to 100 market
+# tickers and returns at most 10,000 candlesticks TOTAL across all of them.
+# That's a different shape of limit from the single-market 5000-per-window
+# cap: here the window cost multiplies by the number of tickers, so a
+# perfectly legal single-market window can blow the batch budget just by
+# adding tickers. Both are checked before the request goes out.
+_MAX_BATCH_CANDLESTICK_TICKERS = 100
+_MAX_BATCH_CANDLESTICKS_TOTAL = 10_000
+
+# Percentiles accepted by the event forecast-percentile-history endpoint, and
+# how many may be requested at once. Values are basis-point-ish: 0-9999, so
+# the median is 5000, not 50.
+_MAX_FORECAST_PERCENTILES = 10
+_FORECAST_PERCENTILE_MAX = 9999
+# That endpoint additionally accepts 0 ("5-second intervals") on top of the
+# usual minute/hour/day widths — the only place in the API where 0 is legal.
+_VALID_FORECAST_INTERVALS: tuple[int, ...] = (0, 1, 60, 1440)
 
 
 def _validate_candlestick_window(start_ts: int, end_ts: int, period_interval: int) -> None:
@@ -85,6 +105,84 @@ def _validate_candlestick_window(start_ts: int, end_ts: int, period_interval: in
         )
 
 
+def _validate_batch_candlestick_window(
+    ticker_count: int, start_ts: int, end_ts: int, period_interval: int
+) -> int:
+    """Pre-flight the BATCH candlestick request. Returns the projected count.
+
+    Runs the single-market guards first (interval set, window ordering,
+    5000-per-market cap), then the batch-only one: candles x tickers must stay
+    under Kalshi's 10,000 total. That last check is the easy one to miss —
+    a 5000-candle window is fine for one market and 5x over budget for three.
+    """
+    _validate_candlestick_window(start_ts, end_ts, period_interval)
+    if ticker_count > _MAX_BATCH_CANDLESTICK_TICKERS:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"Kalshi's batch candlestick endpoint accepts at most "
+                f"{_MAX_BATCH_CANDLESTICK_TICKERS} market tickers, got {ticker_count}. "
+                "Split the request."
+            ),
+        )
+    per_market = math.ceil((end_ts - start_ts) / (period_interval * 60))
+    total = per_market * ticker_count
+    if total > _MAX_BATCH_CANDLESTICKS_TOTAL:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"This request spans ~{per_market} candles x {ticker_count} markets "
+                f"= ~{total}, over Kalshi's {_MAX_BATCH_CANDLESTICKS_TOTAL}-candlestick "
+                "batch cap (the request would 400). Narrow the window, widen "
+                "period_interval (1 -> 60 -> 1440), or split the ticker list. At this "
+                f"window you can request at most "
+                f"{max(1, _MAX_BATCH_CANDLESTICKS_TOTAL // max(per_market, 1))} markets."
+            ),
+        )
+    return total
+
+
+def _validate_forecast_percentiles(percentiles: list[int]) -> list[int]:
+    """Validate the percentile list for the forecast-history endpoint.
+
+    Kalshi takes at most 10 values in 0..9999 — note the scale: the median is
+    5000, not 50. Passing 50 is legal but means the 0.5th percentile, which is
+    a silent wrong answer rather than an error, so the docstring is explicit
+    and this only enforces the hard bounds.
+    """
+    if not percentiles:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                "percentiles must list at least one value in 0..9999 "
+                "(scaled: 5000 is the median, 2500 the first quartile)."
+            ),
+        )
+    if len(percentiles) > _MAX_FORECAST_PERCENTILES:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"At most {_MAX_FORECAST_PERCENTILES} percentiles per request, "
+                f"got {len(percentiles)}."
+            ),
+        )
+    for value in percentiles:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise KalshiAPIError(
+                status=0,
+                message=f"percentiles must be integers, got {value!r}.",
+            )
+        if not 0 <= value <= _FORECAST_PERCENTILE_MAX:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"percentile {value} is outside 0..{_FORECAST_PERCENTILE_MAX}. "
+                    "These are scaled — 5000 is the median, not 50."
+                ),
+            )
+    return percentiles
+
+
 def _book_is_empty(body: dict[str, Any]) -> bool:
     """True if an orderbook response has no resting size on either side.
 
@@ -106,6 +204,61 @@ def _book_is_empty(body: dict[str, Any]) -> bool:
     return not (
         book.get("yes_dollars") or book.get("no_dollars") or book.get("yes") or book.get("no")
     )
+
+
+# ── Batch orderbooks ───────────────────────────────────────────────────────
+#
+# Kalshi's `GET /markets/orderbooks` accepts up to 100 tickers. We cap at 25
+# because the binding constraint here is the CALLER's context, not Kalshi's:
+# 25 books x 2 sides x `depth` levels is already a chunky tool result, and the
+# tool exists to save read budget for scan lenses, not to dump the exchange.
+# Raise this only alongside a smaller default `depth`.
+_MAX_ORDERBOOK_TICKERS = 25
+
+# The batch endpoint has NO `depth` query param (unlike the single-market one,
+# which takes depth 0-100) — confirmed in the API reference. So depth is
+# applied client-side, and it must slice the TAIL: Kalshi returns price levels
+# ASCENDING by price, and both sides are BIDS, so the BEST level is the LAST
+# element. Verified live against prod — a full book's last `yes_dollars` entry
+# equals the market's `yes_bid_dollars`/`yes_bid_size_fp`, and asking the
+# single-market endpoint for depth=3 returns exactly the last 3 entries in the
+# same ascending order. Slicing [:depth] instead of [-depth:] would silently
+# return the WORST levels — i.e. a scan lens would price every market off dust
+# orders. Don't "fix" this.
+_ORDERBOOK_SIDE_KEYS = ("yes_dollars", "no_dollars", "yes", "no")
+
+
+def _truncate_book(book: Any, depth: int) -> dict[str, Any]:
+    """Keep only the best `depth` levels per side of one orderbook container.
+
+    Best = last, since Kalshi orders levels ascending by price and both sides
+    are bids. Unrecognized shapes pass through untouched rather than being
+    dropped — losing data is worse than returning a little extra.
+    """
+    if not isinstance(book, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, levels in book.items():
+        if key in _ORDERBOOK_SIDE_KEYS and isinstance(levels, list):
+            out[key] = levels[-depth:] if depth > 0 else levels
+        else:
+            out[key] = levels
+    return out
+
+
+def _project_orderbook_entry(entry: dict[str, Any], depth: int) -> dict[str, Any]:
+    """Shape one `{ticker, orderbook_fp: {...}}` entry from the batch response."""
+    projected: dict[str, Any] = {"ticker": entry.get("ticker")}
+    for container in ("orderbook_fp", "orderbook"):
+        if container in entry:
+            projected[container] = _truncate_book(entry[container], depth)
+    return projected
+
+
+def _dedupe_tickers(tickers: list[str]) -> list[str]:
+    """Validate, strip, and order-preservingly de-dupe a ticker list."""
+    cleaned = [_validate_ticker(t) for t in tickers]
+    return list(dict.fromkeys(cleaned))
 
 
 def register(server: FastMCP) -> None:
@@ -154,6 +307,175 @@ def register(server: FastMCP) -> None:
             if hint:
                 raise KalshiAPIError(status=0, message=hint)
         return body
+
+    # Keep the emitted tool DESCRIPTION (everything before "Args:") under 1024
+    # chars — OpenAI rejects longer tool descriptions. Per-field detail belongs
+    # in the Args: block, which FastMCP routes to the parameter schema.
+    @server.tool
+    async def kalshi_get_orderbooks(
+        tickers: Annotated[list[str], Field(max_length=_MAX_ORDERBOOK_TICKERS)],
+        depth: Annotated[int, Field(ge=1, le=100)] = 5,
+    ) -> dict[str, Any]:
+        """Fetch orderbooks for up to 25 markets in ONE call.
+
+        The batch form of `kalshi_get_orderbook`. Use it whenever a scan or
+        anomaly lens needs books for a shortlist: one request instead of N
+        keeps the read bucket for the next sweep, and the shallow default
+        depth keeps 25 books inside a normal tool-result budget.
+
+        Errors are isolated per ticker. An unknown or event-level ticker yields
+        an `error` entry for THAT ticker only — the batch still returns every
+        book it could resolve. (A structurally invalid ticker, i.e. empty or
+        blank, is different: it fails the whole call up front, because it means
+        the argument itself is malformed rather than one entry being wrong.)
+
+        Args:
+            tickers: 1-25 MARKET tickers (with outcome suffixes, e.g.
+                "KXFED-26MAR19-B5.25"). Send at most 25 entries — the limit is
+                on the list you pass, duplicates included. (Duplicates are then
+                collapsed, so 25 entries with repeats fetch fewer than 25
+                books; that's fine, just don't pad the list past 25 expecting
+                de-duping to rescue it.) The cap protects your context, not
+                Kalshi — its endpoint allows 100. An EVENT ticker has no single
+                book and comes back as an error entry. An empty or
+                blank-string entry rejects the whole call.
+            depth: Price levels to keep PER SIDE, 1-100. Default 5 — enough
+                for top-of-book plus a few levels of context, which is what a
+                liquidity or anomaly lens actually reads. Raise it only for a
+                handful of tickers; depth x tickers is what drives the response
+                size. Kalshi's batch endpoint has no depth parameter, so this
+                is applied server-side by this MCP after fetching the full
+                books — it saves YOUR context, not Kalshi's bandwidth.
+
+        Returns:
+            `orderbooks`: one entry per requested ticker, in request order.
+                Success entries match `kalshi_get_orderbook`'s shape —
+                `{"ticker": …, "orderbook_fp": {"yes_dollars": [[price, size],
+                …], "no_dollars": […]}}` with each side truncated to the BEST
+                `depth` levels. Failure entries are
+                `{"ticker": …, "error": {"status": …, "message": …}}`.
+            `requested`, `returned`, `errors`: counts, so a caller can assert
+                completeness without walking the list.
+            `depth`, `source`: the applied depth, and whether the data came
+                from Kalshi's batch endpoint ("batch") or the per-ticker
+                fallback ("per_ticker") used when the batch call itself fails.
+
+        Both sides are BIDS, ascending by price — the best level is the LAST
+        one in each list, and a YES bid at X is a NO ask at (1 - X). This
+        matches `kalshi_get_orderbook` exactly; only the batching differs.
+        """
+        if not tickers:
+            raise KalshiAPIError(
+                status=0,
+                message="tickers must contain at least one market ticker.",
+            )
+        cleaned = _dedupe_tickers(tickers)
+        if len(cleaned) > _MAX_ORDERBOOK_TICKERS:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"kalshi_get_orderbooks accepts at most {_MAX_ORDERBOOK_TICKERS} "
+                    f"tickers per call, got {len(cleaned)} (after de-duping). Split the "
+                    "list into batches — the cap bounds the response size, since each "
+                    "book carries up to `depth` levels per side."
+                ),
+            )
+
+        # Kalshi bills batch operations per item, so debit the local limiter
+        # per item too rather than treating this as one cheap read. Clamped to
+        # the read bucket's capacity: `TokenBucket.acquire` REJECTS any cost
+        # above capacity outright (an empty bucket could never satisfy it), and
+        # on the Basic tier 25 items x 10 = 250 already exceeds the 200-token
+        # read budget. Without the clamp every large batch would raise
+        # RateLimitError locally and silently degrade to the per-ticker
+        # fallback — the exact opposite of what this tool is for.
+        cost = min(DEFAULT_ENDPOINT_COST * len(cleaned), client.rate_limiter.read.capacity)
+        by_ticker: dict[str, dict[str, Any]] = {}
+        source = "batch"
+        try:
+            # `tickers` is passed as a LIST, which httpx encodes as repeated
+            # `tickers=A&tickers=B` params. That is deliberate and differs from
+            # the comma-joined `market_tickers` on the batch candlestick tool:
+            # the API reference specs THIS parameter as an array with style
+            # "form, exploded" (max 100 items), and specs that one as a
+            # comma-separated string. They genuinely disagree; don't "unify"
+            # them. If this endpoint ever rejects the exploded form, the
+            # per-ticker fallback below still returns correct books, so the
+            # failure mode is extra reads rather than wrong data.
+            body = await client.get("/markets/orderbooks", params={"tickers": cleaned}, cost=cost)
+        except RateLimitError:
+            # Never answer "you are going too fast" by firing N more requests.
+            raise
+        except KalshiAPIError:
+            # The batch endpoint is all-or-nothing: one malformed ticker can
+            # 400 the whole request. Fall back to per-ticker fetches so a
+            # single bad entry degrades to one error row instead of losing
+            # every book. Costs N reads, but only on this already-failed path.
+            source = "per_ticker"
+            results = await asyncio.gather(
+                *(client.get(f"/markets/{t}/orderbook", params={"depth": depth}) for t in cleaned),
+                return_exceptions=True,
+            )
+            for ticker, result in zip(cleaned, results, strict=True):
+                if isinstance(result, KalshiAPIError):
+                    by_ticker[ticker] = {
+                        "ticker": ticker,
+                        "error": {"status": result.status, "message": result.message},
+                    }
+                elif isinstance(result, BaseException):
+                    # Not a Kalshi API failure (cancellation, a bug) — isolating
+                    # it as a per-ticker "error" row would hide a real problem.
+                    # `from None` drops the batch failure from the chain: it's
+                    # incidental context, not the cause.
+                    raise result from None
+                else:
+                    # Already depth-limited server-side; truncate anyway so the
+                    # two paths return identical shapes regardless of what
+                    # Kalshi honored.
+                    # `ticker` last: it's the one we asked for, so it wins over
+                    # anything the single-market response happens to carry.
+                    by_ticker[ticker] = _project_orderbook_entry(
+                        {**result, "ticker": ticker}, depth
+                    )
+        else:
+            for entry in body.get("orderbooks") or []:
+                if not isinstance(entry, dict):
+                    continue
+                entry_ticker = entry.get("ticker")
+                if isinstance(entry_ticker, str) and entry_ticker:
+                    by_ticker[entry_ticker] = _project_orderbook_entry(entry, depth)
+
+        # Anything requested but absent from the response is reported as an
+        # error row rather than silently dropped — a caller iterating the
+        # result must not mistake a missing book for an empty one.
+        orderbooks: list[dict[str, Any]] = []
+        errors = 0
+        for ticker in cleaned:
+            entry = by_ticker.get(ticker)
+            if entry is None:
+                entry = {
+                    "ticker": ticker,
+                    "error": {
+                        "status": 404,
+                        "message": (
+                            f"Kalshi returned no orderbook for {ticker!r}. Likely an "
+                            "unknown ticker, or an EVENT ticker passed where a MARKET "
+                            "ticker (with its outcome suffix) is required."
+                        ),
+                    },
+                }
+            if "error" in entry:
+                errors += 1
+            orderbooks.append(entry)
+
+        return {
+            "orderbooks": orderbooks,
+            "requested": len(cleaned),
+            "returned": len(orderbooks) - errors,
+            "errors": errors,
+            "depth": depth,
+            "source": source,
+        }
 
     @server.tool
     async def kalshi_get_market_candlesticks(
@@ -243,6 +565,138 @@ def register(server: FastMCP) -> None:
         }
         return await client.get(
             f"/series/{series_ticker}/events/{event_ticker}/candlesticks",
+            params=params,
+        )
+
+    @server.tool
+    async def kalshi_get_batch_candlesticks(
+        market_tickers: Annotated[list[str], Field(max_length=_MAX_BATCH_CANDLESTICK_TICKERS)],
+        start_ts: int,
+        end_ts: int,
+        period_interval: Literal[1, 60, 1440] = 60,
+        include_latest_before_start: bool = False,
+    ) -> dict[str, Any]:
+        """Get OHLC candles for MANY markets in one call (up to 100 tickers).
+
+        The batch form of `kalshi_get_market_candlesticks`, and the right tool
+        for a momentum or trend lens over a shortlist: one request instead of
+        N, and unlike the single-market version it needs no `series_ticker`.
+
+        Watch the budget shape — it is NOT the same as the single-market cap.
+        Kalshi returns at most 10,000 candlesticks TOTAL across all tickers,
+        so the window cost multiplies by ticker count: a 5000-candle window is
+        fine for one market and 5x over budget for three. Validated locally
+        before the request, with a message naming how many markets that window
+        actually affords.
+
+        Args:
+            market_tickers: 1-100 MARKET tickers. The limit is on the list you
+                pass, duplicates included; duplicates are then collapsed before
+                the request goes out.
+            start_ts: Window start, unix seconds. Must be < end_ts.
+            end_ts: Window end, unix seconds.
+            period_interval: Bar width in MINUTES. Kalshi accepts ONLY 1
+                (minute), 60 (hour), or 1440 (day) — any other value 400s.
+                Default 60. Widening this is the cheapest way under the
+                10,000-candle batch cap.
+            include_latest_before_start: Prepend one synthetic candle from
+                before `start_ts`, so a series that didn't trade early in the
+                window still has an opening reference price. Default False.
+
+        Returns `markets`: a list of `{market_ticker, candlesticks: [...]}`.
+        Note this is a KEYED list, unlike `kalshi_get_event_candlesticks`,
+        which returns parallel arrays you have to zip — no zipping needed here.
+        """
+        cleaned = _dedupe_tickers(market_tickers)
+        if not cleaned:
+            raise KalshiAPIError(
+                status=0,
+                message="market_tickers must contain at least one market ticker.",
+            )
+        _validate_batch_candlestick_window(len(cleaned), start_ts, end_ts, period_interval)
+        params: dict[str, Any] = {
+            "market_tickers": ",".join(cleaned),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        if include_latest_before_start:
+            params["include_latest_before_start"] = "true"
+        # Billed per item, clamped to the bucket capacity — see the note on
+        # kalshi_get_orderbooks for why the clamp is load-bearing.
+        cost = min(DEFAULT_ENDPOINT_COST * len(cleaned), client.rate_limiter.read.capacity)
+        return await client.get("/markets/candlesticks", params=params, cost=cost)
+
+    @server.tool
+    async def kalshi_get_event_forecast_history(
+        event_ticker: str,
+        series_ticker: str,
+        start_ts: int,
+        end_ts: int,
+        percentiles: list[int] | None = None,
+        period_interval: Literal[0, 1, 60, 1440] = 60,
+    ) -> dict[str, Any]:
+        """Get an event's market-implied FORECAST DISTRIBUTION over time.
+
+        For scalar / range events — temperature, CPI, index levels, anything
+        whose markets are strike buckets — this collapses the whole strike
+        ladder into a distribution and gives you its percentiles per period.
+        That is a genuinely different signal from prices or candles: it tells
+        you where the market thinks the NUMBER lands, and how that belief has
+        moved, without reconstructing it from a dozen bucket markets yourself.
+
+        Only meaningful for events with a numeric outcome. A binary
+        win/lose event has no distribution to report.
+
+        Args:
+            event_ticker: The event, e.g. "KXHIGHNY-26AUG14".
+            series_ticker: The series it belongs to (the endpoint is scoped
+                by series, same as the candlestick endpoints).
+            start_ts: Window start, unix seconds. Must be < end_ts.
+            end_ts: Window end, unix seconds.
+            percentiles: Up to 10 values, each 0-9999. NOTE THE SCALE — these
+                are not 0-100. The median is 5000, the quartiles are 2500 and
+                7500, and passing 50 silently means the 0.5th percentile
+                rather than the median. Defaults to
+                [1000, 2500, 5000, 7500, 9000] (a decile/quartile spread).
+            period_interval: Period length in MINUTES. Accepts 0 (5-SECOND
+                intervals — the only endpoint where 0 is legal), 1, 60, or
+                1440. Default 60. Use 0 only for a very short window; it is
+                by far the highest-volume option.
+
+        Returns `forecast_history`: per period, an `end_period_ts` plus
+        `percentile_points` giving each requested percentile's raw, numeric,
+        and formatted forecast value.
+        """
+        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
+        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        if period_interval not in _VALID_FORECAST_INTERVALS:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    "period_interval must be 0 (5-second), 1 (minute), 60 (hour) or "
+                    f"1440 (day) for forecast history; got {period_interval!r}."
+                ),
+            )
+        if end_ts <= start_ts:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"end_ts ({end_ts}) must be greater than start_ts ({start_ts}); "
+                    "both are unix seconds."
+                ),
+            )
+        wanted = _validate_forecast_percentiles(
+            list(percentiles) if percentiles else [1000, 2500, 5000, 7500, 9000]
+        )
+        params: dict[str, Any] = {
+            "percentiles": wanted,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        return await client.get(
+            f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
             params=params,
         )
 

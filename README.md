@@ -345,8 +345,9 @@ the worked example.
 | Group | Tools |
 |---|---|
 | Exchange / account | `kalshi_get_exchange_status`, `kalshi_get_exchange_schedule`, `kalshi_get_api_limits`, `kalshi_get_environment`, `kalshi_set_safety_limits` |
-| Discovery | `kalshi_get_markets`, `kalshi_find_liquid_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_trades` |
-| Market data | `kalshi_get_orderbook`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_market_trades` |
+| Discovery | `kalshi_get_markets`, `kalshi_find_liquid_markets`, `kalshi_get_market`, `kalshi_get_event`, `kalshi_get_events`, `kalshi_get_series`, `kalshi_get_series_list`, `kalshi_get_series_summary`, `kalshi_get_milestones`, `kalshi_get_trades` |
+| Market data | `kalshi_get_orderbook`, `kalshi_get_orderbooks`, `kalshi_get_market_candlesticks`, `kalshi_get_event_candlesticks`, `kalshi_get_batch_candlesticks`, `kalshi_get_event_forecast_history`, `kalshi_get_market_trades` |
+| Combos / parlays | `kalshi_get_combo_collections`, `kalshi_get_combo_collection`, `kalshi_get_combo_events`, `kalshi_get_combo_legs`, `kalshi_create_combo_market` (write — off by default, see below) |
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
 | Live (WebSocket) | `kalshi_get_live_orderbook`, `kalshi_sample_trades` |
@@ -379,7 +380,68 @@ multivariate (`KXMVE…`) combo markets with empty/one-sided books. Pass
 use `kalshi_find_liquid_markets` — it excludes combos, ranks by 24h volume,
 and returns a short minimal-projection shortlist. (Kalshi has no server-side
 sort, so the helper's ranking is over a bounded scan window, reported as
-`scanned` in the result.)
+`scanned` in the result.) Pass `scan_all=true` to sweep the FULL open listing
+before ranking — that turns the shortlist into a genuine exchange-wide top-N
+rather than the top of an arbitrary slice. The sweep is bounded by internal
+request / wall-clock / market caps, and the result reports `complete` plus
+`stopped_by` so a partial scan is never mistaken for an exhaustive one.
+
+**Scanning wide without burning context:** three tools exist for
+scan/anomaly workloads that would otherwise cost one call per market.
+
+- `kalshi_get_orderbooks(tickers=[…], depth=5)` fetches up to 25 books in
+  one request, with per-ticker error isolation — a bad or event-level
+  ticker becomes an `error` entry for that ticker instead of failing the
+  batch. Kalshi's batch endpoint has no `depth` parameter, so depth is
+  applied server-side by this MCP; it keeps the *best* levels (Kalshi
+  returns levels ascending by price and both sides are bids).
+- `kalshi_get_series_summary()` rolls the whole listing up to one row per
+  series (market count, event count, 24h volume, tightest spread, soonest
+  close). Cheap in context, not free in reads — it's the daily "new supply
+  census" that spots a new event class listing without paging thousands of
+  markets. Note `series_ticker` is *derived* from the ticker prefix: Kalshi
+  does not return it on market objects.
+- `kalshi_get_batch_candlesticks(market_tickers=[…])` fetches OHLC bars for
+  up to 100 markets in one request — a momentum lens over a whole shortlist.
+  Its budget shape differs from the single-market tool: Kalshi returns at
+  most 10,000 candles *total across all tickers*, so window cost multiplies
+  by ticker count. Validated locally, with a message naming how many markets
+  the requested window actually affords.
+
+**Combos / parlays.** The multivariate surface lives in its own module:
+
+- `kalshi_get_combo_collections` / `kalshi_get_combo_collection` — the parlay
+  *families* on offer and the rules each imposes (`size_min` / `size_max`
+  legs, `is_all_yes`, the eligible-event universe).
+- `kalshi_get_combo_events` — combos already listed against a collection, i.e.
+  live parlay supply. Defaults `minimal=True` for nested markets, because
+  combo markets are the largest objects Kalshi returns.
+- `kalshi_get_combo_legs(ticker)` resolves a `KXMVE…` combo into its
+  underlying legs (market ticker, side, title) from `mve_selected_legs` —
+  strictly better than splitting the combo's title string on commas, which
+  drops the leg tickers and mis-splits on titles that contain a comma. If
+  Kalshi published no leg breakdown, it returns a structured
+  `resolvable: false` rather than guessing. The `legs` it returns feed
+  straight back into the create tool, so you can round-trip an existing combo
+  and vary one leg.
+- `kalshi_create_combo_market` — **write.** Materializes a combo market
+  ticker for a chosen leg set. It places no order and commits no money, so it
+  has its own gate rather than riding on `KALSHI_TRADING_ENABLED`: set
+  `MCP_ALLOW_COMBO_CREATION=1` to register it at all (default off, and when
+  off the tool isn't advertised to the model). Kalshi allows 5000 creations
+  per **week** per account, so the server also enforces
+  `MCP_MAX_COMBO_CREATIONS_PER_DAY` (default 100, in-process, resets at UTC
+  midnight and on restart) to stop a retry loop burning the weekly quota.
+  Before the POST it pre-flights your leg set against the collection's own
+  `size_min`/`size_max`/`is_all_yes` rules, which Kalshi otherwise rejects
+  with an opaque 400; that check fails open if the collection can't be read.
+
+Two env vars come with the combo write surface — add them to your `.env`:
+
+```bash
+MCP_ALLOW_COMBO_CREATION=0        # 1 registers kalshi_create_combo_market
+MCP_MAX_COMBO_CREATIONS_PER_DAY=100
+```
 
 **Event ticker vs market ticker:** a *market* ticker carries an outcome
 suffix (`…PITHOU-HOU`); an *event* ticker (`…PITHOU`) does not. Passing an

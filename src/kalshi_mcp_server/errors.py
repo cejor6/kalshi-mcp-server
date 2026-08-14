@@ -48,3 +48,14 @@ class SafetyError(KalshiMCPError):
 
 class TradingDisabledError(SafetyError):
     """Raised when a write tool is invoked but KALSHI_TRADING_ENABLED != 1."""
+
+
+class ComboCreationDisabledError(SafetyError):
+    """Raised when combo-market creation is invoked but MCP_ALLOW_COMBO_CREATION != 1.
+
+    Deliberately separate from `TradingDisabledError`: creating a market in a
+    multivariate event collection commits no money — it only materializes a
+    ticker — so it has its own gate rather than riding on the trading flag. A
+    read-only scout can be allowed to build parlays without also being allowed
+    to place orders.
+    """
