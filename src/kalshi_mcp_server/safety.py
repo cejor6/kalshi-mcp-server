@@ -140,6 +140,21 @@ class _DailyCounter:
             self.cost_usd = 0.0
 
     def add(self, cost_usd: float) -> float:
+        """Add to today's total. `cost_usd` must be non-negative.
+
+        Rejecting negatives is structural, not pedantic: `add(-1)` is how a
+        decrement gets written by accident, and every such decrement is a
+        latent day-roll bug (see `subtract`). Making the only downward path
+        `subtract` means a future caller cannot reintroduce one — this already
+        happened twice, once in `release_combo_creation` and once in
+        `reserve_combo_creation`'s rollback.
+        """
+        if cost_usd < 0:
+            raise ValueError(
+                f"_DailyCounter.add takes a non-negative amount, got {cost_usd}. "
+                "Use subtract() to give budget back — it clamps at zero and is "
+                "atomic with the UTC day roll."
+            )
         with self._lock:
             self._maybe_roll()
             self.cost_usd += cost_usd
@@ -148,10 +163,12 @@ class _DailyCounter:
     def subtract(self, amount: float) -> float:
         """Give back `amount`, clamped at zero, atomically with the day roll.
 
-        Must NOT be expressed as `peek()` then `add(-amount)`: those take the
-        lock separately, so a UTC-midnight rollover landing between them rolls
-        the counter to 0 and then applies the decrement, leaving the NEW day at
-        -1 and silently widening that day's ceiling by one.
+        The ONLY downward path. Must NOT be expressed as `peek()` then
+        `add(-amount)`, nor as a bare `add(-amount)`: those take the lock
+        separately from (or without) the roll check, so a UTC-midnight rollover
+        landing in between rolls the counter to 0 and then applies the
+        decrement, leaving the NEW day at -1 and silently widening that day's
+        ceiling by one.
         """
         with self._lock:
             self._maybe_roll()
@@ -485,7 +502,9 @@ class SafetyController:
         used_after = self._combo_creations.add(1.0)
         if used_after > ceiling:
             # Over the line — hand the slot straight back, then refuse.
-            self._combo_creations.add(-1.0)
+            # `subtract`, not `add(-1)`: the decrement has to be atomic with
+            # the day roll or a midnight rollover here leaves the new day at -1.
+            self._combo_creations.subtract(1.0)
             raise SafetyError(
                 f"Refusing to create another combo market: {int(used_after) - 1} created "
                 f"today, at the per-day ceiling of {ceiling}. Kalshi allows 5000 per "

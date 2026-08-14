@@ -23,7 +23,12 @@ from fastmcp import FastMCP
 from kalshi_mcp_server.auth import KalshiSigner
 from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
-from kalshi_mcp_server.errors import ComboCreationDisabledError, KalshiAPIError, SafetyError
+from kalshi_mcp_server.errors import (
+    ComboCreationDisabledError,
+    KalshiAPIError,
+    RateLimitError,
+    SafetyError,
+)
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import SafetyController, _DailyCounter
 from kalshi_mcp_server.tools import multivariate
@@ -941,6 +946,35 @@ def test_release_combo_creation_never_goes_negative():
     assert safety.combo_creation_view()["combo_creations_today"] == 0
 
 
+def test_daily_counter_rejects_negative_add():
+    """Structural guard: `add(-1)` is how a decrement gets written by accident,
+    and every such decrement is a latent day-roll bug. This has been
+    reintroduced twice — once in release, once in reserve's rollback — so the
+    only downward path is `subtract`."""
+    counter = _DailyCounter()
+    with pytest.raises(ValueError) as exc:
+        counter.add(-1.0)
+    assert "subtract()" in str(exc.value)
+
+
+def test_reserve_rollback_survives_a_day_roll():
+    """REGRESSION (round 3): reserve's over-ceiling rollback used `add(-1.0)` —
+    the same two-lock-acquisition pattern `subtract` was introduced to fix, in
+    the very commit that introduced it. A midnight roll between the add and the
+    rollback left the NEW day at -1, widening its ceiling by one."""
+    safety = SafetyController(
+        _make_config(combo_creation_enabled=True, max_combo_creations_per_day=1)
+    )
+    safety.reserve_combo_creation()
+    with pytest.raises(SafetyError):
+        safety.reserve_combo_creation()  # rolls back internally
+    # Force the roll that used to corrupt the count, then confirm it's sane.
+    safety._combo_creations.day = "1999-01-01"
+    assert safety.combo_creation_view()["combo_creations_today"] == 0
+    safety.reserve_combo_creation()
+    assert safety.combo_creation_view()["combo_creations_today"] == 1
+
+
 def test_daily_counter_subtract_is_atomic_with_the_day_roll():
     """REGRESSION (round 2): release was `peek()` then `add(-1)`, two separate
     lock acquisitions. A UTC-midnight rollover landing between them rolled the
@@ -956,13 +990,12 @@ def test_daily_counter_subtract_is_atomic_with_the_day_roll():
 
 
 @pytest.mark.asyncio
-async def test_create_combo_market_releases_the_slot_when_the_post_never_went_out(
+async def test_create_combo_market_keeps_the_slot_when_the_post_was_dispatched(
     rsa_private_key,
 ):
-    """REGRESSION (round 2): a transport failure before the POST is provably
-    'nothing created'. Keeping the slot meant a Kalshi outage (or an MCP client
-    timing the call out) silently drained the whole day's creation budget with
-    zero combos made, recoverable only by restart or UTC midnight."""
+    """A transport failure ON the POST is ambiguous — the request went out and
+    Kalshi may have created the combo — so the slot stays spent. This is the
+    conservative half of the invariant: spend a slot iff a combo MAY exist."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -972,11 +1005,27 @@ async def test_create_combo_market_releases_the_slot_when_the_post_never_went_ou
     server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
     fn = await _tool_fn(server, "kalshi_create_combo_market")
 
-    # A transport error surfaces as KalshiAPIError(status=0) — ambiguous once
-    # the POST is in flight, so this one legitimately keeps the slot.
     with pytest.raises(KalshiAPIError):
         await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
     assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 1
+
+
+@pytest.mark.asyncio
+async def test_create_combo_market_releases_the_slot_on_a_rate_limit(rsa_private_key):
+    """A 429 (or a local bucket refusal) is provably 'nothing created', so it
+    must not cost budget — otherwise one throttle punishes the caller twice."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(429, json={"error": {"message": "slow down"}})
+        return httpx.Response(200, json={"multivariate_contract": {"size_min": 1}})
+
+    server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    with pytest.raises(RateLimitError):
+        await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 0
 
 
 @pytest.mark.asyncio
