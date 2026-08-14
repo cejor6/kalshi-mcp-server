@@ -89,6 +89,11 @@ def _enum_of(prop: dict) -> list | None:
         ("kalshi_prepare_order", "order_type", ["limit", "market"]),
         ("kalshi_get_positions", "settlement_status", ["all", "settled", "unsettled"]),
         ("kalshi_get_markets", "mve_filter", ["exclude", "only"]),
+        (
+            "kalshi_get_series_summary",
+            "sort_by",
+            ["volume_24h", "market_count", "soonest_close"],
+        ),
         ("kalshi_get_market_candlesticks", "period_interval", [1, 60, 1440]),
         ("kalshi_get_event_candlesticks", "period_interval", [1, 60, 1440]),
     ],
@@ -117,6 +122,11 @@ async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
         ("kalshi_get_settlements", "limit", 1, 1000),
         ("kalshi_prepare_order", "limit_price_cents", 1, 99),
         ("kalshi_fetch_external_data", "max_bytes", 1_000, 500_000),
+        # Batch orderbook depth is applied client-side (Kalshi's batch
+        # endpoint has no depth param), so the schema bound is the only
+        # steering the model gets — the runtime slice is what enforces it.
+        ("kalshi_get_orderbooks", "depth", 1, 100),
+        ("kalshi_get_series_summary", "top", 1, 200),
     ],
 )
 async def test_range_constraint_in_schema(rsa_private_key, tool, prop, lo, hi):
@@ -124,6 +134,30 @@ async def test_range_constraint_in_schema(rsa_private_key, tool, prop, lo, hi):
     p = await _prop(server, tool, prop)
     assert p["minimum"] == lo
     assert p["maximum"] == hi
+
+
+# ── emitted description length ─────────────────────────────────────────────
+
+# OpenAI rejects tool descriptions longer than this, so a docstring that grows
+# past it breaks the server for those clients — silently, and only for them.
+# FastMCP emits everything BEFORE the "Args:" block as the description and
+# routes the rest to the parameter schema, so the fix is always "move detail
+# into Args:", never "delete the gotchas".
+_MAX_TOOL_DESCRIPTION_CHARS = 1024
+
+
+@pytest.mark.asyncio
+async def test_tool_descriptions_stay_under_the_openai_cap(rsa_private_key):
+    server = _make_server(rsa_private_key)
+    oversized = {
+        tool.name: len(tool.description or "")
+        for tool in await server.list_tools()
+        if len(tool.description or "") > _MAX_TOOL_DESCRIPTION_CHARS
+    }
+    assert not oversized, (
+        f"Tool descriptions over {_MAX_TOOL_DESCRIPTION_CHARS} chars: {oversized}. "
+        "Move per-parameter detail into the docstring's Args: block."
+    )
 
 
 # ── lower-bound-only constraints ───────────────────────────────────────────

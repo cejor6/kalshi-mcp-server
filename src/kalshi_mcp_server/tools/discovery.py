@@ -27,6 +27,8 @@ to stay under an LLM tool-result token cap even for combo markets.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field
@@ -235,34 +237,107 @@ def _rank_liquid_markets(
     return [_minimal_market(m) for m in eligible[:limit]]
 
 
+# ── Listing pager (shared by find_liquid_markets and get_series_summary) ────
+#
+# Budgets for the opt-in `scan_all` full sweep. Without a hard wall the pager
+# would follow Kalshi's cursor indefinitely — a stuck-but-advancing cursor, or
+# simply an exchange with far more open markets than we expect, would hang the
+# tool call until the MCP client times out with nothing to show for it. Every
+# sweep is bounded by ALL THREE of these; whichever binds first stops the scan
+# and is reported back as `stopped_by`, so `complete` is never a guess.
+#
+# Sizing (Aug 2026): the open, non-combo listing is a few thousand markets, so
+# a full sweep is ~5-10 pages. 30 pages x 1000/page = 30k markets of headroom
+# — generous now, and the wall-clock cap is the real backstop if that changes.
+_SCAN_PAGE_SIZE = 1000  # Kalshi's max `limit` on GET /markets
+_SCAN_ALL_MAX_REQUESTS = 30
+_SCAN_ALL_MAX_SECONDS = 25.0
+_SCAN_ALL_MAX_MARKETS = 30_000
+
+
+@dataclass
+class _ScanResult:
+    """Outcome of a listing sweep.
+
+    `complete` is the honest answer to "did this cover every matching
+    market?" — True only when the pager reached the end of the listing.
+    `stopped_by` names the wall that bound first when it didn't:
+    "scan_limit" (the caller's window filled), "request_budget",
+    "time_budget", or "market_cap". It is None when `complete` is True.
+
+    `scanned` counts every distinct market the sweep saw, which is NOT
+    `len(markets)` when an `on_page` fold was used (the pager then retains
+    nothing).
+    """
+
+    markets: list[dict[str, Any]] = field(default_factory=list)
+    complete: bool = False
+    scanned: int = 0
+    requests: int = 0
+    stopped_by: str | None = None
+
+
 async def _scan_markets_excluding_mve(
     client: Any,
     *,
     scan_limit: int,
     status: str,
     series_ticker: str | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Page the markets listing with combos excluded, collecting up to
-    `scan_limit` markets. De-dupes by ticker and caps the result at
-    `scan_limit`. `scan_limit` is clamped to [1, 1000] to bound read-bucket
-    cost.
+    scan_all: bool = False,
+    max_requests: int | None = None,
+    max_seconds: float | None = None,
+    max_markets: int | None = None,
+    on_page: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> _ScanResult:
+    """Page `GET /markets` with combos excluded server-side (`mve_filter=exclude`).
 
-    Returns `(markets, exhausted)`. `exhausted` is True when the scan reached
-    the end of all matching markets — an empty page, a terminal cursor (""),
-    or a non-advancing cursor (Kalshi's known quirk of returning the same
-    cursor forever). It is False when the scan stopped because the window
-    filled (`scan_limit` reached) while more markets remained — i.e. the
-    caller is seeing a windowed subset, not the full set.
+    Two modes:
+
+    * **Windowed** (`scan_all=False`, the default): collect up to `scan_limit`
+      markets, clamped to [1, 1000] to bound read-bucket cost. This is the
+      historical behavior and it is unchanged.
+    * **Full sweep** (`scan_all=True`): ignore `scan_limit` and follow the
+      cursor to the end of the listing, bounded by `max_requests`,
+      `max_seconds`, and `max_markets`.
+
+    De-dupes by ticker, so a non-advancing cursor (a known Kalshi quirk —
+    the same cursor returned forever) can neither pad the result with repeats
+    nor spin the loop. The scan is considered complete on an empty page, a
+    terminal cursor (""), or a cursor already followed; all three mean the
+    listing is exhausted.
+
+    Pass `on_page` to fold each page incrementally instead of retaining it —
+    `_ScanResult.markets` is then left empty and only `scanned` grows. That is
+    what keeps a 30k-market sweep from holding ~60MB of parsed market dicts in
+    memory just to compute per-series totals.
+
+    The three budgets default to the module constants, resolved HERE rather
+    than in the signature so the constants stay a live knob — a default bound
+    at def-time would ignore any later override (and silently no-op a test's
+    monkeypatch, which is how this was caught).
     """
-    scan_limit = max(1, min(scan_limit, 1000))
-    collected: list[dict[str, Any]] = []
+    max_requests = _SCAN_ALL_MAX_REQUESTS if max_requests is None else max_requests
+    max_seconds = _SCAN_ALL_MAX_SECONDS if max_seconds is None else max_seconds
+    max_markets = _SCAN_ALL_MAX_MARKETS if max_markets is None else max_markets
+    target = max_markets if scan_all else max(1, min(scan_limit, 1000))
+    started = time.monotonic()
+    result = _ScanResult()
     seen_tickers: set[str] = set()
     seen_cursors: set[str] = set()
     cursor: str | None = None
-    exhausted = False
-    while len(collected) < scan_limit:
+
+    while result.scanned < target:
+        # Budget checks happen BEFORE the request, so the caps are ceilings on
+        # what we spend, not on what we spend plus one more page.
+        if result.requests >= max_requests:
+            result.stopped_by = "request_budget"
+            return result
+        if result.requests and (time.monotonic() - started) >= max_seconds:
+            result.stopped_by = "time_budget"
+            return result
+
         params: dict[str, Any] = {
-            "limit": min(1000, scan_limit - len(collected)),
+            "limit": min(_SCAN_PAGE_SIZE, target - result.scanned),
             "status": status,
             "mve_filter": "exclude",
         }
@@ -271,27 +346,255 @@ async def _scan_markets_excluding_mve(
         if series_ticker:
             params["series_ticker"] = series_ticker
         body = await client.get("/markets", params=params)
+        result.requests += 1
+
         page = body.get("markets") or []
+        fresh: list[dict[str, Any]] = []
         for market in page:
             ticker = market.get("ticker")
-            # De-dupe by ticker so a non-advancing cursor can't pad the list
-            # with repeats. Markets without a ticker (shouldn't happen) are
-            # kept as-is rather than collapsed into one.
+            # Markets without a ticker (shouldn't happen) are kept as-is
+            # rather than collapsed into one.
             if ticker is not None and ticker in seen_tickers:
                 continue
             if ticker is not None:
                 seen_tickers.add(ticker)
-            collected.append(market)
-            if len(collected) >= scan_limit:
+            fresh.append(market)
+            result.scanned += 1
+            if result.scanned >= target:
                 break
+        if on_page is not None:
+            if fresh:
+                on_page(fresh)
+        else:
+            result.markets.extend(fresh)
+
         cursor = body.get("cursor")
-        # Stop on empty page, terminal cursor (""), or a cursor we've already
-        # followed (no forward progress) — all mean no more markets exist.
         if not page or not cursor or cursor in seen_cursors:
-            exhausted = True
-            break
+            result.complete = True
+            return result
         seen_cursors.add(cursor)
-    return collected[:scan_limit], exhausted
+
+    # Fell out of the loop with the target filled and a live cursor left over
+    # — more matching markets exist beyond what we looked at.
+    result.stopped_by = "market_cap" if scan_all else "scan_limit"
+    return result
+
+
+# ── Multivariate (combo) leg resolution ────────────────────────────────────
+#
+# A `KXMVE…` combo market carries its legs in TWO places, both on the market
+# object itself. Note what is NOT the source: `/multivariate_event_collections
+# /{collection_ticker}` describes the collection (the *universe* of events a
+# combo may be built from, plus `size_min`/`size_max`/`is_all_yes`), not which
+# legs a specific auto-generated combo actually selected. Resolving legs from
+# the collection endpoint is impossible for that reason — the per-market
+# fields below are the only authoritative source, and the collection lookup is
+# offered separately as context.
+#
+#  1. `mve_selected_legs` — structured and authoritative:
+#     [{"event_ticker": …, "market_ticker": …, "side": "yes"|"no"}, …]
+#  2. `custom_strike` — the same data as three PARALLEL comma-separated
+#     strings ("Associated Markets" / "Associated Market Sides" /
+#     "Associated Events"), used as a fallback when (1) is absent.
+#
+# Neither carries a human-readable leg title, which is why callers have been
+# splitting the combo's own `title`/`yes_sub_title` on commas — lossy, because
+# a leg's own title may contain a comma. Titles come from a single batched
+# `GET /markets?tickers=…` over the leg market tickers instead.
+_CUSTOM_STRIKE_MARKETS_KEY = "Associated Markets"
+_CUSTOM_STRIKE_SIDES_KEY = "Associated Market Sides"
+_CUSTOM_STRIKE_EVENTS_KEY = "Associated Events"
+
+# Hard cap on how many legs we'll enrich with titles in one call. Kalshi's
+# combos run to ~10 legs; this only exists so a pathological market can't turn
+# one tool call into a huge `tickers=` query string.
+_MAX_COMBO_LEGS = 100
+
+
+def _legs_from_selected(market: dict[str, Any]) -> list[dict[str, Any]]:
+    """Legs from the structured `mve_selected_legs` field (preferred)."""
+    raw = market.get("mve_selected_legs")
+    if not isinstance(raw, list):
+        return []
+    legs: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        market_ticker = entry.get("market_ticker")
+        if not isinstance(market_ticker, str) or not market_ticker.strip():
+            continue
+        legs.append(
+            {
+                "market_ticker": market_ticker.strip(),
+                "event_ticker": entry.get("event_ticker"),
+                "side": entry.get("side"),
+            }
+        )
+    return legs
+
+
+def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
+    """Legs from the three parallel CSV strings in `custom_strike` (fallback).
+
+    Parallel-array data with no key linking the columns, so a length mismatch
+    between markets and sides means we cannot say which side goes with which
+    leg. Rather than guess (the whole point of this tool), drop `side` to None
+    on mismatch and keep the tickers, which are still unambiguous.
+    """
+    strike = market.get("custom_strike")
+    if not isinstance(strike, dict):
+        return []
+    tickers = _parse_fields(str(strike.get(_CUSTOM_STRIKE_MARKETS_KEY) or ""))
+    if not tickers:
+        return []
+    sides = _parse_fields(str(strike.get(_CUSTOM_STRIKE_SIDES_KEY) or ""))
+    events = _parse_fields(str(strike.get(_CUSTOM_STRIKE_EVENTS_KEY) or ""))
+    aligned_sides = len(sides) == len(tickers)
+    aligned_events = len(events) == len(tickers)
+    return [
+        {
+            "market_ticker": ticker,
+            "event_ticker": events[i] if aligned_events else None,
+            "side": sides[i] if aligned_sides else None,
+        }
+        for i, ticker in enumerate(tickers)
+    ]
+
+
+def _resolve_combo_legs(market: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """Return `(legs, source)` for a combo market, `([], None)` if unresolvable.
+
+    `source` is "mve_selected_legs" or "custom_strike" so a caller can tell
+    whether it got the structured field or the parsed-CSV fallback.
+    """
+    legs = _legs_from_selected(market)
+    if legs:
+        return legs, "mve_selected_legs"
+    legs = _legs_from_custom_strike(market)
+    if legs:
+        return legs, "custom_strike"
+    return [], None
+
+
+# ── Series-level rollup (kalshi_get_series_summary) ─────────────────────────
+#
+# Kalshi does NOT return `series_ticker` on a market object (confirmed against
+# both the API reference and a live prod response) — it exists only as a
+# *query filter*. So the series is derived from the ticker prefix, relying on
+# Kalshi's `SERIES-EVENTSUFFIX-OUTCOME` convention: the event ticker
+# "KXMLBGAME-26AUG141910SDCLE" belongs to series "KXMLBGAME". This is a
+# convention, not a contract — the tool says so in its docstring rather than
+# presenting derived series as authoritative.
+
+
+def _series_of(market: dict[str, Any]) -> str | None:
+    """Derive a market's series ticker from its event/market ticker prefix."""
+    for key in ("event_ticker", "ticker"):
+        value = market.get(key)
+        if isinstance(value, str) and value.strip():
+            head = value.strip().split("-", 1)[0]
+            if head:
+                return head
+    return None
+
+
+def _dollars(market: dict[str, Any], key: str) -> float | None:
+    """Best-effort parse of one of Kalshi's `*_dollars` string prices."""
+    try:
+        return float(market[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _yes_spread(market: dict[str, Any]) -> float | None:
+    """YES-side bid/ask spread in dollars, or None if the book isn't two-sided.
+
+    Both sides must be strictly positive: Kalshi reports an empty or one-sided
+    book as `0.0000`, and treating that as a 0.00 spread would make every dead
+    market look like the tightest one in its series — exactly backwards.
+    """
+    bid = _dollars(market, "yes_bid_dollars")
+    ask = _dollars(market, "yes_ask_dollars")
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    return ask - bid
+
+
+def _fold_series_page(acc: dict[str, dict[str, Any]], markets: list[dict[str, Any]]) -> None:
+    """Fold one page of markets into the running per-series accumulator.
+
+    Called as the pager's `on_page` hook so a full-exchange sweep never
+    retains the raw markets — only this one small row per series.
+    """
+    for market in markets:
+        series = _series_of(market)
+        if series is None:
+            continue
+        row = acc.get(series)
+        if row is None:
+            row = acc[series] = {
+                "series_ticker": series,
+                "market_count": 0,
+                "events": set(),
+                "volume_24h": 0.0,
+                "min_spread_dollars": None,
+                "soonest_close_time": None,
+            }
+        row["market_count"] += 1
+        row["volume_24h"] += _volume_24h(market)
+
+        event_ticker = market.get("event_ticker")
+        if isinstance(event_ticker, str) and event_ticker:
+            row["events"].add(event_ticker)
+
+        spread = _yes_spread(market)
+        if spread is not None:
+            current = row["min_spread_dollars"]
+            if current is None or spread < current:
+                row["min_spread_dollars"] = spread
+
+        close_time = market.get("close_time")
+        if isinstance(close_time, str) and close_time:
+            # Kalshi's close_time is whole-second RFC3339 in UTC ("…:00Z"), so
+            # a lexicographic min is a chronological min — no parsing needed.
+            current_close = row["soonest_close_time"]
+            if current_close is None or close_time < current_close:
+                row["soonest_close_time"] = close_time
+
+
+_SERIES_SORT_KEYS: dict[str, Callable[[dict[str, Any]], Any]] = {
+    # Descending sorts negate; "soonest_close" is the one ascending sort, and
+    # series with no close_time sort last rather than crashing the comparison.
+    "volume_24h": lambda row: -row["volume_24h"],
+    "market_count": lambda row: -row["market_count"],
+    "soonest_close": lambda row: (
+        row["soonest_close_time"] is None,
+        row["soonest_close_time"] or "",
+    ),
+}
+
+
+def _finalize_series(
+    acc: dict[str, dict[str, Any]], *, top: int, sort_by: str
+) -> list[dict[str, Any]]:
+    """Sort the accumulator, take the top `top`, and make each row JSON-safe."""
+    rows = sorted(acc.values(), key=_SERIES_SORT_KEYS[sort_by])
+    out: list[dict[str, Any]] = []
+    for row in rows[:top]:
+        spread = row["min_spread_dollars"]
+        out.append(
+            {
+                "series_ticker": row["series_ticker"],
+                "market_count": row["market_count"],
+                "event_count": len(row["events"]),
+                # Round to cents: these are summed float parses of Kalshi's
+                # string decimals, so the raw value carries binary-float noise.
+                "volume_24h": round(row["volume_24h"], 2),
+                "min_spread_dollars": None if spread is None else round(spread, 4),
+                "soonest_close_time": row["soonest_close_time"],
+            }
+        )
+    return out
 
 
 # Negative cache for `_event_hint`: ticker -> monotonic time we last confirmed
@@ -480,6 +783,7 @@ def register(server: FastMCP) -> None:
         status: str = "open",
         series_ticker: str | None = None,
         min_volume: Annotated[float, Field(ge=0)] = 0.0,
+        scan_all: bool = False,
     ) -> dict[str, Any]:
         """Find the most liquid SINGLE (non-combo) markets, ranked by 24h volume.
 
@@ -490,12 +794,18 @@ def register(server: FastMCP) -> None:
         ranks the result by 24h volume locally, and returns a short
         minimal-projection shortlist — the page an agent actually wants.
 
+        By default the ranking covers a WINDOW (`scan_limit` markets), not the
+        whole exchange. Pass `scan_all=True` for a true exchange-wide ranking.
+
         Args:
             limit: Size of the returned shortlist (top-N by volume). Default 20.
+                The shortlist stays minimal-projected at any `scan_limit`, so
+                a full sweep costs read budget, not context.
             scan_limit: How many markets to fetch+rank before taking the top
                 `limit`. Higher = more thorough but more read-bucket cost.
                 Default 200, range 1-1000 (the schema bounds it; direct
-                callers are clamped to the same range).
+                callers are clamped to the same range). IGNORED when
+                `scan_all=True`.
             status: Lifecycle filter (default "open"). Same values as
                 `kalshi_get_markets` ("unopened"/"open"/"closed"/"settled";
                 multiple OK comma-separated, which is why this stays a free
@@ -503,35 +813,54 @@ def register(server: FastMCP) -> None:
             series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
             min_volume: Drop markets whose 24h volume is below this (same
                 units as `volume_24h_fp`). Default 0.0 (keep all).
+            scan_all: Sweep the ENTIRE matching listing before ranking, instead
+                of the first `scan_limit` markets. This is what makes the
+                ranking exchange-wide rather than an arbitrary slice. Costs
+                one read per 1000 markets (~5-10 requests for the open listing
+                as of Aug 2026) and is bounded by internal request / wall-clock
+                / market caps, so it always terminates. Default False.
 
-        IMPORTANT — windowed ranking: Kalshi has no server-side sort, so the
-        ranking is over the SCANNED WINDOW only (the top markets among the
-        first `scan_limit` results), NOT a global exchange-wide ranking unless
-        the scan exhausted all matching markets. Check `complete` (and
-        `scanned`) in the response; raise `scan_limit` (up to 1000) to look
-        deeper when `complete` is False.
+        IMPORTANT — windowed ranking: Kalshi has no server-side sort, so with
+        `scan_all=False` the ranking is over the SCANNED WINDOW only (the top
+        markets among the first `scan_limit` results), NOT a global
+        exchange-wide ranking unless the scan happened to exhaust the listing.
+        Always check `complete` before treating the shortlist as "the most
+        liquid markets on Kalshi". If `complete` is False, `stopped_by` names
+        the wall that bound: "scan_limit" (raise it, or set `scan_all=True`),
+        or "request_budget"/"time_budget"/"market_cap" (an internal cap on a
+        full sweep — narrow with `status` or `series_ticker`).
 
         Returns:
             `markets`: ranked shortlist (minimal projection), highest 24h
                 volume first.
-            `scanned`: number of distinct markets fetched and ranked.
-            `scan_limit`: the effective scan cap (after clamping to 1-1000).
-            `complete`: True if the scan reached the end of all markets
-                matching `status` + combo-exclusion before hitting `scan_limit`
-                — the ranking then covers every such market (after `min_volume`
-                is applied locally). False means the window filled and more
-                matching markets exist beyond it; raise `scan_limit` to see them.
+            `scanned`: number of distinct markets fetched and ranked (the
+                scanned count — the denominator for `complete`).
+            `requests`: how many listing requests the scan spent.
+            `scan_limit`: the effective scan cap, or null when `scan_all=True`.
+            `scan_all`: echoes the mode the scan actually ran in.
+            `complete`: True only if the scan reached the END of all markets
+                matching `status` + combo-exclusion — the ranking then covers
+                every such market (after `min_volume` is applied locally).
+                False means more matching markets exist beyond what was ranked.
+            `stopped_by`: null when `complete`, else the binding wall (above).
         """
         effective_scan = max(1, min(scan_limit, 1000))
-        collected, exhausted = await _scan_markets_excluding_mve(
-            client, scan_limit=effective_scan, status=status, series_ticker=series_ticker
+        scan = await _scan_markets_excluding_mve(
+            client,
+            scan_limit=effective_scan,
+            status=status,
+            series_ticker=series_ticker,
+            scan_all=scan_all,
         )
-        ranked = _rank_liquid_markets(collected, min_volume=min_volume, limit=limit)
+        ranked = _rank_liquid_markets(scan.markets, min_volume=min_volume, limit=limit)
         return {
             "markets": ranked,
-            "scanned": len(collected),
-            "scan_limit": effective_scan,
-            "complete": exhausted,
+            "scanned": scan.scanned,
+            "requests": scan.requests,
+            "scan_limit": None if scan_all else effective_scan,
+            "scan_all": scan_all,
+            "complete": scan.complete,
+            "stopped_by": scan.stopped_by,
         }
 
     @server.tool
@@ -706,6 +1035,255 @@ def register(server: FastMCP) -> None:
         """
         series_ticker = _validate_ticker(series_ticker, name="series_ticker")
         return await client.get(f"/series/{series_ticker}")
+
+    # Keep the emitted tool DESCRIPTION (everything before "Args:") under 1024
+    # chars — OpenAI rejects longer tool descriptions. Per-field detail belongs
+    # in the Args: block, which FastMCP routes to the parameter schema.
+    @server.tool
+    async def kalshi_get_combo_legs(
+        ticker: str,
+        with_titles: bool = True,
+        include_collection: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve a multivariate (`KXMVE…`) combo market into its underlying legs.
+
+        Returns one entry per leg — the leg's own MARKET ticker, its event
+        ticker, the side the combo takes on it ("yes"/"no"), and (by default)
+        its human title. Use this instead of splitting the combo's `title` /
+        `yes_sub_title` on commas: that string is a rendering, it drops the
+        leg tickers entirely, and it mis-splits whenever a leg's own title
+        contains a comma.
+
+        NOT every combo resolves. When Kalshi hasn't published the leg
+        breakdown, this returns `resolvable: false` with a `reason` rather
+        than guessing from the title — check that field before using `legs`.
+        Legs come from the market object (`mve_selected_legs`, or the
+        `custom_strike` CSV fallback); the collections endpoint describes the
+        *universe* a combo may draw from, not the legs it actually selected,
+        so it cannot answer this question and is offered only as context.
+
+        Args:
+            ticker: The COMBO market's own ticker, e.g.
+                "KXMVECROSSCATEGORY-SHARD1-S2026…-978C8F03297". A plain
+                (non-combo) market is a valid call — it just returns
+                `resolvable: false, reason: "not_a_combo_market"`.
+            with_titles: Resolve each leg's title via ONE extra batched
+                markets lookup. Default True. Set False to save a read when
+                you only need tickers and sides. Title resolution fails open:
+                if the lookup errors, legs still come back with
+                `titles_resolved: false`.
+            include_collection: Also fetch the parent multivariate event
+                collection (`size_min`/`size_max`, `is_all_yes`,
+                `associated_event_tickers`, `functional_description`) — the
+                rules governing how combos in this family are built. Costs one
+                more read and can be sizable, so it defaults False. Fails open.
+
+        Returns:
+            `resolvable`: True when legs were resolved; False otherwise.
+            `legs`: list of `{market_ticker, event_ticker, side, title,
+                yes_sub_title}` (the last two only when `with_titles`
+                succeeded). Order matches Kalshi's leg order.
+            `leg_count`, `source`: how many legs, and whether they came from
+                "mve_selected_legs" (structured, authoritative) or
+                "custom_strike" (parsed parallel CSVs — `side` is dropped to
+                null if the columns don't line up, rather than guessed).
+            `reason` + `message`: only when `resolvable` is False.
+                "not_a_combo_market" — the ticker is an ordinary market.
+                "legs_not_published" — it IS a combo but Kalshi exposed no
+                leg breakdown; the title string is all that exists, and this
+                tool deliberately will not parse it for you.
+            `collection_ticker`, `event_ticker`, `title`: the combo's own
+                identifiers, always present when the market was fetched.
+        """
+        ticker = _validate_ticker(ticker)
+        try:
+            body = await client.get(f"/markets/{ticker}")
+        except KalshiAPIError as exc:
+            if exc.status == 404:
+                hint = await _event_hint(client, ticker)
+                if hint:
+                    raise KalshiAPIError(status=404, message=hint) from exc
+            raise
+
+        market = body.get("market")
+        if not isinstance(market, dict):
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"Kalshi returned no market object for {ticker!r}. "
+                    "Double-check the ticker is a full MARKET ticker."
+                ),
+            )
+
+        collection_ticker = market.get("mve_collection_ticker")
+        base: dict[str, Any] = {
+            "ticker": market.get("ticker", ticker),
+            "event_ticker": market.get("event_ticker"),
+            "title": market.get("title"),
+            "collection_ticker": collection_ticker,
+        }
+
+        legs, source = _resolve_combo_legs(market)
+        if not legs:
+            # Distinguish "you pointed at a normal market" from "this really is
+            # a combo but the legs aren't published" — different caller fixes.
+            is_combo = bool(collection_ticker) or str(market.get("strike_type")) == "custom"
+            if is_combo:
+                reason = "legs_not_published"
+                message = (
+                    f"{ticker!r} is a multivariate combo market but Kalshi published no "
+                    "leg breakdown for it (neither `mve_selected_legs` nor a "
+                    "`custom_strike` markets/sides list). Its legs cannot be resolved "
+                    "from the API; the title string is a lossy rendering and this tool "
+                    "will not parse it. Try kalshi_get_combo_legs(..., "
+                    "include_collection=True) for the collection's construction rules."
+                )
+            else:
+                reason = "not_a_combo_market"
+                message = (
+                    f"{ticker!r} is an ordinary (non-multivariate) market — it has no "
+                    "legs. Combo tickers carry a `KXMVE…` prefix and an "
+                    "`mve_collection_ticker`. Use kalshi_get_market for this one."
+                )
+            return {**base, "resolvable": False, "reason": reason, "message": message}
+
+        truncated = len(legs) > _MAX_COMBO_LEGS
+        legs = legs[:_MAX_COMBO_LEGS]
+
+        titles_resolved = False
+        if with_titles:
+            leg_tickers = [leg["market_ticker"] for leg in legs]
+            try:
+                lookup = await client.get(
+                    "/markets",
+                    params={"tickers": ",".join(leg_tickers), "limit": len(leg_tickers)},
+                )
+            except KalshiAPIError:
+                # Fail open: the legs themselves are the answer; titles are a
+                # convenience, and a lookup failure must not lose them.
+                lookup = {}
+            by_ticker = {
+                m.get("ticker"): m
+                for m in (lookup.get("markets") or [])
+                if isinstance(m, dict) and m.get("ticker")
+            }
+            if by_ticker:
+                titles_resolved = True
+                for leg in legs:
+                    leg_market = by_ticker.get(leg["market_ticker"])
+                    if leg_market is not None:
+                        leg["title"] = leg_market.get("title")
+                        leg["yes_sub_title"] = leg_market.get("yes_sub_title")
+
+        result: dict[str, Any] = {
+            **base,
+            "resolvable": True,
+            "leg_count": len(legs),
+            "source": source,
+            "titles_resolved": titles_resolved,
+            "legs": legs,
+        }
+        if truncated:
+            result["truncated"] = True
+            result["note"] = (
+                f"Only the first {_MAX_COMBO_LEGS} legs are shown; this market declared more."
+            )
+
+        if include_collection and collection_ticker:
+            try:
+                collection = await client.get(
+                    f"/multivariate_event_collections/{collection_ticker}"
+                )
+            except KalshiAPIError:
+                result["collection_error"] = (
+                    f"Could not fetch collection {collection_ticker!r}; legs above are unaffected."
+                )
+            else:
+                result["collection"] = collection.get("multivariate_contract", collection)
+
+        return result
+
+    @server.tool
+    async def kalshi_get_series_summary(
+        status: str = "open",
+        top: Annotated[int, Field(ge=1, le=200)] = 50,
+        sort_by: Literal["volume_24h", "market_count", "soonest_close"] = "volume_24h",
+        scan_all: bool = True,
+    ) -> dict[str, Any]:
+        """Roll the whole market listing up to one row per SERIES.
+
+        A supply census: which series are listed right now, how many markets
+        each has, how much 24h volume, the tightest spread seen in it, and
+        when its soonest market closes. Run it daily and diff the series list
+        to detect new event classes coming online (NFL, a tennis major, a new
+        economic series) without paging thousands of markets into context.
+
+        Cheap in CONTEXT, not free in READS: it sweeps the listing internally
+        (one request per 1000 markets, combos excluded server-side) and returns
+        only the top `top` rows — a few hundred bytes each — so a full-exchange
+        census fits in a normal tool result. Check `complete` before treating
+        the census as exhaustive.
+
+        Args:
+            status: Lifecycle filter (default "open"). Same values as
+                `kalshi_get_markets` ("unopened"/"open"/"closed"/"settled";
+                comma-separated multiples OK, which is why this is a free
+                string rather than an enum).
+            top: How many series rows to return, 1-200. Default 50. This caps
+                the RESPONSE, not the scan — `series_count` always reports how
+                many distinct series the sweep actually saw.
+            sort_by: Which metric picks the top `top`. "volume_24h" (default,
+                descending) for where the money is; "market_count"
+                (descending) for raw supply — the right one for spotting a
+                newly-listed event class; "soonest_close" (ascending) for what
+                is about to resolve.
+            scan_all: Sweep the entire listing (default True — a partial census
+                is a misleading one). Set False to cap the scan at 1000 markets
+                for a fast, deliberately partial sample.
+
+        Multivariate (`KXMVE…`) combos are excluded server-side, matching
+        `kalshi_find_liquid_markets`. A combo census would be dominated by
+        auto-generated parlays with empty books.
+
+        Series-ticker caveat: Kalshi does NOT return `series_ticker` on market
+        objects (it exists only as a query filter), so it is DERIVED from the
+        ticker prefix per Kalshi's `SERIES-EVENTSUFFIX-OUTCOME` convention —
+        "KXMLBGAME-26AUG141910SDCLE-CLE" rolls up to "KXMLBGAME". That holds
+        across every series observed in prod, but it is a convention, not a
+        contract: confirm a newly-spotted series with `kalshi_get_series`.
+
+        Returns:
+            `series`: top-`top` rows of `{series_ticker, market_count,
+                event_count, volume_24h, min_spread_dollars,
+                soonest_close_time}`. `min_spread_dollars` is null when no
+                market in the series had a two-sided book (an empty or
+                one-sided book is skipped, not counted as a 0.00 spread).
+            `series_count`: distinct series seen by the sweep (>= len(series)).
+            `scanned`, `requests`: markets seen and listing requests spent.
+            `complete`: True only if the sweep reached the END of the listing.
+                False means the census is partial — `stopped_by` names the
+                wall ("scan_limit" when `scan_all=False`, else
+                "request_budget"/"time_budget"/"market_cap").
+            `stopped_by`: null when `complete`.
+        """
+        acc: dict[str, dict[str, Any]] = {}
+        scan = await _scan_markets_excluding_mve(
+            client,
+            scan_limit=1000,
+            status=status,
+            scan_all=scan_all,
+            on_page=lambda page: _fold_series_page(acc, page),
+        )
+        return {
+            "series": _finalize_series(acc, top=top, sort_by=sort_by),
+            "series_count": len(acc),
+            "scanned": scan.scanned,
+            "requests": scan.requests,
+            "status": status,
+            "sort_by": sort_by,
+            "complete": scan.complete,
+            "stopped_by": scan.stopped_by,
+        }
 
     @server.tool
     async def kalshi_get_trades(

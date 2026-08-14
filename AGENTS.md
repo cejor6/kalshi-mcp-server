@@ -425,6 +425,47 @@ tools encode these; don't regress them.
   tools call `_event_hint` on the failed path to raise an actionable error
   naming the real market tickers. `_event_hint` must **fail open** (return
   None on any error) so it never masks the caller's original problem.
+- **Orderbook levels ascend by price, and BOTH sides are bids.** The best
+  level is the LAST element, not the first. `GET /markets/orderbooks` (the
+  batch endpoint, up to 100 tickers) has **no `depth` parameter** — unlike
+  the single-market one, which takes 0-100 — so `kalshi_get_orderbooks`
+  truncates client-side and MUST slice `[-depth:]`. Verified live: a full
+  book's last `yes_dollars` entry equals the market's `yes_bid_dollars` /
+  `yes_bid_size_fp`, and the single-market endpoint at `depth=3` returns
+  exactly the last three entries in the same ascending order. Slicing
+  `[:depth]` would hand every scan lens the *worst* levels — dust orders —
+  and nothing would visibly break. Don't "fix" it.
+- **Batch reads must clamp their local token cost to the bucket capacity.**
+  Kalshi bills batch ops per item, so `kalshi_get_orderbooks` debits
+  `10 x len(tickers)` — but `TokenBucket.acquire` *rejects* any cost above
+  capacity outright, and on the Basic tier 25 items (250) exceeds the
+  200-token read budget. Unclamped, every large batch raised `RateLimitError`
+  locally and silently degraded to the per-ticker fallback. Relatedly, that
+  fallback re-raises `RateLimitError` instead of catching it: answering "you
+  are going too fast" with N more requests is how a soft limit becomes a hard
+  one.
+- **Market objects carry no `series_ticker`.** It exists only as a query
+  *filter* (confirmed in the API reference and against a live prod response).
+  `kalshi_get_series_summary` therefore DERIVES the series from the ticker
+  prefix per Kalshi's `SERIES-EVENTSUFFIX-OUTCOME` convention. That's a
+  convention, not a contract — the tool says so in its docstring rather than
+  presenting derived series as authoritative.
+- **Combo legs live on the MARKET, not on the collection.**
+  `/multivariate_event_collections/{ticker}` describes the *universe* a combo
+  may be built from (`associated_event_tickers`, `size_min`/`size_max`,
+  `is_all_yes`) — it cannot tell you which legs a specific auto-generated
+  combo selected. Those come from the market object's `mve_selected_legs`
+  (structured, authoritative) or its `custom_strike` parallel-CSV fallback.
+  When the CSV columns don't line up, `kalshi_get_combo_legs` nulls `side`
+  rather than guessing, and when neither source exists it returns a
+  structured `resolvable: false`. It must never fall back to splitting the
+  combo's title string — that's the lossy thing the tool exists to replace.
+- **Full-sweep paging is budgeted, and the budgets are late-bound.**
+  `_scan_markets_excluding_mve(scan_all=True)` is capped by request count,
+  wall clock, and total markets; whichever binds first is reported as
+  `stopped_by` so `complete` is never a guess. The three defaults resolve
+  from the module constants *inside* the function, not in the signature — a
+  def-time default would freeze them and silently ignore any override.
 - **Candlesticks 400 on two silent footguns** (`market_data.py:_validate_candlestick_window`,
   confirmed live). (1) `period_interval` accepts **only `1` / `60` / `1440`**
   (minute/hour/day) — `5`, `240`, etc. return an opaque `400 bad request`

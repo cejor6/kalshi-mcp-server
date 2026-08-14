@@ -16,16 +16,23 @@ from kalshi_mcp_server.tools.discovery import (
     _compact_market,
     _event_hint,
     _event_hint_misses,
+    _finalize_series,
+    _fold_series_page,
+    _legs_from_custom_strike,
+    _legs_from_selected,
     _minimal_market,
     _parse_fields,
     _project_market,
     _rank_liquid_markets,
     _record_event_hint_miss,
+    _resolve_combo_legs,
     _scan_markets_excluding_mve,
+    _series_of,
     _single_ticker,
     _validate_mve_filter,
     _validate_ticker,
     _volume_24h,
+    _yes_spread,
 )
 
 # Note: the `_event_hint_misses` negative cache is reset around every test by
@@ -401,9 +408,12 @@ async def test_scan_excludes_mve_and_paginates():
             {"markets": [{"ticker": "C"}], "cursor": ""},  # "" = terminal cursor
         ]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=200, status="open")
-    assert [m["ticker"] for m in out] == ["A", "B", "C"]
-    assert exhausted is True  # terminal cursor reached
+    scan = await _scan_markets_excluding_mve(client, scan_limit=200, status="open")
+    assert [m["ticker"] for m in scan.markets] == ["A", "B", "C"]
+    assert scan.complete is True  # terminal cursor reached
+    assert scan.stopped_by is None
+    assert scan.scanned == 3
+    assert scan.requests == 2
     # every request excluded combos server-side
     assert all(params["mve_filter"] == "exclude" for _, params in client.calls)
     # the second request carried the first page's cursor
@@ -412,42 +422,44 @@ async def test_scan_excludes_mve_and_paginates():
 
 async def test_scan_caps_result_at_scan_limit():
     client = _FakeClient(responses=[{"markets": [{"ticker": str(i)} for i in range(5)]}])
-    out, _ = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
     # first request asked for exactly scan_limit
     assert client.calls[0][1]["limit"] == 3
     # one page already satisfied the window — no second request
     assert len(client.calls) == 1
     # result is capped at scan_limit even if the page came back larger
-    assert [m["ticker"] for m in out] == ["0", "1", "2"]
+    assert [m["ticker"] for m in scan.markets] == ["0", "1", "2"]
 
 
 async def test_scan_exhausted_true_when_terminal_at_exactly_scan_limit():
     """Regression: a terminal cursor that fires exactly when the window is
-    full must still report exhausted=True (the exchange ran out), not False."""
+    full must still report complete=True (the exchange ran out), not False."""
     client = _FakeClient(
         responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": ""}]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
-    assert len(out) == 3
-    assert exhausted is True
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(scan.markets) == 3
+    assert scan.complete is True
+    assert scan.stopped_by is None
 
 
 async def test_scan_not_exhausted_when_window_fills_with_more_available():
     client = _FakeClient(
         responses=[{"markets": [{"ticker": str(i)} for i in range(3)], "cursor": "more"}]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
-    assert len(out) == 3
-    assert exhausted is False  # window filled, a live cursor means more remain
+    scan = await _scan_markets_excluding_mve(client, scan_limit=3, status="open")
+    assert len(scan.markets) == 3
+    assert scan.complete is False  # window filled, a live cursor means more remain
+    assert scan.stopped_by == "scan_limit"
     assert len(client.calls) == 1
 
 
 async def test_scan_clamps_nonpositive_scan_limit():
     client = _FakeClient(responses=[{"markets": [{"ticker": "A"}], "cursor": ""}])
-    out, _ = await _scan_markets_excluding_mve(client, scan_limit=0, status="open")
+    scan = await _scan_markets_excluding_mve(client, scan_limit=0, status="open")
     # scan_limit clamped up to 1 — one request asking for 1
     assert client.calls[0][1]["limit"] == 1
-    assert len(out) == 1
+    assert len(scan.markets) == 1
 
 
 async def test_scan_dedupes_and_stops_on_nonadvancing_cursor():
@@ -459,9 +471,10 @@ async def test_scan_dedupes_and_stops_on_nonadvancing_cursor():
             {"markets": [{"ticker": "A"}], "cursor": "stuck"},  # same page + cursor
         ]
     )
-    out, exhausted = await _scan_markets_excluding_mve(client, scan_limit=10, status="open")
-    assert [m["ticker"] for m in out] == ["A"]  # de-duped
-    assert exhausted is True  # no forward progress == exhausted
+    scan = await _scan_markets_excluding_mve(client, scan_limit=10, status="open")
+    assert [m["ticker"] for m in scan.markets] == ["A"]  # de-duped
+    assert scan.complete is True  # no forward progress == exhausted
+    assert scan.scanned == 1
     assert len(client.calls) == 2  # one fetch, one to discover the cursor is stuck
 
 
@@ -471,6 +484,87 @@ async def test_scan_passes_series_ticker_when_given():
         client, scan_limit=50, status="open", series_ticker="KXMLBGAME"
     )
     assert client.calls[0][1]["series_ticker"] == "KXMLBGAME"
+
+
+# ── scan_all: full-sweep paging + its budgets ──────────────────────────────
+
+
+def _pages(count: int, *, per_page: int = 2, terminal: bool = True) -> list[dict]:
+    """`count` pages of `per_page` distinct markets, each with a live cursor.
+    The last page's cursor is terminal ("") when `terminal`, so the sweep
+    reports complete; otherwise every page advertises more."""
+    pages = []
+    for p in range(count):
+        markets = [{"ticker": f"M{p}-{i}"} for i in range(per_page)]
+        last = p == count - 1
+        pages.append({"markets": markets, "cursor": "" if (last and terminal) else f"c{p}"})
+    return pages
+
+
+async def test_scan_all_pages_past_scan_limit_to_exhaustion():
+    """The whole point of scan_all: `scan_limit` no longer bounds the sweep,
+    so the ranking input is the full listing, not an arbitrary slice."""
+    client = _FakeClient(responses=_pages(4))
+    scan = await _scan_markets_excluding_mve(client, scan_limit=2, status="open", scan_all=True)
+    # scan_limit=2 would have stopped after one page in windowed mode.
+    assert scan.scanned == 8
+    assert len(client.calls) == 4
+    assert scan.complete is True
+    assert scan.stopped_by is None
+    # Full-sweep pages request Kalshi's max page size, not scan_limit.
+    assert client.calls[0][1]["limit"] == 1000
+
+
+async def test_scan_all_respects_request_budget():
+    """A listing that never terminates must stop at the request cap and say
+    so — an honest `complete: false`, not an unbounded cursor chase."""
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_requests=3
+    )
+    assert len(client.calls) == 3  # the cap is a ceiling, not cap+1
+    assert scan.scanned == 6
+    assert scan.complete is False
+    assert scan.stopped_by == "request_budget"
+
+
+async def test_scan_all_respects_time_budget():
+    """The wall-clock cap is the backstop for a listing that pages forever
+    within the request budget. One page always goes out, then it stops."""
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_seconds=0.0
+    )
+    assert len(client.calls) == 1
+    assert scan.complete is False
+    assert scan.stopped_by == "time_budget"
+
+
+async def test_scan_all_respects_market_cap():
+    client = _FakeClient(responses=_pages(50, terminal=False))
+    scan = await _scan_markets_excluding_mve(
+        client, scan_limit=2, status="open", scan_all=True, max_markets=5
+    )
+    assert scan.scanned == 5
+    assert scan.complete is False
+    assert scan.stopped_by == "market_cap"
+
+
+async def test_scan_on_page_folds_without_retaining_markets():
+    """`on_page` is what keeps a full sweep from holding every market dict in
+    memory: pages are handed to the fold and NOT accumulated."""
+    seen: list[str] = []
+    client = _FakeClient(responses=_pages(3))
+    scan = await _scan_markets_excluding_mve(
+        client,
+        scan_limit=2,
+        status="open",
+        scan_all=True,
+        on_page=lambda page: seen.extend(m["ticker"] for m in page),
+    )
+    assert scan.markets == []  # nothing retained
+    assert scan.scanned == 6  # but everything counted
+    assert len(seen) == 6  # and everything folded
 
 
 # ── _event_hint (issue #30) ────────────────────────────────────────────────
@@ -551,6 +645,259 @@ async def test_event_hint_ignores_markets_without_ticker():
     client = _FakeClient(responses=[{"markets": [{"no_ticker": "x"}, {"ticker": "EVT-A"}]}])
     hint = await _event_hint(client, "EVT")
     assert "EVT-A" in hint
+
+
+# ── combo-leg resolution (kalshi_get_combo_legs) ───────────────────────────
+
+
+def test_legs_from_selected_reads_structured_field():
+    """`mve_selected_legs` is the authoritative source — ticker, event and
+    side come straight out of it, in Kalshi's order."""
+    legs = _legs_from_selected(_mve_market())
+    assert len(legs) == 9
+    assert legs[0] == {
+        "market_ticker": "KXMLBTOTAL-0-6",
+        "event_ticker": "KXMLBTOTAL-0",
+        "side": "yes",
+    }
+
+
+def test_legs_from_selected_skips_malformed_entries():
+    market = {
+        "mve_selected_legs": [
+            "not-a-dict",
+            {"event_ticker": "E1"},  # no market_ticker
+            {"market_ticker": "   "},  # blank market_ticker
+            {"market_ticker": " KX-A ", "event_ticker": "KX", "side": "no"},
+        ]
+    }
+    assert _legs_from_selected(market) == [
+        {"market_ticker": "KX-A", "event_ticker": "KX", "side": "no"}
+    ]
+
+
+def test_legs_from_selected_empty_when_absent_or_wrong_type():
+    assert _legs_from_selected({}) == []
+    assert _legs_from_selected({"mve_selected_legs": "nope"}) == []
+
+
+def test_legs_from_custom_strike_parses_parallel_csvs():
+    """The fallback: three comma-separated columns that line up by index.
+    This is the real prod shape (confirmed live)."""
+    market = {
+        "custom_strike": {
+            "Associated Events": "KXATP-A,KXMLB-B",
+            "Associated Markets": "KXATP-A-BEL,KXMLB-B-LAA8",
+            "Associated Market Sides": "yes,no",
+        }
+    }
+    assert _legs_from_custom_strike(market) == [
+        {"market_ticker": "KXATP-A-BEL", "event_ticker": "KXATP-A", "side": "yes"},
+        {"market_ticker": "KXMLB-B-LAA8", "event_ticker": "KXMLB-B", "side": "no"},
+    ]
+
+
+def test_legs_from_custom_strike_drops_side_on_column_mismatch():
+    """Parallel arrays with no linking key: if the columns don't line up we
+    cannot say which side belongs to which leg. Keep the unambiguous tickers,
+    null the side — never guess, which is the whole point of this tool."""
+    market = {
+        "custom_strike": {
+            "Associated Markets": "A-1,B-2,C-3",
+            "Associated Market Sides": "yes,no",  # short by one
+            "Associated Events": "A,B",  # also short
+        }
+    }
+    legs = _legs_from_custom_strike(market)
+    assert [leg["market_ticker"] for leg in legs] == ["A-1", "B-2", "C-3"]
+    assert all(leg["side"] is None for leg in legs)
+    assert all(leg["event_ticker"] is None for leg in legs)
+
+
+def test_legs_from_custom_strike_empty_without_markets_column():
+    assert _legs_from_custom_strike({}) == []
+    assert _legs_from_custom_strike({"custom_strike": "nope"}) == []
+    assert _legs_from_custom_strike({"custom_strike": {"Associated Market Sides": "yes"}}) == []
+
+
+def test_resolve_combo_legs_prefers_structured_over_csv():
+    market = _mve_market()
+    market["custom_strike"] = {"Associated Markets": "SHOULD-NOT-WIN"}
+    legs, source = _resolve_combo_legs(market)
+    assert source == "mve_selected_legs"
+    assert legs[0]["market_ticker"] == "KXMLBTOTAL-0-6"
+
+
+def test_resolve_combo_legs_falls_back_to_custom_strike():
+    market = {
+        "custom_strike": {
+            "Associated Markets": "A-1",
+            "Associated Market Sides": "yes",
+            "Associated Events": "A",
+        }
+    }
+    legs, source = _resolve_combo_legs(market)
+    assert source == "custom_strike"
+    assert legs == [{"market_ticker": "A-1", "event_ticker": "A", "side": "yes"}]
+
+
+def test_resolve_combo_legs_unresolvable_returns_empty():
+    """An ordinary market has neither source — the tool must report
+    not-resolvable rather than fall back to parsing the title string."""
+    plain = {"ticker": "KXFED-26MAR19-B5.25", "title": "Fed above 5.25%, and other things"}
+    assert _resolve_combo_legs(plain) == ([], None)
+
+
+# ── series rollup (kalshi_get_series_summary) ──────────────────────────────
+
+
+def test_series_of_derives_prefix_from_event_ticker():
+    assert _series_of({"event_ticker": "KXMLBGAME-26AUG141910SDCLE"}) == "KXMLBGAME"
+
+
+def test_series_of_falls_back_to_market_ticker():
+    assert _series_of({"ticker": "KXFED-26MAR19-B5.25"}) == "KXFED"
+
+
+def test_series_of_none_when_underivable():
+    assert _series_of({}) is None
+    assert _series_of({"event_ticker": "   "}) is None
+    assert _series_of({"event_ticker": 42}) is None
+
+
+def test_yes_spread_requires_a_two_sided_book():
+    """An empty/one-sided book reports 0.0000 on a side. Treating that as a
+    0.00 spread would rank every dead market as the tightest in its series —
+    exactly backwards, so those must be skipped entirely."""
+    assert _yes_spread({"yes_bid_dollars": "0.4600", "yes_ask_dollars": "0.4800"}) == pytest.approx(
+        0.02
+    )
+    assert _yes_spread({"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}) is None
+    assert _yes_spread({"yes_bid_dollars": "0.0000", "yes_ask_dollars": "1.0000"}) is None
+    assert _yes_spread({"yes_bid_dollars": "0.5000"}) is None  # no ask at all
+    assert _yes_spread({"yes_bid_dollars": "x", "yes_ask_dollars": "0.5"}) is None
+    # Crossed book (ask below bid) is nonsense data, not a negative spread.
+    assert _yes_spread({"yes_bid_dollars": "0.6000", "yes_ask_dollars": "0.5000"}) is None
+
+
+def _series_markets() -> list[dict]:
+    return [
+        {
+            "ticker": "KXA-E1-X",
+            "event_ticker": "KXA-E1",
+            "volume_24h_fp": "100.00",
+            "yes_bid_dollars": "0.4000",
+            "yes_ask_dollars": "0.4500",
+            "close_time": "2026-08-20T00:00:00Z",
+        },
+        {
+            "ticker": "KXA-E1-Y",
+            "event_ticker": "KXA-E1",
+            "volume_24h_fp": "50.00",
+            "yes_bid_dollars": "0.4000",
+            "yes_ask_dollars": "0.4100",  # tighter — becomes the series min
+            "close_time": "2026-08-18T00:00:00Z",  # earlier — becomes soonest
+        },
+        {
+            "ticker": "KXA-E2-X",
+            "event_ticker": "KXA-E2",  # second event in the same series
+            "volume_24h_fp": "5.00",
+            "yes_bid_dollars": "0.0000",  # dead book — must not set min spread
+            "yes_ask_dollars": "0.0000",
+            "close_time": "2026-09-01T00:00:00Z",
+        },
+        {
+            "ticker": "KXB-E1-X",
+            "event_ticker": "KXB-E1",
+            "volume_24h_fp": "1000.00",
+            "yes_bid_dollars": "0.1000",
+            "yes_ask_dollars": "0.9000",
+            "close_time": "2026-12-01T00:00:00Z",
+        },
+    ]
+
+
+def test_fold_series_page_aggregates_across_pages():
+    """The fold must be incremental — two calls with half the markets each
+    must produce exactly what one call with all of them would."""
+    acc: dict = {}
+    markets = _series_markets()
+    _fold_series_page(acc, markets[:2])
+    _fold_series_page(acc, markets[2:])
+
+    assert set(acc) == {"KXA", "KXB"}
+    kxa = acc["KXA"]
+    assert kxa["market_count"] == 3
+    assert kxa["events"] == {"KXA-E1", "KXA-E2"}
+    assert kxa["volume_24h"] == pytest.approx(155.0)
+    assert kxa["min_spread_dollars"] == pytest.approx(0.01)  # not 0.00 from the dead book
+    assert kxa["soonest_close_time"] == "2026-08-18T00:00:00Z"
+
+
+def test_fold_series_page_skips_markets_without_a_derivable_series():
+    acc: dict = {}
+    _fold_series_page(acc, [{"volume_24h_fp": "10"}, {"event_ticker": "KXA-E1"}])
+    assert set(acc) == {"KXA"}
+    assert acc["KXA"]["market_count"] == 1
+
+
+def test_finalize_series_sorts_by_volume_and_caps_at_top():
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    rows = _finalize_series(acc, top=1, sort_by="volume_24h")
+    assert len(rows) == 1
+    assert rows[0]["series_ticker"] == "KXB"  # 1000 > 155
+    assert rows[0]["volume_24h"] == 1000.0
+
+
+def test_finalize_series_sort_modes():
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    by_count = _finalize_series(acc, top=10, sort_by="market_count")
+    assert [r["series_ticker"] for r in by_count] == ["KXA", "KXB"]  # 3 markets vs 1
+    by_close = _finalize_series(acc, top=10, sort_by="soonest_close")
+    assert [r["series_ticker"] for r in by_close] == ["KXA", "KXB"]  # Aug 18 before Dec 1
+
+
+def test_finalize_series_row_shape_is_json_safe():
+    """The accumulator holds a `set` of event tickers; the emitted row must
+    carry a count instead, or the tool result won't serialize."""
+    acc: dict = {}
+    _fold_series_page(acc, _series_markets())
+    row = next(
+        r
+        for r in _finalize_series(acc, top=10, sort_by="volume_24h")
+        if r["series_ticker"] == "KXA"
+    )
+    assert row == {
+        "series_ticker": "KXA",
+        "market_count": 3,
+        "event_count": 2,
+        "volume_24h": 155.0,
+        "min_spread_dollars": 0.01,
+        "soonest_close_time": "2026-08-18T00:00:00Z",
+    }
+
+
+def test_finalize_series_null_spread_when_no_two_sided_book():
+    acc: dict = {}
+    _fold_series_page(
+        acc, [{"event_ticker": "KXZ-1", "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}]
+    )
+    assert _finalize_series(acc, top=10, sort_by="volume_24h")[0]["min_spread_dollars"] is None
+
+
+def test_finalize_series_sorts_missing_close_time_last():
+    acc: dict = {}
+    _fold_series_page(
+        acc,
+        [
+            {"event_ticker": "KXNOCLOSE-1"},
+            {"event_ticker": "KXHASCLOSE-1", "close_time": "2026-08-18T00:00:00Z"},
+        ],
+    )
+    rows = _finalize_series(acc, top=10, sort_by="soonest_close")
+    assert [r["series_ticker"] for r in rows] == ["KXHASCLOSE", "KXNOCLOSE"]
 
 
 # ── _single_ticker (issue #30 gate) ────────────────────────────────────────

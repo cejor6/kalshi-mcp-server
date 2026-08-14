@@ -85,9 +85,12 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_get_event",
         "kalshi_get_events",
         "kalshi_get_series",
+        "kalshi_get_series_summary",
+        "kalshi_get_combo_legs",
         "kalshi_get_trades",
         # market_data.py
         "kalshi_get_orderbook",
+        "kalshi_get_orderbooks",
         "kalshi_get_market_candlesticks",
         "kalshi_get_event_candlesticks",
         "kalshi_get_market_trades",
