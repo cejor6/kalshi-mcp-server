@@ -35,8 +35,25 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError
 
+# The ticker / path-segment validators live in `tools/_validation.py` (shared
+# across tool modules — see that file). Re-exported here for back-compat, since
+# a lot of code and tests import them from `discovery`.
+from kalshi_mcp_server.tools._validation import (
+    _PATH_SEGMENT_ALLOWED_CHARS,
+    _validate_path_segment,
+    _validate_path_ticker,
+    _validate_ticker,
+)
+
 if TYPE_CHECKING:
     from fastmcp import FastMCP
+
+__all__ = [  # keeps linters from flagging the re-exports as unused
+    "_PATH_SEGMENT_ALLOWED_CHARS",
+    "_validate_path_segment",
+    "_validate_path_ticker",
+    "_validate_ticker",
+]
 
 
 # Fields stripped from a market object when `compact=True`. Blacklist
@@ -81,92 +98,6 @@ _VERBOSE_EVENT_FIELDS: frozenset[str] = frozenset(
         "mutually_exclusive",
     }
 )
-
-
-def _validate_ticker(ticker: str, *, name: str = "ticker") -> str:
-    """Reject empty/whitespace tickers before they reach Kalshi.
-
-    Without this, an empty path parameter hits `/markets/` (trailing slash)
-    which Kalshi 301-redirects to the LIST endpoint — that would either
-    look like success returning the whole markets list, or surface as a
-    confusing redirect error. Catching it here gives a clean message.
-    """
-    if not isinstance(ticker, str) or not ticker.strip():
-        raise KalshiAPIError(
-            status=0,
-            message=f"{name} must be a non-empty string, got {ticker!r}.",
-        )
-    return ticker.strip()
-
-
-# Characters that are safe in a value we interpolate into a URL PATH segment:
-# upper/lower alphanumerics plus `-`, `.` and `_`. Covers real Kalshi tickers
-# ("KXFED-26MAR19-B5.25", "KXMVECROSSCATEGORY-SHARD1-R") and order-id UUIDs
-# ("a1b2c3d4-...") alike. Every character NOT in this set that could appear is
-# a URL separator (`/`, `?`, `#`, `&`, whitespace, …).
-_PATH_SEGMENT_ALLOWED_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._"
-)
-
-
-def _validate_path_segment(value: str, *, name: str = "ticker", kind: str = "ticker") -> str:
-    """Validate a value that will be INTERPOLATED INTO A URL PATH segment.
-
-    Tools build paths with f-strings (`/markets/{ticker}/orderbook`,
-    `/portfolio/orders/{order_id}`), and the canonical message we sign is
-    reconstructed the same way — critically, `auth._path_without_query` strips
-    the query string before signing. So a value containing `/`, `?`, `#`, or a
-    `..` segment changes which endpoint the request reaches while STILL
-    producing a valid signature: `order_id="abc?foo=bar"` signs `/…/abc` but
-    sends `/…/abc?foo=bar` with caller-chosen query params. It matters most on
-    the state-mutating paths (order cancel/decrease, combo creation), where the
-    value is model-supplied.
-
-    Restricting to the charset real tickers / order-ids use is the whole fix:
-    every dangerous character is a separator and none are legal in either.
-    Rejecting beats escaping — an escaped `/` would just 404 more confusingly.
-
-    `kind` names the value in the error message ("ticker" / "identifier").
-    """
-    value = _validate_ticker(value, name=name)
-    bad = sorted(set(value) - _PATH_SEGMENT_ALLOWED_CHARS)
-    if bad:
-        example = (
-            "'KXFED-26MAR19-B5.25'"
-            if kind == "ticker"
-            else "an alphanumeric id with '-', '.' or '_'"
-        )
-        raise KalshiAPIError(
-            status=0,
-            message=(
-                f"{name} contains characters that are not valid in a Kalshi {kind}: "
-                f"{''.join(bad)!r}. Allowed: alphanumerics plus '-', '.' and '_' "
-                f"(e.g. {example}). Got {value!r}."
-            ),
-        )
-    # `.` is legal inside a value ("…-B5.25"), so the charset check above lets a
-    # bare "." or ".." through — and those are dot-SEGMENTS, which httpx
-    # resolves away: "." collapses the path to its parent, ".." climbs above it.
-    # The signer signs the un-normalized path, so the request would land
-    # somewhere other than what was signed. Reject a value that is nothing but
-    # dots.
-    if set(value) == {"."}:
-        raise KalshiAPIError(
-            status=0,
-            message=(
-                f"{name}={value!r} is a path segment, not a {kind} — '.' and '..' "
-                "resolve to a different endpoint than the one we sign."
-            ),
-        )
-    return value
-
-
-def _validate_path_ticker(ticker: str, *, name: str = "ticker") -> str:
-    """Back-compat alias: validate a TICKER interpolated into a URL path.
-
-    Thin wrapper over `_validate_path_segment` — see it for the why.
-    """
-    return _validate_path_segment(ticker, name=name, kind="ticker")
 
 
 # Whitelist for `minimal=True`. Unlike `compact` (a blacklist), this keeps
@@ -686,6 +617,15 @@ async def _event_hint(client: Any, ticker: str) -> str | None:
     A short-lived negative cache (`_event_hint_misses`) prevents a repeated
     poll of the same non-event ticker from re-probing `/events` every time.
     """
+    # `ticker` is interpolated into the path below. Most callers pass an
+    # already-validated ticker, but `kalshi_get_markets` reaches here with a
+    # value pulled straight from its `tickers` query arg — so validate
+    # defensively here too. Fail open (return None), matching this helper's
+    # whole contract: it never masks the caller's real problem.
+    try:
+        ticker = _validate_path_segment(ticker, kind="ticker")
+    except KalshiAPIError:
+        return None
     now = time.monotonic()
     missed_at = _event_hint_misses.get(ticker)
     if missed_at is not None and (now - missed_at) < _EVENT_HINT_MISS_TTL_S:
@@ -959,7 +899,7 @@ def register(server: FastMCP) -> None:
         and is stripped from the default compact/minimal views — gate on
         the orderbook and `volume_24h_fp` / `open_interest_fp` instead.
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         try:
             body = await client.get(f"/markets/{ticker}")
         except KalshiAPIError as exc:
@@ -1005,7 +945,7 @@ def register(server: FastMCP) -> None:
 
         Nested-market view precedence: `fields` > `minimal` > `compact` > full.
         """
-        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
+        event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
         params = {"with_nested_markets": str(with_nested_markets).lower()}
         body = await client.get(f"/events/{event_ticker}", params=params)
 
@@ -1101,7 +1041,7 @@ def register(server: FastMCP) -> None:
         Args:
             series_ticker: The series ticker, e.g. "KXFED".
         """
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         return await client.get(f"/series/{series_ticker}")
 
     @server.tool
@@ -1111,7 +1051,7 @@ def register(server: FastMCP) -> None:
         include_volume: bool = True,
         min_updated_ts: int | None = None,
         limit: Annotated[int, Field(ge=1, le=1000)] = 100,
-        include_full: bool = False,
+        minimal: bool = True,
     ) -> dict[str, Any]:
         """List Kalshi's SERIES catalog — the authoritative names behind the tickers.
 
@@ -1127,8 +1067,8 @@ def register(server: FastMCP) -> None:
         This endpoint does NOT paginate — Kalshi returns EVERY matching series
         at once, and a busy category is enormous (Economics is 600+). So the
         result is bounded by default: a small field whitelist per series, and
-        only the top `limit` by lifetime volume. Don't reach for `include_full`
-        on a broad query.
+        only the top `limit` by lifetime volume. Keep `minimal` on for a broad
+        query.
 
         Args:
             category: Filter to one category. NOTE Kalshi's exact spelling —
@@ -1144,24 +1084,27 @@ def register(server: FastMCP) -> None:
                 (descending). Default 100. This caps the response, not the
                 fetch — `total_matched` always reports how many Kalshi actually
                 returned, so you can tell when you're seeing a slice.
-            include_full: Return each series' FULL object (settlement sources,
-                contract URLs, prohibitions, product metadata) instead of the
-                minimal projection. Default False. Only safe on an already-
-                narrow query (a specific `tags`, or a tight `min_updated_ts`) —
-                on a broad one it will overflow.
+            minimal: Project each series to a small field whitelist. Same name
+                and meaning as `minimal` on the market tools, but note the
+                DEFAULT is True here (elsewhere it defaults False): this
+                endpoint doesn't paginate, so full objects overflow on a broad
+                query. Set False to get each series' FULL object (settlement
+                sources, contract URLs, prohibitions, product metadata) — only
+                safe on an already-narrow query (a specific `tags` or a tight
+                `min_updated_ts`).
 
         Returns:
             `series`: up to `limit` entries, highest lifetime volume first
-                (minimal projection unless `include_full`).
+                (minimal projection unless `minimal=False`).
             `total_matched`: how many series Kalshi returned before the local
                 top-`limit` cut — `> len(series)` means you're seeing a slice.
             `returned`, `truncated`: convenience counts.
         """
         params: dict[str, Any] = {
             "include_volume": str(include_volume).lower(),
-            # The full product-metadata blob is the single largest field; never
-            # fetch it unless the caller explicitly wants the full objects.
-            "include_product_metadata": str(include_full).lower(),
+            # The full product-metadata blob is the single largest field; only
+            # fetch it when the caller wants the full (non-minimal) objects.
+            "include_product_metadata": str(not minimal).lower(),
         }
         if category:
             params["category"] = category
@@ -1175,9 +1118,13 @@ def register(server: FastMCP) -> None:
         total = len(series)
         # Rank by lifetime volume so a truncated result keeps the series that
         # matter, not an arbitrary prefix. Stable, so equal-volume order is
-        # Kalshi's own.
-        ranked = sorted(series, key=_series_volume, reverse=True)[:limit]
-        if not include_full:
+        # Kalshi's own. `max(0, limit)` matches `_rank_liquid_markets` /
+        # `_TopKByVolume`: the schema's `ge=1` only binds MCP clients, and this
+        # cut is 100% client-side (the endpoint has no `limit`), so an
+        # unclamped negative would slice from the END and return a near-full
+        # list — the one place with no external backstop.
+        ranked = sorted(series, key=_series_volume, reverse=True)[: max(0, limit)]
+        if minimal:
             ranked = [_minimal_series(s) for s in ranked]
         return {
             "series": ranked,

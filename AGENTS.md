@@ -552,15 +552,20 @@ tools encode these; don't regress them.
   resolves away (`.` collapses to the LIST endpoint). Rejecting beats
   escaping.
 
-  The core is `_validate_path_segment(value, name, kind)`; `_validate_path_ticker`
-  is a thin alias over it. Applied to `collection_ticker` on the multivariate
-  GET/POST **and** to `order_id` on the order cancel / decrease / get tools —
-  the latter matters because `auth.py` strips the query before signing, so an
-  `order_id` containing `?` would otherwise yield a *signature-valid* request
-  carrying caller-chosen query params. Reuse `_validate_path_segment` for any
-  new tool that interpolates a model-supplied value into a request path; the
-  remaining plain-ticker path sites (single market/orderbook lookups) are read
-  paths and lower-risk, but there's no reason not to migrate them too.
+  The validators live in **`tools/_validation.py`** (shared across tool
+  modules; `discovery.py` re-exports them for back-compat, so existing
+  `from …tools.discovery import _validate_ticker` imports still resolve — new
+  code should import from `_validation`). The core is
+  `_validate_path_segment(value, name, kind)`; `_validate_path_ticker` is a thin
+  alias. **Every model-supplied value interpolated into a request PATH now uses
+  it** — `order_id` (order cancel/decrease/get), `collection_ticker` (combo
+  GET/POST), and every ticker/event/series path site in discovery + market_data
+  + multivariate, plus `_event_hint` (which `kalshi_get_markets` can reach with
+  an unvalidated `tickers` value). `order_id` is the one that mattered most:
+  `auth.py` strips the query before signing, so an `order_id` containing `?`
+  would otherwise yield a *signature-valid* request carrying caller-chosen query
+  params. Query-param values (not path segments) are httpx-encoded and don't
+  need this. Reuse `_validate_path_segment` for any new path interpolation.
 - **Combo legs live on the MARKET, not on the collection.**
   `/multivariate_event_collections/{ticker}` describes the *universe* a combo
   may be built from (`associated_event_tickers`, `size_min`/`size_max`,

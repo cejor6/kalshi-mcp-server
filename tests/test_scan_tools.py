@@ -509,9 +509,9 @@ async def test_series_list_projects_and_caps_by_volume(rsa_private_key):
 
 
 @pytest.mark.asyncio
-async def test_series_list_include_full_keeps_everything(rsa_private_key):
-    """The escape hatch for a narrow query must return the full objects and
-    request the product-metadata blob."""
+async def test_series_list_minimal_false_keeps_everything(rsa_private_key):
+    """The escape hatch for a narrow query: `minimal=False` returns the full
+    objects and requests the product-metadata blob."""
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -524,10 +524,40 @@ async def test_series_list_include_full_keeps_everything(rsa_private_key):
     server = _make_server(rsa_private_key, handler)
     fn = await _tool_fn(server, "kalshi_get_series_list")
 
-    out = await fn(tags="rare", include_full=True)
+    out = await fn(tags="rare", minimal=False)
 
     assert "settlement_sources" in out["series"][0]  # full object kept
     assert seen[0].url.params["include_product_metadata"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_series_list_minimal_default_does_not_request_product_metadata(rsa_private_key):
+    """Default (minimal) must NOT ask Kalshi for the heavy product-metadata blob."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"series": [{"ticker": "KXA", "volume_fp": "1"}]})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    await fn(category="Economics")
+    assert seen[0].url.params["include_product_metadata"] == "false"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_limit", [0, -1, -50])
+async def test_series_list_clamps_nonpositive_limit_to_empty(rsa_private_key, bad_limit):
+    """REGRESSION: the client-side cut is the ONLY backstop (the endpoint has
+    no limit param), so a negative limit must clamp to [] — unclamped it would
+    slice from the END and return a near-full list. Mirrors the clamp in
+    `_rank_liquid_markets` / `_TopKByVolume`."""
+    server = _make_server(rsa_private_key, _series_catalog_handler(10))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    out = await fn(limit=bad_limit)
+    assert out["series"] == []
+    assert out["returned"] == 0
+    assert out["total_matched"] == 10
 
 
 @pytest.mark.asyncio
@@ -610,3 +640,57 @@ async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
         )
     assert exc.value.status == 500
     assert "does not publish" not in exc.value.message
+
+
+# ── read-path ticker injection (security hardening) ────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,kwargs",
+    [
+        ("kalshi_get_market", {"ticker": "KX/../../portfolio/balance"}),
+        ("kalshi_get_orderbook", {"ticker": "KX?foo=bar"}),
+        ("kalshi_get_event", {"event_ticker": "KX/../x"}),
+        ("kalshi_get_series", {"series_ticker": "KX#frag"}),
+        (
+            "kalshi_get_market_candlesticks",
+            {"ticker": "KX/../x", "series_ticker": "KXS", "start_ts": 1, "end_ts": 2},
+        ),
+        (
+            "kalshi_get_event_forecast_history",
+            {"event_ticker": "KX/../x", "series_ticker": "KXS", "start_ts": 1, "end_ts": 2},
+        ),
+    ],
+)
+async def test_read_path_tickers_reject_injection_before_the_wire(
+    rsa_private_key, tool_name, kwargs
+):
+    """A model-supplied ticker with a path separator would steer a GET to a
+    different endpoint under a valid signature (auth.py strips the query before
+    signing). The read tools now validate with the path-segment guard, so this
+    must fail locally with no wire call."""
+    calls: list[str] = []
+    server = _make_server(
+        rsa_private_key,
+        lambda r: (calls.append(r.url.path), httpx.Response(200, json={}))[1],
+    )
+    fn = await _tool_fn(server, tool_name)
+    with pytest.raises(KalshiAPIError):
+        await fn(**kwargs)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_batch_orderbooks_rejects_injection_ticker_before_the_wire(rsa_private_key):
+    """`_dedupe_tickers` now uses the path-segment guard, so a ticker that could
+    reach the per-ticker fallback path is rejected up front."""
+    calls: list[str] = []
+    server = _make_server(
+        rsa_private_key,
+        lambda r: (calls.append(r.url.path), httpx.Response(200, json={}))[1],
+    )
+    fn = await _tool_fn(server, "kalshi_get_orderbooks")
+    with pytest.raises(KalshiAPIError):
+        await fn(tickers=["KX-A", "KX/../../x"])
+    assert calls == []

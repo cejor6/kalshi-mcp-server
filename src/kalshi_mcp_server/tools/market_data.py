@@ -19,7 +19,8 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError
 from kalshi_mcp_server.rate_limit import DEFAULT_ENDPOINT_COST
-from kalshi_mcp_server.tools.discovery import _event_hint, _validate_ticker
+from kalshi_mcp_server.tools._validation import _validate_path_segment
+from kalshi_mcp_server.tools.discovery import _event_hint
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -257,7 +258,7 @@ def _project_orderbook_entry(entry: dict[str, Any], depth: int) -> dict[str, Any
 
 def _dedupe_tickers(tickers: list[str]) -> list[str]:
     """Validate, strip, and order-preservingly de-dupe a ticker list."""
-    cleaned = [_validate_ticker(t) for t in tickers]
+    cleaned = [_validate_path_segment(t, kind="ticker") for t in tickers]
     return list(dict.fromkeys(cleaned))
 
 
@@ -293,7 +294,7 @@ def register(server: FastMCP) -> None:
         Remember Kalshi's two-sided book: YES at price X cents is
         equivalent to NO at (100 - X) cents.
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         params: dict[str, Any] = {"depth": depth}
         body = await client.get(f"/markets/{ticker}/orderbook", params=params)
 
@@ -514,8 +515,8 @@ def register(server: FastMCP) -> None:
         Returns an array of candlesticks with open/high/low/close
         prices and per-bar volume.
         """
-        ticker = _validate_ticker(ticker)
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        ticker = _validate_path_segment(ticker, kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         _validate_candlestick_window(start_ts, end_ts, period_interval)
         params: dict[str, Any] = {
             "start_ts": start_ts,
@@ -561,8 +562,8 @@ def register(server: FastMCP) -> None:
         the Nth ticker in `market_tickers`. Use Python's `zip()` (or
         equivalent) to pair them up.
         """
-        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         _validate_candlestick_window(start_ts, end_ts, period_interval)
         params: dict[str, Any] = {
             "start_ts": start_ts,
@@ -684,8 +685,8 @@ def register(server: FastMCP) -> None:
         malformed call on our side — try a different event or check with Kalshi
         which series carry percentile forecasts.
         """
-        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         if period_interval not in _VALID_FORECAST_INTERVALS:
             raise KalshiAPIError(
                 status=0,
@@ -760,7 +761,7 @@ def register(server: FastMCP) -> None:
             min_ts: Lower bound on trade ts (unix seconds).
             max_ts: Upper bound on trade ts (unix seconds).
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         params: dict[str, Any] = {"limit": limit, "ticker": ticker}
         if cursor:
             params["cursor"] = cursor

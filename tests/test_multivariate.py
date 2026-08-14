@@ -734,6 +734,22 @@ async def test_combo_collections_include_event_tickers_restores_arrays(rsa_priva
     assert "associated_event_count" not in c
 
 
+def test_project_collection_always_reports_a_count():
+    """REGRESSION (qa NIT): the docstring promises the universe arrays are
+    'replaced with associated_event_count', so the key must exist even when
+    Kalshi omits both arrays."""
+    from kalshi_mcp_server.tools.multivariate import _project_collection
+
+    bare = {"collection_ticker": "KX-R", "size_min": 2}
+    out = _project_collection(bare, include_event_tickers=False)
+    assert out["associated_event_count"] == 0
+    # Falls back to the objects list when the ticker list is absent.
+    with_events = {"associated_events": [{"ticker": "a"}, {"ticker": "b"}]}
+    assert (
+        _project_collection(with_events, include_event_tickers=False)["associated_event_count"] == 2
+    )
+
+
 @pytest.mark.asyncio
 async def test_combo_collection_single_defaults_to_full_universe(rsa_private_key):
     """The single-object fetch keeps the universe by default (that's the point

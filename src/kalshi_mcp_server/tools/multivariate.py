@@ -33,12 +33,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError, SafetyError
-from kalshi_mcp_server.tools.discovery import (
-    _event_hint,
-    _project_market,
-    _validate_path_ticker,
-    _validate_ticker,
-)
+from kalshi_mcp_server.tools._validation import _validate_path_segment, _validate_path_ticker
+from kalshi_mcp_server.tools.discovery import _event_hint, _project_market
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -192,12 +188,18 @@ def _project_collection(contract: dict[str, Any], *, include_event_tickers: bool
     if include_event_tickers:
         return dict(contract)
     projected = {k: v for k, v in contract.items() if k not in _COLLECTION_UNIVERSE_FIELDS}
+    # Always report a count, so a caller can rely on the key existing (the
+    # docstring promises the arrays are "replaced with associated_event_count").
+    # Prefer the ticker list; fall back to the objects list; 0 if neither is a
+    # readable list.
     tickers = contract.get("associated_event_tickers")
     events = contract.get("associated_events")
     if isinstance(tickers, list):
         projected["associated_event_count"] = len(tickers)
     elif isinstance(events, list):
         projected["associated_event_count"] = len(events)
+    else:
+        projected["associated_event_count"] = 0
     return projected
 
 
@@ -552,7 +554,7 @@ def register(server: FastMCP) -> None:
             `collection_ticker`, `event_ticker`, `title`: the combo's own
                 identifiers, always present when the market was fetched.
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         try:
             body = await client.get(f"/markets/{ticker}")
         except KalshiAPIError as exc:

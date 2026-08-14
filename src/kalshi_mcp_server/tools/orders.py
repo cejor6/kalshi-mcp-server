@@ -30,7 +30,7 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import SafetyError
 from kalshi_mcp_server.safety import OrderIntent
-from kalshi_mcp_server.tools.discovery import _validate_path_segment
+from kalshi_mcp_server.tools._validation import _validate_path_segment
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
