@@ -19,7 +19,8 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError
 from kalshi_mcp_server.rate_limit import DEFAULT_ENDPOINT_COST
-from kalshi_mcp_server.tools.discovery import _event_hint, _validate_ticker
+from kalshi_mcp_server.tools._validation import _validate_path_segment
+from kalshi_mcp_server.tools.discovery import _event_hint
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -257,7 +258,7 @@ def _project_orderbook_entry(entry: dict[str, Any], depth: int) -> dict[str, Any
 
 def _dedupe_tickers(tickers: list[str]) -> list[str]:
     """Validate, strip, and order-preservingly de-dupe a ticker list."""
-    cleaned = [_validate_ticker(t) for t in tickers]
+    cleaned = [_validate_path_segment(t, kind="ticker") for t in tickers]
     return list(dict.fromkeys(cleaned))
 
 
@@ -293,7 +294,7 @@ def register(server: FastMCP) -> None:
         Remember Kalshi's two-sided book: YES at price X cents is
         equivalent to NO at (100 - X) cents.
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         params: dict[str, Any] = {"depth": depth}
         body = await client.get(f"/markets/{ticker}/orderbook", params=params)
 
@@ -323,11 +324,17 @@ def register(server: FastMCP) -> None:
         keeps the read bucket for the next sweep, and the shallow default
         depth keeps 25 books inside a normal tool-result budget.
 
-        Errors are isolated per ticker. An unknown or event-level ticker yields
-        an `error` entry for THAT ticker only — the batch still returns every
-        book it could resolve. (A structurally invalid ticker, i.e. empty or
-        blank, is different: it fails the whole call up front, because it means
-        the argument itself is malformed rather than one entry being wrong.)
+        Failures are isolated, never fatal. If the batch request itself is
+        rejected (one malformed ticker can 400 the whole thing), this falls
+        back to per-ticker fetches and each bad ticker becomes an `error` entry
+        while the good ones still return. Note the live nuance: Kalshi's batch
+        endpoint returns an EMPTY book (not an error, not an omission) for an
+        unknown or event-level ticker, so those come back as an empty
+        `orderbook_fp` rather than an `error` entry — a caller can't distinguish
+        "dead market" from "bad ticker" from the batch result alone. (A
+        structurally invalid ticker — empty or blank string — is different: it
+        fails the whole call up front, because the argument itself is
+        malformed.)
 
         Args:
             tickers: 1-25 MARKET tickers (with outcome suffixes, e.g.
@@ -336,8 +343,8 @@ def register(server: FastMCP) -> None:
                 collapsed, so 25 entries with repeats fetch fewer than 25
                 books; that's fine, just don't pad the list past 25 expecting
                 de-duping to rescue it.) The cap protects your context, not
-                Kalshi — its endpoint allows 100. An EVENT ticker has no single
-                book and comes back as an error entry. An empty or
+                Kalshi — its endpoint allows 100. An EVENT ticker (no single
+                book) comes back as an EMPTY book, not an error. An empty or
                 blank-string entry rejects the whole call.
             depth: Price levels to keep PER SIDE, 1-100. Default 5 — enough
                 for top-of-book plus a few levels of context, which is what a
@@ -508,8 +515,8 @@ def register(server: FastMCP) -> None:
         Returns an array of candlesticks with open/high/low/close
         prices and per-bar volume.
         """
-        ticker = _validate_ticker(ticker)
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        ticker = _validate_path_segment(ticker, kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         _validate_candlestick_window(start_ts, end_ts, period_interval)
         params: dict[str, Any] = {
             "start_ts": start_ts,
@@ -555,8 +562,8 @@ def register(server: FastMCP) -> None:
         the Nth ticker in `market_tickers`. Use Python's `zip()` (or
         equivalent) to pair them up.
         """
-        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         _validate_candlestick_window(start_ts, end_ts, period_interval)
         params: dict[str, Any] = {
             "start_ts": start_ts,
@@ -667,9 +674,19 @@ def register(server: FastMCP) -> None:
         Returns `forecast_history`: per period, an `end_period_ts` plus
         `percentile_points` giving each requested percentile's raw, numeric,
         and formatted forecast value.
+
+        CAVEAT — not all events expose this. As of this writing, plausible,
+        doc-valid requests (weather and index events alike) come back `400 bad
+        request` from Kalshi, which suggests forecast-percentile data is
+        published for only some event types / windows. This tool sends the
+        exact request the API reference specifies (percentiles as a repeated
+        `percentiles=` param, timestamps in seconds); if you get the 400-with-
+        guidance error below, it is Kalshi refusing the request, not a
+        malformed call on our side — try a different event or check with Kalshi
+        which series carry percentile forecasts.
         """
-        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
-        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
+        series_ticker = _validate_path_segment(series_ticker, name="series_ticker", kind="ticker")
         if period_interval not in _VALID_FORECAST_INTERVALS:
             raise KalshiAPIError(
                 status=0,
@@ -695,10 +712,33 @@ def register(server: FastMCP) -> None:
             "end_ts": end_ts,
             "period_interval": period_interval,
         }
-        return await client.get(
-            f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
-            params=params,
-        )
+        try:
+            return await client.get(
+                f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
+                params=params,
+            )
+        except KalshiAPIError as exc:
+            # Kalshi 400s here even on doc-valid requests (see the CAVEAT in the
+            # docstring). Its own error body is unhelpful ("bad request"), so
+            # turn the opaque 400 into an actionable message naming the likely
+            # cause rather than letting an agent loop on it — the same policy as
+            # the candlestick guards. Only reshape the 400; re-raise anything
+            # else untouched.
+            if exc.status == 400:
+                raise KalshiAPIError(
+                    status=400,
+                    message=(
+                        f"Kalshi returned 400 for forecast history on "
+                        f"{event_ticker!r} (series {series_ticker!r}). The request shape "
+                        "is valid per Kalshi's API reference, so this most likely means "
+                        "this event/series does not publish percentile-forecast data, or "
+                        "not for this window. Not all events do. Try a different event, or "
+                        "confirm with Kalshi which series carry forecasts. "
+                        f"Kalshi said: {exc.message!r}."
+                    ),
+                    body=exc.body,
+                ) from exc
+            raise
 
     @server.tool
     async def kalshi_get_market_trades(
@@ -721,7 +761,7 @@ def register(server: FastMCP) -> None:
             min_ts: Lower bound on trade ts (unix seconds).
             max_ts: Upper bound on trade ts (unix seconds).
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         params: dict[str, Any] = {"limit": limit, "ticker": ticker}
         if cursor:
             params["cursor"] = cursor

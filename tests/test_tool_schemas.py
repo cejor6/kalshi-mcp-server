@@ -135,6 +135,7 @@ async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
         ("kalshi_get_orderbooks", "depth", 1, 100),
         ("kalshi_get_series_summary", "top", 1, 200),
         ("kalshi_get_milestones", "limit", 1, 500),
+        ("kalshi_get_series_list", "limit", 1, 1000),
         ("kalshi_get_combo_collections", "limit", 1, 200),
         ("kalshi_get_combo_events", "limit", 1, 200),
     ],

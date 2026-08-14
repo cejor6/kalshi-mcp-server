@@ -33,12 +33,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError, SafetyError
-from kalshi_mcp_server.tools.discovery import (
-    _event_hint,
-    _project_market,
-    _validate_path_ticker,
-    _validate_ticker,
-)
+from kalshi_mcp_server.tools._validation import _validate_path_segment, _validate_path_ticker
+from kalshi_mcp_server.tools.discovery import _event_hint, _project_market
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -167,6 +163,44 @@ def _resolve_combo_legs(market: dict[str, Any]) -> tuple[list[dict[str, Any]], s
     if legs:
         return legs, "custom_strike"
     return [], None
+
+
+# The two heavy fields on a collection object, both parallel per-eligible-event
+# arrays that run to ~hundreds (863 on a prod cross-category collection, ~104KB
+# each). `associated_event_tickers` is the ticker list; `associated_events` is
+# the same set as objects (per-event size bounds + `active_quoters`). Dropped by
+# default — the construction RULES (`size_min`/`size_max`/`is_all_yes`/…) are
+# what a caller needs, and they're tiny.
+_COLLECTION_UNIVERSE_FIELDS: tuple[str, ...] = (
+    "associated_event_tickers",
+    "associated_events",
+)
+
+
+def _project_collection(contract: dict[str, Any], *, include_event_tickers: bool) -> dict[str, Any]:
+    """Shape one collection object for a tool result.
+
+    By default strips the large eligible-event universe arrays and replaces
+    them with `associated_event_count`, keeping the construction rules. Pass
+    `include_event_tickers=True` to keep the full arrays (single-object reads
+    only — it can be ~100KB).
+    """
+    if include_event_tickers:
+        return dict(contract)
+    projected = {k: v for k, v in contract.items() if k not in _COLLECTION_UNIVERSE_FIELDS}
+    # Always report a count, so a caller can rely on the key existing (the
+    # docstring promises the arrays are "replaced with associated_event_count").
+    # Prefer the ticker list; fall back to the objects list; 0 if neither is a
+    # readable list.
+    tickers = contract.get("associated_event_tickers")
+    events = contract.get("associated_events")
+    if isinstance(tickers, list):
+        projected["associated_event_count"] = len(tickers)
+    elif isinstance(events, list):
+        projected["associated_event_count"] = len(events)
+    else:
+        projected["associated_event_count"] = 0
+    return projected
 
 
 class ComboLeg(BaseModel):
@@ -298,6 +332,7 @@ def register(server: FastMCP) -> None:
         associated_event_ticker: str | None = None,
         limit: Annotated[int, Field(ge=1, le=200)] = 20,
         cursor: str | None = None,
+        include_event_tickers: bool = False,
     ) -> dict[str, Any]:
         """List multivariate event COLLECTIONS — the parlay families on offer.
 
@@ -317,11 +352,19 @@ def register(server: FastMCP) -> None:
             limit: 1-200. Default 20.
             cursor: Pagination cursor from a previous response. Kalshi
                 silently returns an empty list on a malformed cursor.
+            include_event_tickers: Keep each collection's full eligible-event
+                universe (`associated_event_tickers` + `associated_events`).
+                Default False — those are parallel arrays that run to HUNDREDS
+                of entries per collection (a cross-category collection is 800+,
+                ~100KB EACH), so even a small `limit` overflows the context
+                with them on. By default each collection reports
+                `associated_event_count` instead; use
+                `kalshi_get_combo_collection(..., include_event_tickers=True)`
+                to pull one collection's full universe when you actually need
+                the leg candidates.
 
-        Token-cap note: collection objects carry `associated_event_tickers`,
-        which can run to hundreds of entries on a broad cross-category
-        collection. Keep `limit` low when browsing; fetch one collection in
-        full with `kalshi_get_combo_collection` once you know which you want.
+        The construction rules (`size_min`/`size_max`/`is_all_yes`/…) — the
+        part you need to build or validate a parlay — are always kept.
         """
         params: dict[str, Any] = {"limit": limit}
         if status:
@@ -332,16 +375,26 @@ def register(server: FastMCP) -> None:
             params["associated_event_ticker"] = associated_event_ticker
         if cursor:
             params["cursor"] = cursor
-        return await client.get("/multivariate_event_collections", params=params)
+        body = await client.get("/multivariate_event_collections", params=params)
+        if "multivariate_contracts" in body:
+            body["multivariate_contracts"] = [
+                _project_collection(c, include_event_tickers=include_event_tickers)
+                for c in body["multivariate_contracts"]
+                if isinstance(c, dict)
+            ]
+        return body
 
     @server.tool
-    async def kalshi_get_combo_collection(collection_ticker: str) -> dict[str, Any]:
+    async def kalshi_get_combo_collection(
+        collection_ticker: str,
+        include_event_tickers: bool = True,
+    ) -> dict[str, Any]:
         """Fetch one multivariate event collection by ticker.
 
         Returns the collection's construction rules — `size_min` / `size_max`
         (legs per combo), `is_all_yes` (whether NO legs are allowed),
         `is_ordered`, `is_single_market_per_event`, `functional_description`,
-        and the full `associated_event_tickers` universe.
+        and (by default) the full `associated_event_tickers` universe.
 
         Read this BEFORE `kalshi_create_combo_market`: those fields are
         exactly the rules Kalshi rejects a malformed selection against, and it
@@ -351,13 +404,25 @@ def register(server: FastMCP) -> None:
             collection_ticker: e.g. "KXMVECROSSCATEGORY-SHARD1-R". A combo
                 market's own `mve_collection_ticker` field names its parent
                 collection.
+            include_event_tickers: Keep the full eligible-event universe
+                (`associated_event_tickers` + `associated_events`). Default
+                True — this is a single-object fetch and the universe is the
+                point of drilling into one collection. Set False if you only
+                need the rules and want to avoid a large (~100KB on a broad
+                collection) response; you then get `associated_event_count`.
 
-        Token-cap note: `associated_event_tickers` can be long on a broad
-        collection — this is a single-object fetch, so expect a large-ish
-        response and don't loop it over many collections.
+        Even as a single fetch this can be large (a cross-category collection's
+        universe is 800+ events) — don't loop it over many collections; use the
+        list tool's `associated_event_count` to triage first.
         """
         collection_ticker = _validate_path_ticker(collection_ticker, name="collection_ticker")
-        return await client.get(f"/multivariate_event_collections/{collection_ticker}")
+        body = await client.get(f"/multivariate_event_collections/{collection_ticker}")
+        contract = body.get("multivariate_contract")
+        if isinstance(contract, dict):
+            body["multivariate_contract"] = _project_collection(
+                contract, include_event_tickers=include_event_tickers
+            )
+        return body
 
     @server.tool
     async def kalshi_get_combo_events(
@@ -489,7 +554,7 @@ def register(server: FastMCP) -> None:
             `collection_ticker`, `event_ticker`, `title`: the combo's own
                 identifiers, always present when the market was fetched.
         """
-        ticker = _validate_ticker(ticker)
+        ticker = _validate_path_segment(ticker, kind="ticker")
         try:
             body = await client.get(f"/markets/{ticker}")
         except KalshiAPIError as exc:

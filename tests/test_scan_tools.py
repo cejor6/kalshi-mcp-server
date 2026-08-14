@@ -452,3 +452,269 @@ async def test_get_orderbooks_rejects_empty_and_blank_tickers(rsa_private_key):
     with pytest.raises(KalshiAPIError):
         await fn(tickers=["KX-A", "   "])
     assert calls == []
+
+
+# ── kalshi_get_series_list (context-blowup hardening) ──────────────────────
+
+
+def _series_catalog_handler(n: int):
+    """A /series handler returning `n` series with descending volume plus the
+    bulky fields the minimal projection must strip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/series")
+        series = [
+            {
+                "ticker": f"KXS{i:04d}",
+                "title": f"Series {i}",
+                "category": "Economics",
+                "volume_fp": str((n - i) * 100),  # S0 highest, descending
+                "settlement_sources": [{"name": "src", "url": "https://x"}] * 20,
+                "product_metadata": {"blob": "x" * 500},
+            }
+            for i in range(n)
+        ]
+        return httpx.Response(200, json={"series": series})
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_series_list_projects_and_caps_by_volume(rsa_private_key):
+    """The live failure: one category returned 556KB. The tool must bound the
+    result — top-`limit` by volume, minimal projection — not dump everything."""
+    server = _make_server(rsa_private_key, _series_catalog_handler(500))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+
+    out = await fn(category="Economics", limit=10)
+
+    assert out["total_matched"] == 500  # Kalshi returned all 500
+    assert out["returned"] == 10  # but we cap the response
+    assert out["truncated"] is True
+    # Highest volume first (S0000 has the largest), minimal projection.
+    assert out["series"][0]["ticker"] == "KXS0000"
+    for entry in out["series"]:
+        assert "settlement_sources" not in entry
+        assert "product_metadata" not in entry
+        assert set(entry) <= {
+            "ticker",
+            "title",
+            "category",
+            "frequency",
+            "tags",
+            "fee_type",
+            "volume_fp",
+            "last_updated_ts",
+        }
+
+
+@pytest.mark.asyncio
+async def test_series_list_minimal_false_keeps_everything(rsa_private_key):
+    """The escape hatch for a narrow query: `minimal=False` returns the full
+    objects and requests the product-metadata blob."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={"series": [{"ticker": "KXA", "settlement_sources": [{"name": "s"}]}]},
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+
+    out = await fn(tags="rare", minimal=False)
+
+    assert "settlement_sources" in out["series"][0]  # full object kept
+    assert seen[0].url.params["include_product_metadata"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_series_list_minimal_default_does_not_request_product_metadata(rsa_private_key):
+    """Default (minimal) must NOT ask Kalshi for the heavy product-metadata blob."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"series": [{"ticker": "KXA", "volume_fp": "1"}]})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    await fn(category="Economics")
+    assert seen[0].url.params["include_product_metadata"] == "false"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_limit", [0, -1, -50])
+async def test_series_list_clamps_nonpositive_limit_to_empty(rsa_private_key, bad_limit):
+    """REGRESSION: the client-side cut is the ONLY backstop (the endpoint has
+    no limit param), so a negative limit must clamp to [] — unclamped it would
+    slice from the END and return a near-full list. Mirrors the clamp in
+    `_rank_liquid_markets` / `_TopKByVolume`."""
+    server = _make_server(rsa_private_key, _series_catalog_handler(10))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    out = await fn(limit=bad_limit)
+    assert out["series"] == []
+    assert out["returned"] == 0
+    assert out["total_matched"] == 10
+
+
+@pytest.mark.asyncio
+async def test_series_list_not_truncated_when_under_limit(rsa_private_key):
+    server = _make_server(rsa_private_key, _series_catalog_handler(3))
+    fn = await _tool_fn(server, "kalshi_get_series_list")
+    out = await fn(limit=100)
+    assert out["total_matched"] == 3
+    assert out["returned"] == 3
+    assert out["truncated"] is False
+
+
+# ── kalshi_get_event_forecast_history (opaque-400 → actionable) ────────────
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_reshapes_kalshis_opaque_400(rsa_private_key):
+    """Live, this endpoint 400s on doc-valid requests. The tool must turn the
+    bare 'bad request' into an actionable message instead of passing it through
+    for an agent to loop on."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+            period_interval=60,
+        )
+    msg = exc.value.message
+    assert exc.value.status == 400
+    assert "does not publish percentile-forecast data" in msg
+    assert "KXHIGHNY-26AUG14" in msg
+    assert "bad request" in msg  # Kalshi's own text is preserved
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_passes_percentiles_as_repeated_params(rsa_private_key):
+    """Encoding is confirmed correct against Kalshi's API reference (exploded
+    form), so pin it: percentiles go out as repeated `percentiles=` params."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"forecast_history": []})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    await fn(
+        event_ticker="KXHIGHNY-26AUG14",
+        series_ticker="KXHIGHNY",
+        start_ts=1_000_000,
+        end_ts=1_086_400,
+        percentiles=[2500, 5000, 7500],
+    )
+    assert seen[0].url.params.get_list("percentiles") == ["2500", "5000", "7500"]
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert exc.value.status == 500
+    assert "does not publish" not in exc.value.message
+
+
+# ── read-path ticker injection (security hardening) ────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,kwargs",
+    [
+        ("kalshi_get_market", {"ticker": "KX/../../portfolio/balance"}),
+        ("kalshi_get_orderbook", {"ticker": "KX?foo=bar"}),
+        ("kalshi_get_event", {"event_ticker": "KX/../x"}),
+        ("kalshi_get_series", {"series_ticker": "KX#frag"}),
+        (
+            "kalshi_get_market_candlesticks",
+            {"ticker": "KX/../x", "series_ticker": "KXS", "start_ts": 1, "end_ts": 2},
+        ),
+        (
+            "kalshi_get_event_forecast_history",
+            {"event_ticker": "KX/../x", "series_ticker": "KXS", "start_ts": 1, "end_ts": 2},
+        ),
+    ],
+)
+async def test_read_path_tickers_reject_injection_before_the_wire(
+    rsa_private_key, tool_name, kwargs
+):
+    """A model-supplied ticker with a path separator would steer a GET to a
+    different endpoint under a valid signature (auth.py strips the query before
+    signing). The read tools now validate with the path-segment guard, so this
+    must fail locally with no wire call."""
+    calls: list[str] = []
+    server = _make_server(
+        rsa_private_key,
+        lambda r: (calls.append(r.url.path), httpx.Response(200, json={}))[1],
+    )
+    fn = await _tool_fn(server, tool_name)
+    with pytest.raises(KalshiAPIError):
+        await fn(**kwargs)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_batch_orderbooks_rejects_injection_ticker_before_the_wire(rsa_private_key):
+    """`_dedupe_tickers` now uses the path-segment guard, so a ticker that could
+    reach the per-ticker fallback path is rejected up front."""
+    calls: list[str] = []
+    server = _make_server(
+        rsa_private_key,
+        lambda r: (calls.append(r.url.path), httpx.Response(200, json={}))[1],
+    )
+    fn = await _tool_fn(server, "kalshi_get_orderbooks")
+    with pytest.raises(KalshiAPIError):
+        await fn(tickers=["KX-A", "KX/../../x"])
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_markets_injection_ticker_never_reaches_event_hint_wire(rsa_private_key):
+    """REGRESSION (qa NIT): `kalshi_get_markets` is the one path that reaches
+    `_event_hint` with an UNVALIDATED value — its `tickers` arg. On an empty
+    result it extracts the sole ticker and probes `/events/{ticker}`; a ticker
+    with a path separator must be rejected by `_event_hint`'s defensive guard
+    (fail-open) so it never steers that probe. The `/markets` query call still
+    happens (httpx encodes the query), but no `/events` call does."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"markets": []})  # empty → triggers the hint path
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_markets")
+
+    out = await fn(tickers="KX/../../portfolio/balance")
+
+    assert out == {"markets": []}  # clean passthrough, no crash, no hint raised
+    assert not any(p.endswith("/events/KX/../../portfolio/balance") for p in paths)
+    assert not any("/events/" in p for p in paths)  # the injection never probed /events
