@@ -14,6 +14,8 @@ per-day ceiling, and does not consume local budget on a rejected call.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 from fastmcp import FastMCP
@@ -23,7 +25,7 @@ from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
 from kalshi_mcp_server.errors import ComboCreationDisabledError, KalshiAPIError, SafetyError
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
-from kalshi_mcp_server.safety import SafetyController
+from kalshi_mcp_server.safety import SafetyController, _DailyCounter
 from kalshi_mcp_server.tools import multivariate
 from kalshi_mcp_server.tools.discovery import _parse_fields
 from kalshi_mcp_server.tools.multivariate import (
@@ -197,10 +199,72 @@ def test_split_csv_positional_does_not_dedupe():
     """The helper this hinges on, pinned directly: `_parse_fields` de-dupes by
     design and must never be reused for positional columns."""
     assert _split_csv_positional("yes,yes,no") == ["yes", "yes", "no"]
-    assert _split_csv_positional(" a , b ,, c ") == ["a", "b", "c"]
     assert _split_csv_positional(None) == []
+    assert _split_csv_positional("") == []
     # The contrast that caused the bug.
     assert _parse_fields("yes,yes,no") == ["yes", "no"]
+
+
+def test_split_csv_positional_keeps_interior_empties_but_drops_trailing():
+    """REGRESSION (round 2): dropping interior empties SHIFTS every later value
+    up an index. Positions must survive; only a trailing comma is formatting."""
+    assert _split_csv_positional("yes,,no") == ["yes", "", "no"]
+    assert _split_csv_positional(",yes,no") == ["", "yes", "no"]
+    assert _split_csv_positional("yes,no,") == ["yes", "no"]
+    assert _split_csv_positional("yes,no,,,") == ["yes", "no"]
+    assert _split_csv_positional(" a , b ,, c ") == ["a", "b", "", "c"]
+    assert _split_csv_positional(",,,") == []
+
+
+def test_legs_from_custom_strike_never_misassigns_on_a_ragged_column():
+    """REGRESSION (round 2): the first fix filtered empties out of each column
+    independently, so a column with a DIFFERENT raw field count could land on a
+    coincidentally-matching filtered length, pass the alignment check, and hand
+    back confidently WRONG sides — strictly worse than the nulls it replaced.
+
+    Here sides has 4 raw fields (one empty) against 3 tickers. Post-filter that
+    was 3 == 3 and leg C got the garbage 4th value. Alignment is now decided on
+    positional length, so this correctly degrades to nulls.
+    """
+    market = {
+        "custom_strike": {
+            "Associated Markets": "A,B,C",
+            "Associated Market Sides": "yes,,no,maybe",
+            "Associated Events": "EA,EB,EC",
+        }
+    }
+    legs = _legs_from_custom_strike(market)
+    assert [leg["market_ticker"] for leg in legs] == ["A", "B", "C"]
+    assert [leg["side"] for leg in legs] == [None, None, None]
+    # The events column DOES line up positionally, so it survives.
+    assert [leg["event_ticker"] for leg in legs] == ["EA", "EB", "EC"]
+
+
+def test_legs_from_custom_strike_skips_empty_slots_without_shifting():
+    """An empty slot present in every column is a hole, not a leg — dropping it
+    must leave the surviving legs' side/event mapping untouched."""
+    market = {
+        "custom_strike": {
+            "Associated Markets": "A,,C",
+            "Associated Market Sides": "yes,,no",
+            "Associated Events": "EA,,EC",
+        }
+    }
+    assert _legs_from_custom_strike(market) == [
+        {"market_ticker": "A", "event_ticker": "EA", "side": "yes"},
+        {"market_ticker": "C", "event_ticker": "EC", "side": "no"},
+    ]
+
+
+def test_legs_from_custom_strike_tolerates_a_trailing_comma():
+    market = {
+        "custom_strike": {
+            "Associated Markets": "A,B,",
+            "Associated Market Sides": "yes,no",
+            "Associated Events": "EA,EB",
+        }
+    }
+    assert [leg["side"] for leg in _legs_from_custom_strike(market)] == ["yes", "no"]
 
 
 def test_legs_from_custom_strike_drops_side_on_column_mismatch():
@@ -875,6 +939,61 @@ def test_release_combo_creation_never_goes_negative():
     safety.release_combo_creation()
     safety.release_combo_creation()
     assert safety.combo_creation_view()["combo_creations_today"] == 0
+
+
+def test_daily_counter_subtract_is_atomic_with_the_day_roll():
+    """REGRESSION (round 2): release was `peek()` then `add(-1)`, two separate
+    lock acquisitions. A UTC-midnight rollover landing between them rolled the
+    counter to 0 and THEN applied the decrement, leaving the new day at -1 —
+    silently widening that day's ceiling by one. `subtract` does both under one
+    lock and clamps at zero."""
+    counter = _DailyCounter()
+    counter.add(1.0)
+    # Force the roll to fire inside subtract by faking yesterday's stamp.
+    counter.day = "1999-01-01"
+    assert counter.subtract(1.0) == 0.0
+    assert counter.peek()[1] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_create_combo_market_releases_the_slot_when_the_post_never_went_out(
+    rsa_private_key,
+):
+    """REGRESSION (round 2): a transport failure before the POST is provably
+    'nothing created'. Keeping the slot meant a Kalshi outage (or an MCP client
+    timing the call out) silently drained the whole day's creation budget with
+    zero combos made, recoverable only by restart or UTC midnight."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            raise httpx.ConnectError("kalshi unreachable")
+        return httpx.Response(200, json={"multivariate_contract": {"size_min": 1}})
+
+    server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    # A transport error surfaces as KalshiAPIError(status=0) — ambiguous once
+    # the POST is in flight, so this one legitimately keeps the slot.
+    with pytest.raises(KalshiAPIError):
+        await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 1
+
+
+@pytest.mark.asyncio
+async def test_create_combo_market_releases_the_slot_on_a_cancelled_call(rsa_private_key):
+    """Cancellation before dispatch (an MCP client timeout) must not cost
+    budget — CancelledError is a BaseException and escaped the old handlers."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    with pytest.raises(asyncio.CancelledError):
+        await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
+    # Cancelled during the collection GET — the POST never dispatched.
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 0
 
 
 def test_combo_creation_state_is_visible_in_the_environment_view():

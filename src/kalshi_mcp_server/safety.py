@@ -145,6 +145,19 @@ class _DailyCounter:
             self.cost_usd += cost_usd
             return self.cost_usd
 
+    def subtract(self, amount: float) -> float:
+        """Give back `amount`, clamped at zero, atomically with the day roll.
+
+        Must NOT be expressed as `peek()` then `add(-amount)`: those take the
+        lock separately, so a UTC-midnight rollover landing between them rolls
+        the counter to 0 and then applies the decrement, leaving the NEW day at
+        -1 and silently widening that day's ceiling by one.
+        """
+        with self._lock:
+            self._maybe_roll()
+            self.cost_usd = max(0.0, self.cost_usd - amount)
+            return self.cost_usd
+
     def peek(self) -> tuple[str, float]:
         with self._lock:
             self._maybe_roll()
@@ -482,15 +495,23 @@ class SafetyController:
             )
 
     def release_combo_creation(self) -> None:
-        """Return a reserved slot after an UNAMBIGUOUS rejection.
+        """Return a reserved slot when nothing was created.
 
-        Only for outcomes where Kalshi certainly did not create anything — a
-        4xx. Never call this on a timeout or a 5xx: the combo may exist, and
-        crediting the budget back would let a retry loop spin freely.
+        Call only for outcomes where Kalshi certainly created nothing — an
+        unambiguous 4xx, a local refusal, or a failure before the POST was
+        dispatched. Never on a timeout or a 5xx once the POST is in flight:
+        the combo may exist, and crediting the budget back would let a retry
+        loop spin freely.
+
+        Known imprecision, deliberately not engineered away: this returns *a*
+        slot for the current day, not specifically the one this caller
+        reserved. If a request reserves just before UTC midnight and releases
+        just after, it credits the new day instead — granting at most one
+        extra creation, self-correcting, and requiring a sub-second window.
+        Threading a day-stamped reservation token through every call path
+        costs more complexity than that is worth.
         """
-        _, used = self._combo_creations.peek()
-        if used > 0:
-            self._combo_creations.add(-1.0)
+        self._combo_creations.subtract(1.0)
 
     def combo_creation_view(self) -> dict[str, object]:
         """Combo-creation state for `kalshi_get_environment` / the resource."""

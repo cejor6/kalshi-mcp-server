@@ -331,11 +331,13 @@ def register(server: FastMCP) -> None:
 
         Args:
             tickers: 1-25 MARKET tickers (with outcome suffixes, e.g.
-                "KXFED-26MAR19-B5.25"). Duplicates are collapsed and the cap
-                applies AFTER de-duping. Over 25 is rejected with a message
-                telling you to split the batch — the cap protects your context,
-                not Kalshi (its endpoint allows 100). An EVENT ticker has no
-                single book and comes back as an error entry. An empty or
+                "KXFED-26MAR19-B5.25"). Send at most 25 entries — the limit is
+                on the list you pass, duplicates included. (Duplicates are then
+                collapsed, so 25 entries with repeats fetch fewer than 25
+                books; that's fine, just don't pad the list past 25 expecting
+                de-duping to rescue it.) The cap protects your context, not
+                Kalshi — its endpoint allows 100. An EVENT ticker has no single
+                book and comes back as an error entry. An empty or
                 blank-string entry rejects the whole call.
             depth: Price levels to keep PER SIDE, 1-100. Default 5 — enough
                 for top-of-book plus a few levels of context, which is what a
@@ -588,7 +590,9 @@ def register(server: FastMCP) -> None:
         actually affords.
 
         Args:
-            market_tickers: 1-100 MARKET tickers. Duplicates are collapsed.
+            market_tickers: 1-100 MARKET tickers. The limit is on the list you
+                pass, duplicates included; duplicates are then collapsed before
+                the request goes out.
             start_ts: Window start, unix seconds. Must be < end_ts.
             end_ts: Window end, unix seconds.
             period_interval: Bar width in MINUTES. Kalshi accepts ONLY 1

@@ -129,6 +129,22 @@ def test_validate_path_ticker_rejects_separators_and_whitespace(bad):
     assert "not valid in a Kalshi ticker" in exc.value.message
 
 
+@pytest.mark.parametrize("dots", [".", "..", "...."])
+def test_validate_path_ticker_rejects_bare_dot_segments(dots):
+    """REGRESSION: '.' is legal INSIDE a ticker ("…-B5.25"), so the charset
+    check alone let a bare '.'/'..' through — and those are dot-SEGMENTS that
+    httpx resolves away, sending the request to a different endpoint than the
+    one we signed ('.' collapses to the LIST endpoint, '..' climbs above it)."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker(dots, name="collection_ticker")
+    assert "path segment" in exc.value.message
+
+
+def test_validate_path_ticker_still_allows_dots_inside_a_ticker():
+    """The guard must not overreach — real strike tickers carry a decimal."""
+    assert _validate_path_ticker("KXFED-26MAR19-B5.25") == "KXFED-26MAR19-B5.25"
+
+
 def test_validate_path_ticker_still_rejects_empty():
     with pytest.raises(KalshiAPIError) as exc:
         _validate_path_ticker("   ", name="collection_ticker")
@@ -174,6 +190,19 @@ def test_topk_by_volume_projects_minimally():
     fold = _TopKByVolume(limit=1)
     fold([{"ticker": "A", "volume_24h_fp": "10", "rules_primary": "long text"}])
     assert "rules_primary" not in fold.result()[0]
+
+
+@pytest.mark.parametrize("limit", [0, -1, -5])
+def test_topk_and_batch_agree_on_degenerate_limits(limit):
+    """The schema's `ge=1` only binds MCP clients; a direct `.fn` caller can
+    pass 0 or a negative. The two ranking paths must not disagree there — an
+    unclamped negative would slice from the END via `list[:-1]` and return a
+    near-full list from one path and nothing from the other."""
+    markets = [{"ticker": f"M{i}", "volume_24h_fp": str(i)} for i in range(5)]
+    fold = _TopKByVolume(limit=limit)
+    fold(markets)
+    assert fold.result() == []
+    assert _rank_liquid_markets(markets, limit=limit) == []
 
 
 # ── _compact_market ────────────────────────────────────────────────────────

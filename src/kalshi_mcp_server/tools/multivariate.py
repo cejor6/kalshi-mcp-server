@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
-from kalshi_mcp_server.errors import KalshiAPIError, SafetyError
+from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError, SafetyError
 from kalshi_mcp_server.tools.discovery import (
     _event_hint,
     _project_market,
@@ -89,14 +89,32 @@ def _legs_from_selected(market: dict[str, Any]) -> list[dict[str, Any]]:
 def _split_csv_positional(raw: Any) -> list[str]:
     """Split one of `custom_strike`'s parallel CSV columns, PRESERVING position.
 
-    Deliberately NOT `discovery._parse_fields`: that helper de-dupes (it exists
-    for a field whitelist, where a repeat is a caller mistake). De-duping
-    positional data is catastrophic here — the sides column of a real combo is
-    usually "yes,yes,yes…" and collapses to a single element, which then fails
-    the length check below and silently nulls every leg's side. Repeats are
-    MEANINGFUL in a parallel array; only empty trailing fragments are dropped.
+    Every field keeps its index. Two things this must NOT do, both of which
+    have already shipped a bug here:
+
+    * **Don't de-dupe** (what `discovery._parse_fields` does — it exists for a
+      field whitelist, where a repeat is a caller mistake). A real all-YES
+      combo's sides column is "yes,yes,yes…", which collapsed to one element,
+      failed the alignment check, and nulled every leg's side.
+    * **Don't drop interior empties.** Filtering `if part.strip()` removes an
+      empty field entirely, shifting every later value up an index. If that
+      makes the filtered length coincidentally match the ticker column, the
+      alignment check passes and legs get the WRONG side — strictly worse than
+      the null a mismatch would have produced.
+
+    So: split, strip each field, and drop only TRAILING empties (a trailing
+    comma is formatting, not a slot). Interior empties survive as "" and keep
+    the columns lined up; `_legs_from_custom_strike` skips those slots by
+    index. An all-empty column returns [], which fails alignment — correct,
+    since it carries no usable positional data.
     """
-    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in text.split(",")]
+    while parts and not parts[-1]:
+        parts.pop()
+    return parts
 
 
 def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
@@ -111,20 +129,29 @@ def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(strike, dict):
         return []
     tickers = _split_csv_positional(strike.get(_CUSTOM_STRIKE_MARKETS_KEY))
-    if not tickers:
+    if not any(tickers):
         return []
     sides = _split_csv_positional(strike.get(_CUSTOM_STRIKE_SIDES_KEY))
     events = _split_csv_positional(strike.get(_CUSTOM_STRIKE_EVENTS_KEY))
+    # Alignment is decided on the POSITIONAL lengths — interior empties are
+    # still counted, so a column with a different field count can't sneak past
+    # by coincidentally matching after a filter.
     aligned_sides = len(sides) == len(tickers)
     aligned_events = len(events) == len(tickers)
-    return [
-        {
-            "market_ticker": ticker,
-            "event_ticker": events[i] if aligned_events else None,
-            "side": sides[i] if aligned_sides else None,
-        }
-        for i, ticker in enumerate(tickers)
-    ]
+    legs: list[dict[str, Any]] = []
+    for i, ticker in enumerate(tickers):
+        if not ticker:
+            # An empty ticker slot is not a leg. Skipping it by index leaves
+            # every other leg's side/event mapping untouched.
+            continue
+        legs.append(
+            {
+                "market_ticker": ticker,
+                "event_ticker": (events[i] or None) if aligned_events else None,
+                "side": (sides[i] or None) if aligned_sides else None,
+            }
+        )
+    return legs
 
 
 def _resolve_combo_legs(market: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
@@ -620,9 +647,10 @@ def register(server: FastMCP) -> None:
                 you need prices.
 
         Pre-flight: the collection's own rules (`size_min` / `size_max` /
-        `is_all_yes`) are checked locally first, because Kalshi rejects a
-        malformed selection with an opaque 400. That check fails OPEN — if the
-        collection can't be read, the request proceeds and Kalshi decides.
+        `is_all_yes` / `is_single_market_per_event`) are checked locally first,
+        because Kalshi rejects a malformed selection with an opaque 400. That
+        check fails OPEN — if the collection can't be read, the request
+        proceeds and Kalshi decides.
 
         Returns `event_ticker` and `market_ticker` for the created combo, plus
         `created_today` / `max_per_day` so you can see your remaining local
@@ -641,6 +669,11 @@ def register(server: FastMCP) -> None:
         # and a concurrent pair can't both pass the same ceiling.
         safety.reserve_combo_creation()
 
+        # Tracks whether the creating POST was actually dispatched. Everything
+        # before it is provably "nothing created", so any failure up to that
+        # point returns the slot; only once the POST is in flight does an
+        # ambiguous outcome have to cost budget.
+        posted = False
         try:
             try:
                 collection = await client.get(
@@ -658,21 +691,37 @@ def register(server: FastMCP) -> None:
             body: dict[str, Any] = {"selected_markets": normalized}
             if with_market_payload:
                 body["with_market_payload"] = True
+            posted = True
             response = await client.post(
                 f"/multivariate_event_collections/{collection_ticker}", json=body
             )
+        except RateLimitError:
+            # Either the local bucket refused before sending, or Kalshi replied
+            # 429. Both mean nothing was created — return the slot. (Answering
+            # a rate limit by keeping budget spent would also punish the caller
+            # twice for one throttle.)
+            safety.release_combo_creation()
+            raise
         except KalshiAPIError as exc:
-            # Give the reserved slot back ONLY when Kalshi unambiguously
-            # refused (4xx) — nothing was created, so nothing was spent. A
-            # timeout (status 0) or a 5xx is ambiguous: the combo may exist,
-            # and that is exactly the case a retry loop hits, so the slot
-            # stays spent. See SafetyController.reserve_combo_creation.
-            if 400 <= exc.status < 500:
+            # Once the POST is in flight, give the slot back ONLY on an
+            # unambiguous 4xx refusal. A timeout (status 0) or a 5xx is
+            # ambiguous — the combo may exist, and that is exactly the case a
+            # retry loop hits, so it must cost budget. Before the POST, every
+            # failure is provably "nothing created".
+            if not posted or 400 <= exc.status < 500:
                 safety.release_combo_creation()
             raise
         except SafetyError:
             # Local pre-flight refusal — no request went out.
             safety.release_combo_creation()
+            raise
+        except BaseException:
+            # Cancellation (an MCP client timing the tool call out) and any
+            # unexpected error. If the POST never went out this is provably
+            # "nothing created", so don't let a Kalshi outage or a impatient
+            # client silently drain the day's creation budget.
+            if not posted:
+                safety.release_combo_creation()
             raise
 
         view = safety.combo_creation_view()

@@ -510,23 +510,41 @@ tools encode these; don't regress them.
   an error — which is why the docstring leads with the scale and the validator
   only enforces the hard bounds. `period_interval=0` (5-second bars) is legal
   on that endpoint and ONLY that one.
-- **Never parse `custom_strike`'s parallel columns with `_parse_fields`.**
-  That helper de-dupes (it exists for a *field whitelist*, where a repeat is a
-  caller mistake). `custom_strike` holds three PARALLEL arrays where repeats
-  are the norm and carry meaning: the sides column of a real all-YES combo is
-  `"yes,yes,yes…"`, which de-duped down to one element, failed the
-  length-alignment check, and silently returned every leg with `side: null`
-  while still reporting `resolvable: true`. Use `_split_csv_positional`, which
-  preserves position. This shipped once and was caught in review; the
-  regression tests use REPEATED values on purpose, because the original tests
-  used `"yes,no"` and de-duping is a no-op on distinct values.
+- **`custom_strike`'s three columns are PARALLEL ARRAYS — index is the only
+  thing linking them.** Two different ways of destroying that have already
+  shipped here, both caught in review, so use `_split_csv_positional` and
+  nothing else:
+  1. **Never de-dupe** (`_parse_fields` does — it's a *field whitelist*
+     helper, where a repeat is a caller mistake). A real all-YES combo's sides
+     column is `"yes,yes,yes…"`; de-duped it collapsed to one element, failed
+     the length-alignment check, and returned every leg with `side: null`
+     while still reporting `resolvable: true`.
+  2. **Never drop interior empties.** Filtering `if part.strip()` deletes an
+     empty field and shifts every later value up an index. If that makes the
+     filtered length coincidentally match the ticker column, alignment
+     *passes* and legs get the WRONG side — strictly worse than the null a
+     mismatch produces, and it round-trips into `kalshi_create_combo_market`
+     as a parlay betting the wrong direction. Only TRAILING empties are
+     dropped; alignment is decided on positional length.
+
+  The regression tests use REPEATED values and RAGGED columns on purpose — the
+  original tests used `"yes,no"`, where both bugs are invisible.
 - **Tickers interpolated into a URL path go through `_validate_path_ticker`,
   not just `_validate_ticker`.** Paths are built with f-strings and the signed
-  canonical message is rebuilt the same way, so a `/`, `?`, `#`, or `..` in a
-  ticker changes which endpoint the request reaches. It matters most on the
-  POST path (`/multivariate_event_collections/{collection_ticker}`), where the
-  string is model-supplied and the call mutates state. Restricting to the
-  charset real tickers use closes it; rejecting beats escaping.
+  canonical message is rebuilt the same way, so a separator in a ticker sends
+  the request somewhere other than what was signed. Two layers, both needed:
+  a charset allowlist (blocks `/`, `?`, `#`, whitespace), AND an explicit
+  all-dots check — `.` is legal *inside* a ticker (`…-B5.25`), so the charset
+  pass alone let a bare `.` or `..` through, and those are dot-SEGMENTS httpx
+  resolves away (`.` collapses to the LIST endpoint). Rejecting beats
+  escaping.
+
+  **Scope, so nobody assumes blanket coverage:** this is currently applied to
+  `collection_ticker` on the multivariate GET/POST only. Other f-string path
+  sites still use the looser `_validate_ticker`, and `order_id` in `orders.py`
+  has no charset check at all — worth closing, since `auth.py` strips the
+  query before signing, so an `order_id` containing `?` yields a
+  *signature-valid* request carrying caller-chosen query params.
 - **Combo legs live on the MARKET, not on the collection.**
   `/multivariate_event_collections/{ticker}` describes the *universe* a combo
   may be built from (`associated_event_tickers`, `size_min`/`size_max`,

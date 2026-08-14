@@ -133,6 +133,21 @@ def _validate_path_ticker(ticker: str, *, name: str = "ticker") -> str:
                 f"(e.g. 'KXFED-26MAR19-B5.25'). Got {ticker!r}."
             ),
         )
+    # `.` is legal INSIDE a ticker ("…-B5.25"), so the charset check above lets
+    # a bare "." or ".." through — and those are dot-SEGMENTS, which httpx
+    # resolves away: "." collapses the path to its parent (the LIST endpoint),
+    # ".." climbs above it. The signer signs the un-normalized path, so the
+    # request would land somewhere other than what was signed. Reject the whole
+    # ticker when it is nothing but dots.
+    if set(ticker) == {"."}:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"{name}={ticker!r} is a path segment, not a ticker — '.' and '..' "
+                "resolve to a different endpoint than the one we sign. Pass a real "
+                "ticker like 'KXFED-26MAR19-B5.25'."
+            ),
+        )
     return ticker
 
 
@@ -268,10 +283,16 @@ def _rank_liquid_markets(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     """Filter by min 24h volume, sort by 24h volume (desc), take the top
-    `limit`, and project each survivor to the minimal triage view."""
+    `limit`, and project each survivor to the minimal triage view.
+
+    `limit` is clamped at 0 so this and the streaming `_TopKByVolume` agree on
+    the degenerate inputs a direct `.fn` caller can reach (the schema's `ge=1`
+    only binds MCP clients). Unclamped, a negative `limit` would slice from the
+    END via Python's `list[:-1]` and quietly return a near-full list.
+    """
     eligible = [m for m in markets if _volume_24h(m) >= min_volume]
     eligible.sort(key=_volume_24h, reverse=True)
-    return [_minimal_market(m) for m in eligible[:limit]]
+    return [_minimal_market(m) for m in eligible[: max(0, limit)]]
 
 
 class _TopKByVolume:
@@ -285,7 +306,10 @@ class _TopKByVolume:
     """
 
     def __init__(self, *, limit: int, min_volume: float = 0.0) -> None:
-        self._limit = max(1, limit)
+        # Clamp at 0, matching `_rank_liquid_markets`, so the streaming and
+        # batch paths agree even on the degenerate limits a direct `.fn`
+        # caller can pass (the schema's `ge=1` only binds MCP clients).
+        self._limit = max(0, limit)
         self._min_volume = min_volume
         self._best: list[dict[str, Any]] = []
 
