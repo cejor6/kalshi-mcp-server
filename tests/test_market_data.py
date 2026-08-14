@@ -27,9 +27,13 @@ from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import SafetyController
 from kalshi_mcp_server.tools import market_data
 from kalshi_mcp_server.tools.market_data import (
+    _MAX_BATCH_CANDLESTICKS_TOTAL,
     _MAX_CANDLESTICK_PERIODS,
     _book_is_empty,
+    _truncate_book,
+    _validate_batch_candlestick_window,
     _validate_candlestick_window,
+    _validate_forecast_percentiles,
 )
 
 # ── _book_is_empty (issue #30) ─────────────────────────────────────────────
@@ -136,6 +140,117 @@ def test_candlestick_window_cap_scales_with_interval():
     over_end = start + (_MAX_CANDLESTICK_PERIODS + 1) * 60 * 60  # 5001 hourly bars
     with pytest.raises(KalshiAPIError):
         _validate_candlestick_window(start, over_end, 60)
+
+
+# ── _validate_batch_candlestick_window (the 10,000-total batch cap) ────────
+
+
+def test_batch_candlestick_window_multiplies_by_ticker_count():
+    """The batch cap is on candles x TICKERS. A window that is legal for one
+    market can be far over budget for several — that multiplication is the
+    easy thing to miss, and Kalshi answers it with an opaque 400."""
+    start = 1_000_000
+    end = start + 1000 * 60  # 1000 one-minute candles per market
+    # 10 markets x 1000 = exactly the cap — allowed.
+    assert _validate_batch_candlestick_window(10, start, end, 1) == _MAX_BATCH_CANDLESTICKS_TOTAL
+    # 11 markets x 1000 = 11,000 — over.
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_batch_candlestick_window(11, start, end, 1)
+    assert str(_MAX_BATCH_CANDLESTICKS_TOTAL) in exc.value.message
+    # The message tells the caller how many markets the window actually affords.
+    assert "at most 10 markets" in exc.value.message
+
+
+def test_batch_candlestick_window_still_applies_single_market_guards():
+    """The per-market guards (interval set, ordering, 5000 cap) are not
+    superseded by the batch cap — a single ticker must still respect them."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_batch_candlestick_window(1, 1_000_000, 1_000_600, 240)
+    assert "period_interval" in exc.value.message
+
+    over = 1_000_000 + (_MAX_CANDLESTICK_PERIODS + 1) * 60
+    with pytest.raises(KalshiAPIError):
+        _validate_batch_candlestick_window(1, 1_000_000, over, 1)
+
+    with pytest.raises(KalshiAPIError):
+        _validate_batch_candlestick_window(1, 1_000_000, 999_000, 60)
+
+
+def test_batch_candlestick_window_rejects_too_many_tickers():
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_batch_candlestick_window(101, 1_000_000, 1_000_600, 60)
+    assert "100 market tickers" in exc.value.message
+
+
+def test_batch_candlestick_widening_interval_buys_headroom():
+    """The documented escape hatch must actually work: same window, wider
+    bars, now under budget."""
+    start = 1_000_000
+    end = start + 1000 * 60
+    with pytest.raises(KalshiAPIError):
+        _validate_batch_candlestick_window(50, start, end, 1)
+    _validate_batch_candlestick_window(50, start, end, 60)  # no raise
+
+
+# ── _validate_forecast_percentiles (0-9999 scale, max 10) ──────────────────
+
+
+def test_forecast_percentiles_accept_valid_set():
+    assert _validate_forecast_percentiles([1000, 5000, 9000]) == [1000, 5000, 9000]
+    assert _validate_forecast_percentiles([0, 9999]) == [0, 9999]
+
+
+def test_forecast_percentiles_reject_out_of_range():
+    """The scale is 0-9999, not 0-100. 10000 is out; 50 is legal but means
+    the 0.5th percentile — a silent wrong answer the docstring warns about."""
+    for bad in ([10_000], [-1], [5000, 12345]):
+        with pytest.raises(KalshiAPIError) as exc:
+            _validate_forecast_percentiles(bad)
+        assert "9999" in exc.value.message
+    assert _validate_forecast_percentiles([50]) == [50]  # legal, just not the median
+
+
+def test_forecast_percentiles_reject_empty_and_oversized():
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_forecast_percentiles([])
+    assert "at least one" in exc.value.message
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_forecast_percentiles(list(range(11)))
+    assert "At most 10" in exc.value.message
+
+
+def test_forecast_percentiles_reject_non_integers():
+    for bad in ([50.5], ["5000"], [True]):
+        with pytest.raises(KalshiAPIError) as exc:
+            _validate_forecast_percentiles(bad)
+        assert "integers" in exc.value.message
+
+
+# ── _truncate_book (best levels are the LAST ones) ─────────────────────────
+
+
+def test_truncate_book_keeps_the_best_levels():
+    """Kalshi orders levels ascending by price and both sides are bids, so
+    the best levels are at the END. Slicing the head would hand a scan lens
+    the worst prices — dust orders — with nothing visibly broken."""
+    book = {
+        "yes_dollars": [["0.01", "5"], ["0.20", "9"], ["0.42", "166"], ["0.46", "449"]],
+        "no_dollars": [["0.01", "251"], ["0.51", "522"], ["0.52", "349"]],
+    }
+    out = _truncate_book(book, 2)
+    assert out["yes_dollars"] == [["0.42", "166"], ["0.46", "449"]]
+    assert out["no_dollars"] == [["0.51", "522"], ["0.52", "349"]]
+
+
+def test_truncate_book_handles_short_sides_and_legacy_keys():
+    book = {"yes": [[50, 10]], "no": []}
+    assert _truncate_book(book, 5) == {"yes": [[50, 10]], "no": []}
+
+
+def test_truncate_book_passes_unknown_shapes_through():
+    """Losing data is worse than returning a little extra."""
+    assert _truncate_book({"weird": {"a": 1}}, 2) == {"weird": {"a": 1}}
+    assert _truncate_book(None, 2) == {}
 
 
 # ── candlestick tool wiring (validation fires before the HTTP call) ─────────

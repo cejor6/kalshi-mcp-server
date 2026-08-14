@@ -85,15 +85,25 @@ async def test_expected_tools_are_registered(rsa_private_key):
         "kalshi_get_event",
         "kalshi_get_events",
         "kalshi_get_series",
+        "kalshi_get_series_list",
         "kalshi_get_series_summary",
-        "kalshi_get_combo_legs",
+        "kalshi_get_milestones",
         "kalshi_get_trades",
         # market_data.py
         "kalshi_get_orderbook",
         "kalshi_get_orderbooks",
         "kalshi_get_market_candlesticks",
         "kalshi_get_event_candlesticks",
+        "kalshi_get_batch_candlesticks",
+        "kalshi_get_event_forecast_history",
         "kalshi_get_market_trades",
+        # multivariate.py (combo / parlay). kalshi_create_combo_market is
+        # NOT here: it is registered only when MCP_ALLOW_COMBO_CREATION=1,
+        # and this fixture leaves it off. See test_multivariate.py.
+        "kalshi_get_combo_collections",
+        "kalshi_get_combo_collection",
+        "kalshi_get_combo_events",
+        "kalshi_get_combo_legs",
         # portfolio.py
         "kalshi_get_balance",
         "kalshi_get_positions",
@@ -114,3 +124,6 @@ async def test_expected_tools_are_registered(rsa_private_key):
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"
+    # The write gate is off in this fixture, so the create tool must be absent
+    # entirely — a read-only deploy shouldn't advertise it to the model.
+    assert "kalshi_create_combo_market" not in names

@@ -18,14 +18,11 @@ from kalshi_mcp_server.tools.discovery import (
     _event_hint_misses,
     _finalize_series,
     _fold_series_page,
-    _legs_from_custom_strike,
-    _legs_from_selected,
     _minimal_market,
     _parse_fields,
     _project_market,
     _rank_liquid_markets,
     _record_event_hint_miss,
-    _resolve_combo_legs,
     _scan_markets_excluding_mve,
     _series_of,
     _single_ticker,
@@ -645,107 +642,6 @@ async def test_event_hint_ignores_markets_without_ticker():
     client = _FakeClient(responses=[{"markets": [{"no_ticker": "x"}, {"ticker": "EVT-A"}]}])
     hint = await _event_hint(client, "EVT")
     assert "EVT-A" in hint
-
-
-# ── combo-leg resolution (kalshi_get_combo_legs) ───────────────────────────
-
-
-def test_legs_from_selected_reads_structured_field():
-    """`mve_selected_legs` is the authoritative source — ticker, event and
-    side come straight out of it, in Kalshi's order."""
-    legs = _legs_from_selected(_mve_market())
-    assert len(legs) == 9
-    assert legs[0] == {
-        "market_ticker": "KXMLBTOTAL-0-6",
-        "event_ticker": "KXMLBTOTAL-0",
-        "side": "yes",
-    }
-
-
-def test_legs_from_selected_skips_malformed_entries():
-    market = {
-        "mve_selected_legs": [
-            "not-a-dict",
-            {"event_ticker": "E1"},  # no market_ticker
-            {"market_ticker": "   "},  # blank market_ticker
-            {"market_ticker": " KX-A ", "event_ticker": "KX", "side": "no"},
-        ]
-    }
-    assert _legs_from_selected(market) == [
-        {"market_ticker": "KX-A", "event_ticker": "KX", "side": "no"}
-    ]
-
-
-def test_legs_from_selected_empty_when_absent_or_wrong_type():
-    assert _legs_from_selected({}) == []
-    assert _legs_from_selected({"mve_selected_legs": "nope"}) == []
-
-
-def test_legs_from_custom_strike_parses_parallel_csvs():
-    """The fallback: three comma-separated columns that line up by index.
-    This is the real prod shape (confirmed live)."""
-    market = {
-        "custom_strike": {
-            "Associated Events": "KXATP-A,KXMLB-B",
-            "Associated Markets": "KXATP-A-BEL,KXMLB-B-LAA8",
-            "Associated Market Sides": "yes,no",
-        }
-    }
-    assert _legs_from_custom_strike(market) == [
-        {"market_ticker": "KXATP-A-BEL", "event_ticker": "KXATP-A", "side": "yes"},
-        {"market_ticker": "KXMLB-B-LAA8", "event_ticker": "KXMLB-B", "side": "no"},
-    ]
-
-
-def test_legs_from_custom_strike_drops_side_on_column_mismatch():
-    """Parallel arrays with no linking key: if the columns don't line up we
-    cannot say which side belongs to which leg. Keep the unambiguous tickers,
-    null the side — never guess, which is the whole point of this tool."""
-    market = {
-        "custom_strike": {
-            "Associated Markets": "A-1,B-2,C-3",
-            "Associated Market Sides": "yes,no",  # short by one
-            "Associated Events": "A,B",  # also short
-        }
-    }
-    legs = _legs_from_custom_strike(market)
-    assert [leg["market_ticker"] for leg in legs] == ["A-1", "B-2", "C-3"]
-    assert all(leg["side"] is None for leg in legs)
-    assert all(leg["event_ticker"] is None for leg in legs)
-
-
-def test_legs_from_custom_strike_empty_without_markets_column():
-    assert _legs_from_custom_strike({}) == []
-    assert _legs_from_custom_strike({"custom_strike": "nope"}) == []
-    assert _legs_from_custom_strike({"custom_strike": {"Associated Market Sides": "yes"}}) == []
-
-
-def test_resolve_combo_legs_prefers_structured_over_csv():
-    market = _mve_market()
-    market["custom_strike"] = {"Associated Markets": "SHOULD-NOT-WIN"}
-    legs, source = _resolve_combo_legs(market)
-    assert source == "mve_selected_legs"
-    assert legs[0]["market_ticker"] == "KXMLBTOTAL-0-6"
-
-
-def test_resolve_combo_legs_falls_back_to_custom_strike():
-    market = {
-        "custom_strike": {
-            "Associated Markets": "A-1",
-            "Associated Market Sides": "yes",
-            "Associated Events": "A",
-        }
-    }
-    legs, source = _resolve_combo_legs(market)
-    assert source == "custom_strike"
-    assert legs == [{"market_ticker": "A-1", "event_ticker": "A", "side": "yes"}]
-
-
-def test_resolve_combo_legs_unresolvable_returns_empty():
-    """An ordinary market has neither source — the tool must report
-    not-resolvable rather than fall back to parsing the title string."""
-    plain = {"ticker": "KXFED-26MAR19-B5.25", "title": "Fed above 5.25%, and other things"}
-    assert _resolve_combo_legs(plain) == ([], None)
 
 
 # ── series rollup (kalshi_get_series_summary) ──────────────────────────────

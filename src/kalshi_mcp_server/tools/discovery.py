@@ -380,102 +380,6 @@ async def _scan_markets_excluding_mve(
     return result
 
 
-# ── Multivariate (combo) leg resolution ────────────────────────────────────
-#
-# A `KXMVE…` combo market carries its legs in TWO places, both on the market
-# object itself. Note what is NOT the source: `/multivariate_event_collections
-# /{collection_ticker}` describes the collection (the *universe* of events a
-# combo may be built from, plus `size_min`/`size_max`/`is_all_yes`), not which
-# legs a specific auto-generated combo actually selected. Resolving legs from
-# the collection endpoint is impossible for that reason — the per-market
-# fields below are the only authoritative source, and the collection lookup is
-# offered separately as context.
-#
-#  1. `mve_selected_legs` — structured and authoritative:
-#     [{"event_ticker": …, "market_ticker": …, "side": "yes"|"no"}, …]
-#  2. `custom_strike` — the same data as three PARALLEL comma-separated
-#     strings ("Associated Markets" / "Associated Market Sides" /
-#     "Associated Events"), used as a fallback when (1) is absent.
-#
-# Neither carries a human-readable leg title, which is why callers have been
-# splitting the combo's own `title`/`yes_sub_title` on commas — lossy, because
-# a leg's own title may contain a comma. Titles come from a single batched
-# `GET /markets?tickers=…` over the leg market tickers instead.
-_CUSTOM_STRIKE_MARKETS_KEY = "Associated Markets"
-_CUSTOM_STRIKE_SIDES_KEY = "Associated Market Sides"
-_CUSTOM_STRIKE_EVENTS_KEY = "Associated Events"
-
-# Hard cap on how many legs we'll enrich with titles in one call. Kalshi's
-# combos run to ~10 legs; this only exists so a pathological market can't turn
-# one tool call into a huge `tickers=` query string.
-_MAX_COMBO_LEGS = 100
-
-
-def _legs_from_selected(market: dict[str, Any]) -> list[dict[str, Any]]:
-    """Legs from the structured `mve_selected_legs` field (preferred)."""
-    raw = market.get("mve_selected_legs")
-    if not isinstance(raw, list):
-        return []
-    legs: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        market_ticker = entry.get("market_ticker")
-        if not isinstance(market_ticker, str) or not market_ticker.strip():
-            continue
-        legs.append(
-            {
-                "market_ticker": market_ticker.strip(),
-                "event_ticker": entry.get("event_ticker"),
-                "side": entry.get("side"),
-            }
-        )
-    return legs
-
-
-def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
-    """Legs from the three parallel CSV strings in `custom_strike` (fallback).
-
-    Parallel-array data with no key linking the columns, so a length mismatch
-    between markets and sides means we cannot say which side goes with which
-    leg. Rather than guess (the whole point of this tool), drop `side` to None
-    on mismatch and keep the tickers, which are still unambiguous.
-    """
-    strike = market.get("custom_strike")
-    if not isinstance(strike, dict):
-        return []
-    tickers = _parse_fields(str(strike.get(_CUSTOM_STRIKE_MARKETS_KEY) or ""))
-    if not tickers:
-        return []
-    sides = _parse_fields(str(strike.get(_CUSTOM_STRIKE_SIDES_KEY) or ""))
-    events = _parse_fields(str(strike.get(_CUSTOM_STRIKE_EVENTS_KEY) or ""))
-    aligned_sides = len(sides) == len(tickers)
-    aligned_events = len(events) == len(tickers)
-    return [
-        {
-            "market_ticker": ticker,
-            "event_ticker": events[i] if aligned_events else None,
-            "side": sides[i] if aligned_sides else None,
-        }
-        for i, ticker in enumerate(tickers)
-    ]
-
-
-def _resolve_combo_legs(market: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
-    """Return `(legs, source)` for a combo market, `([], None)` if unresolvable.
-
-    `source` is "mve_selected_legs" or "custom_strike" so a caller can tell
-    whether it got the structured field or the parsed-CSV fallback.
-    """
-    legs = _legs_from_selected(market)
-    if legs:
-        return legs, "mve_selected_legs"
-    legs = _legs_from_custom_strike(market)
-    if legs:
-        return legs, "custom_strike"
-    return [], None
-
-
 # ── Series-level rollup (kalshi_get_series_summary) ─────────────────────────
 #
 # Kalshi does NOT return `series_ticker` on a market object (confirmed against
@@ -1036,172 +940,115 @@ def register(server: FastMCP) -> None:
         series_ticker = _validate_ticker(series_ticker, name="series_ticker")
         return await client.get(f"/series/{series_ticker}")
 
-    # Keep the emitted tool DESCRIPTION (everything before "Args:") under 1024
-    # chars — OpenAI rejects longer tool descriptions. Per-field detail belongs
-    # in the Args: block, which FastMCP routes to the parameter schema.
     @server.tool
-    async def kalshi_get_combo_legs(
-        ticker: str,
-        with_titles: bool = True,
-        include_collection: bool = False,
+    async def kalshi_get_series_list(
+        category: str | None = None,
+        tags: str | None = None,
+        include_volume: bool = True,
+        min_updated_ts: int | None = None,
+        include_product_metadata: bool = False,
     ) -> dict[str, Any]:
-        """Resolve a multivariate (`KXMVE…`) combo market into its underlying legs.
+        """List Kalshi's SERIES catalog — the authoritative names behind the tickers.
 
-        Returns one entry per leg — the leg's own MARKET ticker, its event
-        ticker, the side the combo takes on it ("yes"/"no"), and (by default)
-        its human title. Use this instead of splitting the combo's `title` /
-        `yes_sub_title` on commas: that string is a rendering, it drops the
-        leg tickers entirely, and it mis-splits whenever a leg's own title
-        contains a comma.
+        Where `kalshi_get_series_summary` derives series from ticker prefixes
+        and measures live activity, this returns Kalshi's own catalog entry
+        per series: real title, category, tags, settlement sources, fee type,
+        and (with `include_volume`) lifetime traded volume. Pair them — the
+        summary tells you what's active, this tells you what it IS.
 
-        NOT every combo resolves. When Kalshi hasn't published the leg
-        breakdown, this returns `resolvable: false` with a `reason` rather
-        than guessing from the title — check that field before using `legs`.
-        Legs come from the market object (`mve_selected_legs`, or the
-        `custom_strike` CSV fallback); the collections endpoint describes the
-        *universe* a combo may draw from, not the legs it actually selected,
-        so it cannot answer this question and is offered only as context.
+        `min_updated_ts` makes this a cheap change-feed: pass yesterday's
+        timestamp to get only series whose metadata moved, which is the low-
+        cost way to spot a new event class listing.
 
         Args:
-            ticker: The COMBO market's own ticker, e.g.
-                "KXMVECROSSCATEGORY-SHARD1-S2026…-978C8F03297". A plain
-                (non-combo) market is a valid call — it just returns
-                `resolvable: false, reason: "not_a_combo_market"`.
-            with_titles: Resolve each leg's title via ONE extra batched
-                markets lookup. Default True. Set False to save a read when
-                you only need tickers and sides. Title resolution fails open:
-                if the lookup errors, legs still come back with
-                `titles_resolved: false`.
-            include_collection: Also fetch the parent multivariate event
-                collection (`size_min`/`size_max`, `is_all_yes`,
-                `associated_event_tickers`, `functional_description`) — the
-                rules governing how combos in this family are built. Costs one
-                more read and can be sizable, so it defaults False. Fails open.
+            category: Filter to one category (e.g. "Sports", "Economics",
+                "Politics"). Omit for all.
+            tags: Filter by tag. Omit for all.
+            include_volume: Include `volume_fp`, total volume traded across
+                all events in each series. Default True — it's the single
+                most useful ranking field here and costs nothing extra.
+            min_updated_ts: Only series whose metadata was updated after this
+                unix timestamp (seconds). The change-feed knob described above.
+            include_product_metadata: Include Kalshi's internal
+                `product_metadata` blob. Default False — it is verbose and
+                rarely useful to a trading agent.
 
-        Returns:
-            `resolvable`: True when legs were resolved; False otherwise.
-            `legs`: list of `{market_ticker, event_ticker, side, title,
-                yes_sub_title}` (the last two only when `with_titles`
-                succeeded). Order matches Kalshi's leg order.
-            `leg_count`, `source`: how many legs, and whether they came from
-                "mve_selected_legs" (structured, authoritative) or
-                "custom_strike" (parsed parallel CSVs — `side` is dropped to
-                null if the columns don't line up, rather than guessed).
-            `reason` + `message`: only when `resolvable` is False.
-                "not_a_combo_market" — the ticker is an ordinary market.
-                "legs_not_published" — it IS a combo but Kalshi exposed no
-                leg breakdown; the title string is all that exists, and this
-                tool deliberately will not parse it for you.
-            `collection_ticker`, `event_ticker`, `title`: the combo's own
-                identifiers, always present when the market was fetched.
+        Token-cap note: this endpoint does NOT paginate — it returns every
+        matching series in one response. Unfiltered that is the whole catalog
+        (hundreds of entries, each with settlement sources and tags), so
+        prefer `category=` or `min_updated_ts=` when you can, and leave
+        `include_product_metadata` off.
         """
-        ticker = _validate_ticker(ticker)
-        try:
-            body = await client.get(f"/markets/{ticker}")
-        except KalshiAPIError as exc:
-            if exc.status == 404:
-                hint = await _event_hint(client, ticker)
-                if hint:
-                    raise KalshiAPIError(status=404, message=hint) from exc
-            raise
-
-        market = body.get("market")
-        if not isinstance(market, dict):
-            raise KalshiAPIError(
-                status=0,
-                message=(
-                    f"Kalshi returned no market object for {ticker!r}. "
-                    "Double-check the ticker is a full MARKET ticker."
-                ),
-            )
-
-        collection_ticker = market.get("mve_collection_ticker")
-        base: dict[str, Any] = {
-            "ticker": market.get("ticker", ticker),
-            "event_ticker": market.get("event_ticker"),
-            "title": market.get("title"),
-            "collection_ticker": collection_ticker,
+        params: dict[str, Any] = {
+            "include_volume": str(include_volume).lower(),
+            "include_product_metadata": str(include_product_metadata).lower(),
         }
+        if category:
+            params["category"] = category
+        if tags:
+            params["tags"] = tags
+        if min_updated_ts is not None:
+            params["min_updated_ts"] = min_updated_ts
+        return await client.get("/series", params=params)
 
-        legs, source = _resolve_combo_legs(market)
-        if not legs:
-            # Distinguish "you pointed at a normal market" from "this really is
-            # a combo but the legs aren't published" — different caller fixes.
-            is_combo = bool(collection_ticker) or str(market.get("strike_type")) == "custom"
-            if is_combo:
-                reason = "legs_not_published"
-                message = (
-                    f"{ticker!r} is a multivariate combo market but Kalshi published no "
-                    "leg breakdown for it (neither `mve_selected_legs` nor a "
-                    "`custom_strike` markets/sides list). Its legs cannot be resolved "
-                    "from the API; the title string is a lossy rendering and this tool "
-                    "will not parse it. Try kalshi_get_combo_legs(..., "
-                    "include_collection=True) for the collection's construction rules."
-                )
-            else:
-                reason = "not_a_combo_market"
-                message = (
-                    f"{ticker!r} is an ordinary (non-multivariate) market — it has no "
-                    "legs. Combo tickers carry a `KXMVE…` prefix and an "
-                    "`mve_collection_ticker`. Use kalshi_get_market for this one."
-                )
-            return {**base, "resolvable": False, "reason": reason, "message": message}
+    @server.tool
+    async def kalshi_get_milestones(
+        limit: Annotated[int, Field(ge=1, le=500)] = 50,
+        cursor: str | None = None,
+        category: str | None = None,
+        competition: str | None = None,
+        type: str | None = None,
+        related_event_ticker: str | None = None,
+        minimum_start_date: str | None = None,
+        min_updated_ts: int | None = None,
+    ) -> dict[str, Any]:
+        """List MILESTONES — the real-world schedule behind Kalshi's markets.
 
-        truncated = len(legs) > _MAX_COMBO_LEGS
-        legs = legs[:_MAX_COMBO_LEGS]
+        A milestone is a scheduled real-world happening (a game, a race, a
+        match) with its own start/end dates, category, competition, and the
+        event tickers Kalshi has attached to it. That makes it the leading
+        indicator for new supply: a milestone can exist before its markets
+        list, so this answers "what is coming" rather than "what is listed",
+        which is the one thing a market-listing sweep structurally cannot tell
+        you.
 
-        titles_resolved = False
-        if with_titles:
-            leg_tickers = [leg["market_ticker"] for leg in legs]
-            try:
-                lookup = await client.get(
-                    "/markets",
-                    params={"tickers": ",".join(leg_tickers), "limit": len(leg_tickers)},
-                )
-            except KalshiAPIError:
-                # Fail open: the legs themselves are the answer; titles are a
-                # convenience, and a lookup failure must not lose them.
-                lookup = {}
-            by_ticker = {
-                m.get("ticker"): m
-                for m in (lookup.get("markets") or [])
-                if isinstance(m, dict) and m.get("ticker")
-            }
-            if by_ticker:
-                titles_resolved = True
-                for leg in legs:
-                    leg_market = by_ticker.get(leg["market_ticker"])
-                    if leg_market is not None:
-                        leg["title"] = leg_market.get("title")
-                        leg["yes_sub_title"] = leg_market.get("yes_sub_title")
+        Args:
+            limit: 1-500. Default 50. Milestone objects are small, but they
+                carry `related_event_tickers` arrays — keep it modest.
+            cursor: Pagination cursor. Kalshi silently returns an empty list
+                on a malformed cursor.
+            category: e.g. "Sports", "Elections", "Esports", "Crypto".
+            competition: e.g. "Pro Football", "Pro Basketball".
+            type: Milestone type, e.g. "football_game", "basketball_game".
+            related_event_ticker: Find the milestone(s) behind a known event
+                — the reverse lookup, useful for pulling schedule context onto
+                a market you're already looking at.
+            minimum_start_date: RFC3339 timestamp; only milestones starting
+                on/after it. The forward-looking filter — pass "now" to see
+                what is upcoming rather than what already happened.
+            min_updated_ts: Only milestones whose metadata changed after this
+                unix timestamp (seconds). Use as a daily change-feed.
 
-        result: dict[str, Any] = {
-            **base,
-            "resolvable": True,
-            "leg_count": len(legs),
-            "source": source,
-            "titles_resolved": titles_resolved,
-            "legs": legs,
-        }
-        if truncated:
-            result["truncated"] = True
-            result["note"] = (
-                f"Only the first {_MAX_COMBO_LEGS} legs are shown; this market declared more."
-            )
-
-        if include_collection and collection_ticker:
-            try:
-                collection = await client.get(
-                    f"/multivariate_event_collections/{collection_ticker}"
-                )
-            except KalshiAPIError:
-                result["collection_error"] = (
-                    f"Could not fetch collection {collection_ticker!r}; legs above are unaffected."
-                )
-            else:
-                result["collection"] = collection.get("multivariate_contract", collection)
-
-        return result
+        Pair with `kalshi_get_series_summary`: milestones tell you a
+        competition is coming, the series census confirms when its markets
+        actually list.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if category:
+            params["category"] = category
+        if competition:
+            params["competition"] = competition
+        if type:
+            params["type"] = type
+        if related_event_ticker:
+            params["related_event_ticker"] = related_event_ticker
+        if minimum_start_date:
+            params["minimum_start_date"] = minimum_start_date
+        if min_updated_ts is not None:
+            params["min_updated_ts"] = min_updated_ts
+        return await client.get("/milestones", params=params)
 
     @server.tool
     async def kalshi_get_series_summary(

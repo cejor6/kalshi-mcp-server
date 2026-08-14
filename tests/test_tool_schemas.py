@@ -96,6 +96,10 @@ def _enum_of(prop: dict) -> list | None:
         ),
         ("kalshi_get_market_candlesticks", "period_interval", [1, 60, 1440]),
         ("kalshi_get_event_candlesticks", "period_interval", [1, 60, 1440]),
+        ("kalshi_get_batch_candlesticks", "period_interval", [1, 60, 1440]),
+        # Forecast history is the ONE endpoint where 0 is legal (5-second bars).
+        ("kalshi_get_event_forecast_history", "period_interval", [0, 1, 60, 1440]),
+        ("kalshi_get_combo_collections", "status", ["unopened", "open", "closed"]),
     ],
 )
 async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
@@ -127,6 +131,9 @@ async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
         # steering the model gets — the runtime slice is what enforces it.
         ("kalshi_get_orderbooks", "depth", 1, 100),
         ("kalshi_get_series_summary", "top", 1, 200),
+        ("kalshi_get_milestones", "limit", 1, 500),
+        ("kalshi_get_combo_collections", "limit", 1, 200),
+        ("kalshi_get_combo_events", "limit", 1, 200),
     ],
 )
 async def test_range_constraint_in_schema(rsa_private_key, tool, prop, lo, hi):

@@ -19,7 +19,11 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from kalshi_mcp_server.config import Config
-from kalshi_mcp_server.errors import SafetyError, TradingDisabledError
+from kalshi_mcp_server.errors import (
+    ComboCreationDisabledError,
+    SafetyError,
+    TradingDisabledError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +175,9 @@ class SafetyController:
         # this lock — see effective_limits.
         self._limits_lock = asyncio.Lock()
         self._daily = _DailyCounter()
+        # Separate counter: combo creations draw on Kalshi's weekly creation
+        # quota, not on the USD spend budget, so they must not share a bucket.
+        self._combo_creations = _DailyCounter()
 
     @property
     def ceilings(self) -> SafetyLimits:
@@ -417,6 +424,59 @@ class SafetyController:
                     f"Order would leave ${remaining_after:.2f} in cash, below the "
                     f"active reserve floor (${limits.cash_reserve_usd:.2f})."
                 )
+
+    # ── Combo (parlay) creation ────────────────────────────────────────────
+    #
+    # `POST /multivariate_event_collections/{ticker}` materializes a combo
+    # market ticker. It commits no money, so it is gated separately from
+    # `trading_enabled` (see Config.combo_creation_enabled) — but it is still
+    # a POST creating exchange state, AND Kalshi caps creations at 5000 per
+    # WEEK per account. Burning that quota is the real failure mode here: an
+    # agent retrying a bad leg set could eat a meaningful slice of the week's
+    # budget in minutes. The per-day ceiling is what bounds that.
+    #
+    # Caveat, deliberately mirrored from the daily spend counter: this count
+    # is IN-PROCESS and resets on restart. It bounds a runaway loop within a
+    # session; it is not a durable ledger of the weekly quota.
+
+    def assert_combo_creation_enabled(self) -> None:
+        if not self._config.combo_creation_enabled:
+            raise ComboCreationDisabledError(
+                "Combo (parlay) creation is disabled. Set MCP_ALLOW_COMBO_CREATION=1 "
+                "and restart to allow this server to materialize combo market "
+                "tickers. This is a separate gate from KALSHI_TRADING_ENABLED — "
+                "creating a combo commits no money, but it does create exchange "
+                "state under your account and draws on Kalshi's 5000-per-week "
+                "creation quota."
+            )
+
+    def check_combo_creation(self) -> None:
+        """Raise if combo creation is disabled or the daily ceiling is reached."""
+        self.assert_combo_creation_enabled()
+        _, used_today = self._combo_creations.peek()
+        ceiling = self._config.max_combo_creations_per_day
+        if used_today + 1 > ceiling:
+            raise SafetyError(
+                f"Refusing to create another combo market: {int(used_today)} created "
+                f"today, at the per-day ceiling of {ceiling}. Kalshi allows 5000 per "
+                "WEEK per account and this server bounds the daily draw so a retry "
+                "loop can't burn it. Raise MCP_MAX_COMBO_CREATIONS_PER_DAY and restart "
+                "if you genuinely need more. Resets at UTC midnight."
+            )
+
+    def record_combo_creation(self) -> None:
+        """Call AFTER Kalshi accepts a combo-market creation."""
+        self._combo_creations.add(1.0)
+
+    def combo_creation_view(self) -> dict[str, object]:
+        """Combo-creation state for `kalshi_get_environment` / the resource."""
+        day, used_today = self._combo_creations.peek()
+        return {
+            "combo_creation_enabled": self._config.combo_creation_enabled,
+            "combo_creations_today": int(used_today),
+            "max_combo_creations_per_day": self._config.max_combo_creations_per_day,
+            "combo_creation_day_utc": day,
+        }
 
     def record_order_committed(self, intent: OrderIntent) -> None:
         """Call AFTER the order is successfully accepted by Kalshi."""

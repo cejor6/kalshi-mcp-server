@@ -164,6 +164,41 @@ Caveat: persistence is single-replica-coherent (write-through + load-on-
 boot); if you scale past one instance, a mid-life change won't reach other
 replicas until they restart.
 
+**Combo (parlay) creation has its OWN gate.**
+`kalshi_create_combo_market` (`tools/multivariate.py`) POSTs to
+`/multivariate_event_collections/{ticker}` to materialize a combo market
+ticker. Read the distinction carefully before "tidying" it:
+
+- It **places no order and commits no money.** Kalshi requires a combo to be
+  created once before it can be looked up or traded; risk arrives later, via
+  the normal order path. So it is gated on `MCP_ALLOW_COMBO_CREATION`
+  (default **0**), NOT on `KALSHI_TRADING_ENABLED`. Coupling it to the money
+  flag would mean a read-only scout couldn't build parlays at all, which is
+  precisely the posture we want that capability in. `ComboCreationDisabledError`
+  is a distinct type from `TradingDisabledError` so the two gates can't be
+  confused.
+- When the flag is off the tool is **not registered at all** (same pattern as
+  `kalshi_set_safety_limits` under `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0`), so a
+  read-only deploy doesn't advertise the capability to the model.
+- The scarce resource is **Kalshi's 5000-creations-per-WEEK account quota**,
+  not dollars, so it gets its own counter — `SafetyController._combo_creations`,
+  bounded by `MCP_MAX_COMBO_CREATIONS_PER_DAY` (default 100). Do NOT merge it
+  into the USD daily counter; they measure different budgets. Like the spend
+  counter it is in-process and resets on restart: it bounds a runaway loop
+  within a session, it is not a durable ledger.
+- The counter increments only **after** Kalshi accepts. A rejected creation
+  consumed no Kalshi quota, so it must not consume local budget either.
+
+This is the one write tool that deliberately does NOT follow the
+"build an `OrderIntent`, call `safety.check_order`, generate an idempotency
+key, call `record_order_committed`" contract in "How to add a new tool" —
+there is no price, count, or cash flow to check. It follows the analogous
+shape (`safety.check_combo_creation()` before the wire call,
+`safety.record_combo_creation()` after success) and pre-flights the leg set
+against the collection's own `size_min`/`size_max`/`is_all_yes` rules, which
+Kalshi otherwise rejects with an opaque 400. That contract still binds every
+order-placing tool without exception.
+
 A fourth gate fires at startup when HTTP transport is used:
 **`http` transport refuses to start without OAuth configured** unless
 `MCP_ALLOW_INSECURE_HTTP=1` is explicitly set. An unauthenticated HTTP
@@ -375,11 +410,18 @@ can't be expressed in JSON-Schema at all — those are runtime-only with an
 actionable error message. And don't put strategy/computed values in a
 constraint; just the API's own accepted ranges.
 
-Write tools (anything that mutates state) MUST:
+Order-placing tools (anything that puts money at risk) MUST:
 - Call `safety.assert_trading_enabled()` at the top
 - Build an `OrderIntent` and call `safety.check_order(...)`
 - Generate a client-side idempotency key
 - Call `safety.record_order_committed(...)` after the response succeeds
+
+A state-mutating tool that risks NO money still needs a gate, a
+consumable-budget check, and a record-after-success — just not this one.
+`kalshi_create_combo_market` is the worked example; see the combo-creation
+note in "Safety model" for why it has its own flag and its own counter
+rather than reusing the order contract. Adding a second such tool means
+following that shape, not weakening the order contract to fit.
 
 ---
 
@@ -450,6 +492,18 @@ tools encode these; don't regress them.
   prefix per Kalshi's `SERIES-EVENTSUFFIX-OUTCOME` convention. That's a
   convention, not a contract — the tool says so in its docstring rather than
   presenting derived series as authoritative.
+- **The batch candlestick cap is candles x TICKERS, not candles.**
+  `GET /markets/candlesticks` takes up to 100 tickers and returns at most
+  10,000 candles TOTAL across all of them, so a window that is perfectly legal
+  for one market is 5x over budget for five.
+  `market_data.py:_validate_batch_candlestick_window` runs the single-market
+  guards first and then this multiplication; don't collapse the two, and keep
+  the message that names how many markets the window affords.
+- **Forecast percentiles are 0-9999, not 0-100.** The median is 5000. Passing
+  50 is *legal* and silently means the 0.5th percentile — a wrong answer, not
+  an error — which is why the docstring leads with the scale and the validator
+  only enforces the hard bounds. `period_interval=0` (5-second bars) is legal
+  on that endpoint and ONLY that one.
 - **Combo legs live on the MARKET, not on the collection.**
   `/multivariate_event_collections/{ticker}` describes the *universe* a combo
   may be built from (`associated_event_tickers`, `size_min`/`size_max`,

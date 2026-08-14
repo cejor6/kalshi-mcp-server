@@ -40,6 +40,24 @@ _VALID_PERIOD_INTERVALS: tuple[int, ...] = (1, 60, 1440)
 # 400 (the exact failure this guard exists to prevent).
 _MAX_CANDLESTICK_PERIODS = 5000
 
+# `GET /markets/candlesticks` (the batch form) accepts up to 100 market
+# tickers and returns at most 10,000 candlesticks TOTAL across all of them.
+# That's a different shape of limit from the single-market 5000-per-window
+# cap: here the window cost multiplies by the number of tickers, so a
+# perfectly legal single-market window can blow the batch budget just by
+# adding tickers. Both are checked before the request goes out.
+_MAX_BATCH_CANDLESTICK_TICKERS = 100
+_MAX_BATCH_CANDLESTICKS_TOTAL = 10_000
+
+# Percentiles accepted by the event forecast-percentile-history endpoint, and
+# how many may be requested at once. Values are basis-point-ish: 0-9999, so
+# the median is 5000, not 50.
+_MAX_FORECAST_PERCENTILES = 10
+_FORECAST_PERCENTILE_MAX = 9999
+# That endpoint additionally accepts 0 ("5-second intervals") on top of the
+# usual minute/hour/day widths — the only place in the API where 0 is legal.
+_VALID_FORECAST_INTERVALS: tuple[int, ...] = (0, 1, 60, 1440)
+
 
 def _validate_candlestick_window(start_ts: int, end_ts: int, period_interval: int) -> None:
     """Pre-flight the candlestick params Kalshi silently 400s on.
@@ -85,6 +103,84 @@ def _validate_candlestick_window(start_ts: int, end_ts: int, period_interval: in
                 "period_interval (1 -> 60 -> 1440)."
             ),
         )
+
+
+def _validate_batch_candlestick_window(
+    ticker_count: int, start_ts: int, end_ts: int, period_interval: int
+) -> int:
+    """Pre-flight the BATCH candlestick request. Returns the projected count.
+
+    Runs the single-market guards first (interval set, window ordering,
+    5000-per-market cap), then the batch-only one: candles x tickers must stay
+    under Kalshi's 10,000 total. That last check is the easy one to miss —
+    a 5000-candle window is fine for one market and 5x over budget for three.
+    """
+    _validate_candlestick_window(start_ts, end_ts, period_interval)
+    if ticker_count > _MAX_BATCH_CANDLESTICK_TICKERS:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"Kalshi's batch candlestick endpoint accepts at most "
+                f"{_MAX_BATCH_CANDLESTICK_TICKERS} market tickers, got {ticker_count}. "
+                "Split the request."
+            ),
+        )
+    per_market = math.ceil((end_ts - start_ts) / (period_interval * 60))
+    total = per_market * ticker_count
+    if total > _MAX_BATCH_CANDLESTICKS_TOTAL:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"This request spans ~{per_market} candles x {ticker_count} markets "
+                f"= ~{total}, over Kalshi's {_MAX_BATCH_CANDLESTICKS_TOTAL}-candlestick "
+                "batch cap (the request would 400). Narrow the window, widen "
+                "period_interval (1 -> 60 -> 1440), or split the ticker list. At this "
+                f"window you can request at most "
+                f"{max(1, _MAX_BATCH_CANDLESTICKS_TOTAL // max(per_market, 1))} markets."
+            ),
+        )
+    return total
+
+
+def _validate_forecast_percentiles(percentiles: list[int]) -> list[int]:
+    """Validate the percentile list for the forecast-history endpoint.
+
+    Kalshi takes at most 10 values in 0..9999 — note the scale: the median is
+    5000, not 50. Passing 50 is legal but means the 0.5th percentile, which is
+    a silent wrong answer rather than an error, so the docstring is explicit
+    and this only enforces the hard bounds.
+    """
+    if not percentiles:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                "percentiles must list at least one value in 0..9999 "
+                "(scaled: 5000 is the median, 2500 the first quartile)."
+            ),
+        )
+    if len(percentiles) > _MAX_FORECAST_PERCENTILES:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"At most {_MAX_FORECAST_PERCENTILES} percentiles per request, "
+                f"got {len(percentiles)}."
+            ),
+        )
+    for value in percentiles:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise KalshiAPIError(
+                status=0,
+                message=f"percentiles must be integers, got {value!r}.",
+            )
+        if not 0 <= value <= _FORECAST_PERCENTILE_MAX:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"percentile {value} is outside 0..{_FORECAST_PERCENTILE_MAX}. "
+                    "These are scaled — 5000 is the median, not 50."
+                ),
+            )
+    return percentiles
 
 
 def _book_is_empty(body: dict[str, Any]) -> bool:
@@ -455,6 +551,136 @@ def register(server: FastMCP) -> None:
         }
         return await client.get(
             f"/series/{series_ticker}/events/{event_ticker}/candlesticks",
+            params=params,
+        )
+
+    @server.tool
+    async def kalshi_get_batch_candlesticks(
+        market_tickers: list[str],
+        start_ts: int,
+        end_ts: int,
+        period_interval: Literal[1, 60, 1440] = 60,
+        include_latest_before_start: bool = False,
+    ) -> dict[str, Any]:
+        """Get OHLC candles for MANY markets in one call (up to 100 tickers).
+
+        The batch form of `kalshi_get_market_candlesticks`, and the right tool
+        for a momentum or trend lens over a shortlist: one request instead of
+        N, and unlike the single-market version it needs no `series_ticker`.
+
+        Watch the budget shape — it is NOT the same as the single-market cap.
+        Kalshi returns at most 10,000 candlesticks TOTAL across all tickers,
+        so the window cost multiplies by ticker count: a 5000-candle window is
+        fine for one market and 5x over budget for three. Validated locally
+        before the request, with a message naming how many markets that window
+        actually affords.
+
+        Args:
+            market_tickers: 1-100 MARKET tickers. Duplicates are collapsed.
+            start_ts: Window start, unix seconds. Must be < end_ts.
+            end_ts: Window end, unix seconds.
+            period_interval: Bar width in MINUTES. Kalshi accepts ONLY 1
+                (minute), 60 (hour), or 1440 (day) — any other value 400s.
+                Default 60. Widening this is the cheapest way under the
+                10,000-candle batch cap.
+            include_latest_before_start: Prepend one synthetic candle from
+                before `start_ts`, so a series that didn't trade early in the
+                window still has an opening reference price. Default False.
+
+        Returns `markets`: a list of `{market_ticker, candlesticks: [...]}`.
+        Note this is a KEYED list, unlike `kalshi_get_event_candlesticks`,
+        which returns parallel arrays you have to zip — no zipping needed here.
+        """
+        cleaned = _dedupe_tickers(market_tickers)
+        if not cleaned:
+            raise KalshiAPIError(
+                status=0,
+                message="market_tickers must contain at least one market ticker.",
+            )
+        _validate_batch_candlestick_window(len(cleaned), start_ts, end_ts, period_interval)
+        params: dict[str, Any] = {
+            "market_tickers": ",".join(cleaned),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        if include_latest_before_start:
+            params["include_latest_before_start"] = "true"
+        # Billed per item, clamped to the bucket capacity — see the note on
+        # kalshi_get_orderbooks for why the clamp is load-bearing.
+        cost = min(DEFAULT_ENDPOINT_COST * len(cleaned), client.rate_limiter.read.capacity)
+        return await client.get("/markets/candlesticks", params=params, cost=cost)
+
+    @server.tool
+    async def kalshi_get_event_forecast_history(
+        event_ticker: str,
+        series_ticker: str,
+        start_ts: int,
+        end_ts: int,
+        percentiles: list[int] | None = None,
+        period_interval: Literal[0, 1, 60, 1440] = 60,
+    ) -> dict[str, Any]:
+        """Get an event's market-implied FORECAST DISTRIBUTION over time.
+
+        For scalar / range events — temperature, CPI, index levels, anything
+        whose markets are strike buckets — this collapses the whole strike
+        ladder into a distribution and gives you its percentiles per period.
+        That is a genuinely different signal from prices or candles: it tells
+        you where the market thinks the NUMBER lands, and how that belief has
+        moved, without reconstructing it from a dozen bucket markets yourself.
+
+        Only meaningful for events with a numeric outcome. A binary
+        win/lose event has no distribution to report.
+
+        Args:
+            event_ticker: The event, e.g. "KXHIGHNY-26AUG14".
+            series_ticker: The series it belongs to (the endpoint is scoped
+                by series, same as the candlestick endpoints).
+            start_ts: Window start, unix seconds. Must be < end_ts.
+            end_ts: Window end, unix seconds.
+            percentiles: Up to 10 values, each 0-9999. NOTE THE SCALE — these
+                are not 0-100. The median is 5000, the quartiles are 2500 and
+                7500, and passing 50 silently means the 0.5th percentile
+                rather than the median. Defaults to
+                [1000, 2500, 5000, 7500, 9000] (a decile/quartile spread).
+            period_interval: Period length in MINUTES. Accepts 0 (5-SECOND
+                intervals — the only endpoint where 0 is legal), 1, 60, or
+                1440. Default 60. Use 0 only for a very short window; it is
+                by far the highest-volume option.
+
+        Returns `forecast_history`: per period, an `end_period_ts` plus
+        `percentile_points` giving each requested percentile's raw, numeric,
+        and formatted forecast value.
+        """
+        event_ticker = _validate_ticker(event_ticker, name="event_ticker")
+        series_ticker = _validate_ticker(series_ticker, name="series_ticker")
+        if period_interval not in _VALID_FORECAST_INTERVALS:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    "period_interval must be 0 (5-second), 1 (minute), 60 (hour) or "
+                    f"1440 (day) for forecast history; got {period_interval!r}."
+                ),
+            )
+        if end_ts <= start_ts:
+            raise KalshiAPIError(
+                status=0,
+                message=(
+                    f"end_ts ({end_ts}) must be greater than start_ts ({start_ts}); "
+                    "both are unix seconds."
+                ),
+            )
+        wanted = _validate_forecast_percentiles(
+            list(percentiles) if percentiles else [1000, 2500, 5000, 7500, 9000]
+        )
+        params: dict[str, Any] = {
+            "percentiles": wanted,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        return await client.get(
+            f"/series/{series_ticker}/events/{event_ticker}/forecast_percentile_history",
             params=params,
         )
 

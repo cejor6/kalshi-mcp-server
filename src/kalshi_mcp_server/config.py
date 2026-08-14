@@ -99,6 +99,20 @@ class Config:
     # safety envelope). Has a default so existing constructors stay valid.
     runtime_limit_tuning_enabled: bool = True
 
+    # Combo (parlay) creation. `POST /multivariate_event_collections/{ticker}`
+    # materializes a combo market ticker so it can be looked up and traded. It
+    # commits NO money, so it gets its own gate rather than riding on
+    # `trading_enabled` — a read-only scout can be allowed to build parlays
+    # without also being allowed to place orders. Default OFF (fail closed):
+    # it is still a POST that creates exchange state under your account.
+    #
+    # Kalshi caps creations at 5000 per WEEK per account. That's a scarce
+    # shared resource an agent in a retry loop could burn, so the server also
+    # enforces its own per-day ceiling. Both have defaults so existing
+    # constructors stay valid.
+    combo_creation_enabled: bool = False
+    max_combo_creations_per_day: int = 100
+
     @classmethod
     def from_env(cls) -> Config:
         key_id = os.environ.get("KALSHI_API_KEY_ID", "").strip()
@@ -150,6 +164,8 @@ class Config:
             port=_get_int("PORT", 8000),
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
             runtime_limit_tuning_enabled=_get_bool("MCP_ALLOW_RUNTIME_LIMIT_TUNING", default=True),
+            combo_creation_enabled=_get_bool("MCP_ALLOW_COMBO_CREATION", default=False),
+            max_combo_creations_per_day=_get_int("MCP_MAX_COMBO_CREATIONS_PER_DAY", 100),
         )
 
 
