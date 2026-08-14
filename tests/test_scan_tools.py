@@ -135,6 +135,40 @@ async def test_find_liquid_markets_scan_all_sweeps_full_listing(rsa_private_key)
 
 
 @pytest.mark.asyncio
+async def test_find_liquid_markets_scan_all_streams_instead_of_retaining(rsa_private_key):
+    """A full sweep must fold each page into a running top-K, not retain every
+    market. Tens of thousands of ~2KB objects held only to sort once and keep
+    `limit` is a lot of memory for nothing — the pager's `on_page` hook exists
+    for exactly this, and the ranking must come out identical either way."""
+    handler, calls = _listing_pages(4, 3)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_find_liquid_markets")
+
+    out = await fn(limit=2, scan_all=True)
+
+    assert len(calls) == 4
+    assert out["scanned"] == 12  # everything was still counted
+    # Streaming top-K is exact: page 0 carries the highest volume (100).
+    assert [m["volume_24h_fp"] for m in out["markets"]] == ["100", "100"]
+    assert len(out["markets"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_find_liquid_markets_scan_all_applies_min_volume(rsa_private_key):
+    """The streaming fold must apply min_volume too, not just top-K."""
+    handler, _ = _listing_pages(4, 3)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_find_liquid_markets")
+
+    # Pages carry volumes 100, 99, 98, 97 — cut everything below 99.
+    out = await fn(limit=10, scan_all=True, min_volume=99)
+
+    assert {m["volume_24h_fp"] for m in out["markets"]} == {"100", "99"}
+    assert len(out["markets"]) == 6  # two pages x 3 markets
+    assert out["scanned"] == 12  # the scan still saw everything
+
+
+@pytest.mark.asyncio
 async def test_find_liquid_markets_default_is_unchanged(rsa_private_key):
     """Backwards compatibility: without scan_all the tool still windows at
     `scan_limit` and reports it, exactly as before."""

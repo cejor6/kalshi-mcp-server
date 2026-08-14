@@ -25,13 +25,15 @@ from kalshi_mcp_server.errors import ComboCreationDisabledError, KalshiAPIError,
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import SafetyController
 from kalshi_mcp_server.tools import multivariate
+from kalshi_mcp_server.tools.discovery import _parse_fields
 from kalshi_mcp_server.tools.multivariate import (
+    ComboLeg,
     _check_against_collection,
     _legs_from_custom_strike,
     _legs_from_selected,
     _normalize_leg_specs,
     _resolve_combo_legs,
-    ComboLeg,
+    _split_csv_positional,
 )
 
 
@@ -148,6 +150,59 @@ def test_legs_from_custom_strike_parses_parallel_csvs():
     ]
 
 
+def test_legs_from_custom_strike_preserves_repeated_positional_values():
+    """REGRESSION: these are PARALLEL arrays, so repeats are meaningful and
+    must not be de-duped.
+
+    The first implementation reused `discovery._parse_fields`, which de-dupes
+    (it exists for a field whitelist). On the commonest real shape — an
+    all-YES combo, sides "yes,yes,yes" — the sides column collapsed to one
+    element, the length check failed, and EVERY leg came back with
+    `side: None` while still reporting `resolvable: true`. The original tests
+    missed it because they used distinct values ("yes,no"), where de-duping is
+    a no-op.
+    """
+    market = {
+        "custom_strike": {
+            "Associated Markets": "KXMLB-A-6,KXMLB-B-6,KXMLB-C-6",
+            "Associated Market Sides": "yes,yes,yes",
+            "Associated Events": "KXMLB-A,KXMLB-B,KXMLB-C",
+        }
+    }
+    legs = _legs_from_custom_strike(market)
+    assert [leg["side"] for leg in legs] == ["yes", "yes", "yes"]
+    assert [leg["market_ticker"] for leg in legs] == [
+        "KXMLB-A-6",
+        "KXMLB-B-6",
+        "KXMLB-C-6",
+    ]
+
+
+def test_legs_from_custom_strike_preserves_repeated_events():
+    """Two legs on the same event repeat that event ticker — also a value the
+    de-duping implementation collapsed, taking `event_ticker` down with it."""
+    market = {
+        "custom_strike": {
+            "Associated Markets": "E1-A,E1-B,E2-C",
+            "Associated Market Sides": "yes,no,yes",
+            "Associated Events": "E1,E1,E2",
+        }
+    }
+    legs = _legs_from_custom_strike(market)
+    assert [leg["event_ticker"] for leg in legs] == ["E1", "E1", "E2"]
+    assert [leg["side"] for leg in legs] == ["yes", "no", "yes"]
+
+
+def test_split_csv_positional_does_not_dedupe():
+    """The helper this hinges on, pinned directly: `_parse_fields` de-dupes by
+    design and must never be reused for positional columns."""
+    assert _split_csv_positional("yes,yes,no") == ["yes", "yes", "no"]
+    assert _split_csv_positional(" a , b ,, c ") == ["a", "b", "c"]
+    assert _split_csv_positional(None) == []
+    # The contrast that caused the bug.
+    assert _parse_fields("yes,yes,no") == ["yes", "no"]
+
+
 def test_legs_from_custom_strike_drops_side_on_column_mismatch():
     """Parallel arrays with no linking key: if the columns don't line up we
     cannot say which side belongs to which leg. Keep the unambiguous tickers,
@@ -254,9 +309,7 @@ def test_normalize_leg_specs_rejects_duplicate_leg_market():
 
 
 def test_normalize_leg_specs_rejects_oversized_selection():
-    legs = [
-        {"market_ticker": f"KX-{i}", "event_ticker": "KX-E", "side": "yes"} for i in range(101)
-    ]
+    legs = [{"market_ticker": f"KX-{i}", "event_ticker": "KX-E", "side": "yes"} for i in range(101)]
     with pytest.raises(SafetyError) as exc:
         _normalize_leg_specs(legs)
     assert "cap is 100" in str(exc.value)
@@ -270,9 +323,7 @@ def test_check_against_collection_enforces_size_bounds():
         _check_against_collection({"size_min": 3, "size_max": 9}, _GOOD_LEGS)
     assert "at least 3" in str(exc.value)
 
-    many = [
-        {"market_ticker": f"KX-{i}", "event_ticker": "KX-E", "side": "yes"} for i in range(10)
-    ]
+    many = [{"market_ticker": f"KX-{i}", "event_ticker": "KX-E", "side": "yes"} for i in range(10)]
     with pytest.raises(SafetyError) as exc:
         _check_against_collection({"size_min": 2, "size_max": 9}, many)
     assert "at most 9" in str(exc.value)
@@ -283,6 +334,22 @@ def test_check_against_collection_enforces_all_yes():
         _check_against_collection({"is_all_yes": True}, _GOOD_LEGS)
     assert "YES-only" in str(exc.value)
     assert "KXB-E1-Y" in str(exc.value)  # names the offending leg
+
+
+def test_check_against_collection_enforces_single_market_per_event():
+    """A readable collection rule the sibling tool advertises — two strikes on
+    the same game can't both be legs where the collection forbids it."""
+    legs = [
+        {"market_ticker": "KXA-E1-X", "event_ticker": "KXA-E1", "side": "yes"},
+        {"market_ticker": "KXA-E1-Y", "event_ticker": "KXA-E1", "side": "no"},
+        {"market_ticker": "KXB-E1-Z", "event_ticker": "KXB-E1", "side": "yes"},
+    ]
+    with pytest.raises(SafetyError) as exc:
+        _check_against_collection({"is_single_market_per_event": True}, legs)
+    assert "KXA-E1" in str(exc.value)
+    assert "KXB-E1" not in str(exc.value)  # only the offender is named
+    # Same legs are fine when the collection doesn't impose the rule.
+    _check_against_collection({}, legs)
 
 
 def test_check_against_collection_skips_unreadable_rules():
@@ -739,11 +806,95 @@ async def test_create_combo_market_is_independent_of_trading_enabled(rsa_private
     assert out["market_ticker"] == "KXMVE-S1-NEW"
 
 
+@pytest.mark.asyncio
+async def test_create_combo_market_keeps_the_slot_on_an_ambiguous_failure(rsa_private_key):
+    """A timeout or 5xx may mean Kalshi DID create the combo — and it is
+    exactly the case that triggers a retry loop, which is what the ceiling
+    exists to bound. So the slot stays spent; only a clean 4xx refunds it."""
+    handler, _ = _create_handler(collection={"size_min": 1, "size_max": 9}, create_status=503)
+    server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    with pytest.raises(KalshiAPIError):
+        await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
+
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 1
+
+
+@pytest.mark.asyncio
+async def test_create_combo_market_refunds_the_slot_on_local_preflight_refusal(rsa_private_key):
+    """A local refusal sent no request at all, so it must cost no budget."""
+    handler, _ = _create_handler(collection={"is_all_yes": True})
+    server = _make_server(rsa_private_key, handler, combo_creation_enabled=True)
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    with pytest.raises(SafetyError):
+        await fn(collection_ticker="KXMVE-R", legs=_GOOD_LEGS)
+
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 0
+
+
+@pytest.mark.asyncio
+async def test_create_combo_market_rejects_path_traversal_in_collection_ticker(rsa_private_key):
+    """The collection ticker is interpolated into the POST path AND into the
+    message we sign. A separator in it would steer a state-mutating call at a
+    different endpoint, so reject the charset outright."""
+    calls: list[str] = []
+    server = _make_server(
+        rsa_private_key,
+        lambda r: (calls.append(r.url.path), httpx.Response(200, json={}))[1],
+        combo_creation_enabled=True,
+    )
+    fn = await _tool_fn(server, "kalshi_create_combo_market")
+
+    for bad in ("../portfolio/orders", "KX-R/../../x", "KX-R?a=b", "KX R"):
+        with pytest.raises(KalshiAPIError) as exc:
+            await fn(collection_ticker=bad, legs=_GOOD_LEGS)
+        assert "not valid in a Kalshi ticker" in exc.value.message
+    assert calls == []  # nothing reached the wire, and no slot was spent
+    assert server._kalshi_safety.combo_creation_view()["combo_creations_today"] == 0
+
+
+def test_reserve_combo_creation_is_atomic_against_the_ceiling():
+    """Reserve-then-release, not check-then-record: the slot is claimed before
+    the await, so two callers can't both pass a ceiling of one."""
+    safety = SafetyController(
+        _make_config(combo_creation_enabled=True, max_combo_creations_per_day=1)
+    )
+    safety.reserve_combo_creation()
+    with pytest.raises(SafetyError):
+        safety.reserve_combo_creation()
+    # A refund frees it again.
+    safety.release_combo_creation()
+    safety.reserve_combo_creation()
+    assert safety.combo_creation_view()["combo_creations_today"] == 1
+
+
+def test_release_combo_creation_never_goes_negative():
+    safety = SafetyController(_make_config(combo_creation_enabled=True))
+    safety.release_combo_creation()
+    safety.release_combo_creation()
+    assert safety.combo_creation_view()["combo_creations_today"] == 0
+
+
+def test_combo_creation_state_is_visible_in_the_environment_view():
+    """The gate has to be observable to an operator — combo_creation_view's
+    docstring says it feeds kalshi_get_environment, so it must actually be
+    wired there (it wasn't, and three reviewers caught the overclaim)."""
+    safety = SafetyController(
+        _make_config(combo_creation_enabled=True, max_combo_creations_per_day=7)
+    )
+    view = safety.combo_creation_view()
+    assert view["combo_creation_enabled"] is True
+    assert view["max_combo_creations_per_day"] == 7
+    assert view["combo_creations_today"] == 0
+
+
 def test_combo_creation_gate_raises_its_own_error_type():
     """Distinct from TradingDisabledError so a caller can tell the two gates
     apart — and so flipping one is never mistaken for flipping the other."""
     safety = SafetyController(_make_config(combo_creation_enabled=False))
     with pytest.raises(ComboCreationDisabledError) as exc:
-        safety.check_combo_creation()
+        safety.reserve_combo_creation()
     assert "MCP_ALLOW_COMBO_CREATION" in str(exc.value)
     assert "KALSHI_TRADING_ENABLED" in str(exc.value)  # explains the distinction

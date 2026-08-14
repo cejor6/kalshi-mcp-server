@@ -126,9 +126,12 @@ async def test_enum_constraint_in_schema(rsa_private_key, tool, prop, expected):
         ("kalshi_get_settlements", "limit", 1, 1000),
         ("kalshi_prepare_order", "limit_price_cents", 1, 99),
         ("kalshi_fetch_external_data", "max_bytes", 1_000, 500_000),
-        # Batch orderbook depth is applied client-side (Kalshi's batch
-        # endpoint has no depth param), so the schema bound is the only
-        # steering the model gets — the runtime slice is what enforces it.
+        # Batch orderbook depth is applied client-side (Kalshi's batch endpoint
+        # has no depth param). `depth` is a benign READ knob, so per AGENTS.md
+        # the schema bound is the enforcement and there is no redundant runtime
+        # guard: a direct `.fn` caller passing depth<=0 just gets the full book,
+        # which is the same thing kalshi_get_orderbook's depth=0 means. Nothing
+        # safety-relevant rides on it.
         ("kalshi_get_orderbooks", "depth", 1, 100),
         ("kalshi_get_series_summary", "top", 1, 200),
         ("kalshi_get_milestones", "limit", 1, 500),

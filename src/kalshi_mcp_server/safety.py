@@ -450,23 +450,47 @@ class SafetyController:
                 "creation quota."
             )
 
-    def check_combo_creation(self) -> None:
-        """Raise if combo creation is disabled or the daily ceiling is reached."""
+    def reserve_combo_creation(self) -> None:
+        """Gate + claim one unit of today's creation budget, BEFORE the POST.
+
+        Reserve-then-release rather than check-then-record, for two reasons the
+        naive ordering gets wrong:
+
+        1. **Concurrency.** Check-then-await-then-record leaves the whole
+           network round trip between the check and the increment, so N
+           concurrent calls all read the same count and every one of them
+           passes a ceiling only one should have. Claiming the slot up front
+           closes that window.
+        2. **Ambiguous failures.** If the POST times out, Kalshi may well have
+           created the combo — and a timeout is precisely the case that
+           triggers a retry loop, which is the thing this ceiling exists to
+           bound. Counting optimistically means an ambiguous outcome costs
+           budget; only an unambiguous rejection gives it back.
+        """
         self.assert_combo_creation_enabled()
-        _, used_today = self._combo_creations.peek()
         ceiling = self._config.max_combo_creations_per_day
-        if used_today + 1 > ceiling:
+        used_after = self._combo_creations.add(1.0)
+        if used_after > ceiling:
+            # Over the line — hand the slot straight back, then refuse.
+            self._combo_creations.add(-1.0)
             raise SafetyError(
-                f"Refusing to create another combo market: {int(used_today)} created "
+                f"Refusing to create another combo market: {int(used_after) - 1} created "
                 f"today, at the per-day ceiling of {ceiling}. Kalshi allows 5000 per "
                 "WEEK per account and this server bounds the daily draw so a retry "
                 "loop can't burn it. Raise MCP_MAX_COMBO_CREATIONS_PER_DAY and restart "
                 "if you genuinely need more. Resets at UTC midnight."
             )
 
-    def record_combo_creation(self) -> None:
-        """Call AFTER Kalshi accepts a combo-market creation."""
-        self._combo_creations.add(1.0)
+    def release_combo_creation(self) -> None:
+        """Return a reserved slot after an UNAMBIGUOUS rejection.
+
+        Only for outcomes where Kalshi certainly did not create anything — a
+        4xx. Never call this on a timeout or a 5xx: the combo may exist, and
+        crediting the budget back would let a retry loop spin freely.
+        """
+        _, used = self._combo_creations.peek()
+        if used > 0:
+            self._combo_creations.add(-1.0)
 
     def combo_creation_view(self) -> dict[str, object]:
         """Combo-creation state for `kalshi_get_environment` / the resource."""

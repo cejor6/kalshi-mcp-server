@@ -186,8 +186,14 @@ ticker. Read the distinction carefully before "tidying" it:
   into the USD daily counter; they measure different budgets. Like the spend
   counter it is in-process and resets on restart: it bounds a runaway loop
   within a session, it is not a durable ledger.
-- The counter increments only **after** Kalshi accepts. A rejected creation
-  consumed no Kalshi quota, so it must not consume local budget either.
+- The slot is **reserved before the POST and released only on an unambiguous
+  4xx** — not counted afterwards. Check-then-await-then-record leaves the whole
+  round trip between the check and the increment, so concurrent calls all read
+  the same count and every one passes a ceiling only one should have. And a
+  timeout or 5xx is ambiguous: Kalshi may well have created the combo, and a
+  timeout is precisely what triggers the retry loop this ceiling exists to
+  bound, so an ambiguous outcome must cost budget. Don't "simplify" it back to
+  record-on-success.
 
 This is the one write tool that deliberately does NOT follow the
 "build an `OrderIntent`, call `safety.check_order`, generate an idempotency
@@ -504,6 +510,23 @@ tools encode these; don't regress them.
   an error — which is why the docstring leads with the scale and the validator
   only enforces the hard bounds. `period_interval=0` (5-second bars) is legal
   on that endpoint and ONLY that one.
+- **Never parse `custom_strike`'s parallel columns with `_parse_fields`.**
+  That helper de-dupes (it exists for a *field whitelist*, where a repeat is a
+  caller mistake). `custom_strike` holds three PARALLEL arrays where repeats
+  are the norm and carry meaning: the sides column of a real all-YES combo is
+  `"yes,yes,yes…"`, which de-duped down to one element, failed the
+  length-alignment check, and silently returned every leg with `side: null`
+  while still reporting `resolvable: true`. Use `_split_csv_positional`, which
+  preserves position. This shipped once and was caught in review; the
+  regression tests use REPEATED values on purpose, because the original tests
+  used `"yes,no"` and de-duping is a no-op on distinct values.
+- **Tickers interpolated into a URL path go through `_validate_path_ticker`,
+  not just `_validate_ticker`.** Paths are built with f-strings and the signed
+  canonical message is rebuilt the same way, so a `/`, `?`, `#`, or `..` in a
+  ticker changes which endpoint the request reaches. It matters most on the
+  POST path (`/multivariate_event_collections/{collection_ticker}`), where the
+  string is model-supplied and the call mutates state. Restricting to the
+  charset real tickers use closes it; rejecting beats escaping.
 - **Combo legs live on the MARKET, not on the collection.**
   `/multivariate_event_collections/{ticker}` describes the *universe* a combo
   may be built from (`associated_event_tickers`, `size_min`/`size_max`,

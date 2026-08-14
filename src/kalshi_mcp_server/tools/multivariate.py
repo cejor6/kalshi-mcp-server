@@ -22,7 +22,8 @@ Three things about this API that are easy to get wrong:
    own docs say it "must be hit at least once before trading or looking up a
    market". Money is only at risk later, via the normal order path.
 3. **Creations are a scarce account resource** — 5000 per WEEK. See
-   `SafetyController.check_combo_creation` for how that's bounded locally.
+   `SafetyController.reserve_combo_creation` for how that's bounded locally,
+   and why it reserves the slot up front rather than counting afterwards.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ from pydantic import BaseModel, Field
 from kalshi_mcp_server.errors import KalshiAPIError, SafetyError
 from kalshi_mcp_server.tools.discovery import (
     _event_hint,
-    _parse_fields,
     _project_market,
+    _validate_path_ticker,
     _validate_ticker,
 )
 
@@ -85,6 +86,19 @@ def _legs_from_selected(market: dict[str, Any]) -> list[dict[str, Any]]:
     return legs
 
 
+def _split_csv_positional(raw: Any) -> list[str]:
+    """Split one of `custom_strike`'s parallel CSV columns, PRESERVING position.
+
+    Deliberately NOT `discovery._parse_fields`: that helper de-dupes (it exists
+    for a field whitelist, where a repeat is a caller mistake). De-duping
+    positional data is catastrophic here — the sides column of a real combo is
+    usually "yes,yes,yes…" and collapses to a single element, which then fails
+    the length check below and silently nulls every leg's side. Repeats are
+    MEANINGFUL in a parallel array; only empty trailing fragments are dropped.
+    """
+    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
+
+
 def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
     """Legs from the three parallel CSV strings in `custom_strike` (fallback).
 
@@ -96,11 +110,11 @@ def _legs_from_custom_strike(market: dict[str, Any]) -> list[dict[str, Any]]:
     strike = market.get("custom_strike")
     if not isinstance(strike, dict):
         return []
-    tickers = _parse_fields(str(strike.get(_CUSTOM_STRIKE_MARKETS_KEY) or ""))
+    tickers = _split_csv_positional(strike.get(_CUSTOM_STRIKE_MARKETS_KEY))
     if not tickers:
         return []
-    sides = _parse_fields(str(strike.get(_CUSTOM_STRIKE_SIDES_KEY) or ""))
-    events = _parse_fields(str(strike.get(_CUSTOM_STRIKE_EVENTS_KEY) or ""))
+    sides = _split_csv_positional(strike.get(_CUSTOM_STRIKE_SIDES_KEY))
+    events = _split_csv_positional(strike.get(_CUSTOM_STRIKE_EVENTS_KEY))
     aligned_sides = len(sides) == len(tickers)
     aligned_events = len(events) == len(tickers)
     return [
@@ -202,9 +216,7 @@ def _normalize_leg_specs(legs: Any) -> list[dict[str, str]]:
     return normalized
 
 
-def _check_against_collection(
-    collection: dict[str, Any], legs: list[dict[str, str]]
-) -> None:
+def _check_against_collection(collection: dict[str, Any], legs: list[dict[str, str]]) -> None:
     """Pre-flight the leg set against the collection's own construction rules.
 
     Kalshi rejects a malformed selection with an opaque 400. The collection
@@ -231,6 +243,18 @@ def _check_against_collection(
                 "This collection is YES-only (`is_all_yes`), but these legs are "
                 f"side='no': {', '.join(no_legs)}. Flip them to 'yes', or pick a "
                 "collection that permits NO legs."
+            )
+    if collection.get("is_single_market_per_event") is True:
+        counts: dict[str, int] = {}
+        for leg in legs:
+            counts[leg["event_ticker"]] = counts.get(leg["event_ticker"], 0) + 1
+        repeated = sorted(event for event, n in counts.items() if n > 1)
+        if repeated:
+            raise SafetyError(
+                "This collection allows only one market per event "
+                "(`is_single_market_per_event`), but these events appear on more "
+                f"than one leg: {', '.join(repeated)}. Drop the duplicates — two "
+                "strikes on the same game can't both be legs here."
             )
 
 
@@ -305,7 +329,7 @@ def register(server: FastMCP) -> None:
         collection — this is a single-object fetch, so expect a large-ish
         response and don't loop it over many collections.
         """
-        collection_ticker = _validate_ticker(collection_ticker, name="collection_ticker")
+        collection_ticker = _validate_path_ticker(collection_ticker, name="collection_ticker")
         return await client.get(f"/multivariate_event_collections/{collection_ticker}")
 
     @server.tool
@@ -420,8 +444,12 @@ def register(server: FastMCP) -> None:
             `legs`: list of `{market_ticker, event_ticker, side, title,
                 yes_sub_title}` (the last two only when `with_titles`
                 succeeded). Order matches Kalshi's leg order. This list is
-                shaped to feed straight back into
-                `kalshi_create_combo_market(legs=…)`.
+                shaped to feed back into `kalshi_create_combo_market(legs=…)`
+                — but check first that no leg has a null `side` or
+                `event_ticker`. Those are null only when `source` is
+                "custom_strike" AND its parallel columns didn't line up, in
+                which case the direction of that leg is genuinely unknown and
+                the create call will (correctly) refuse it rather than guess.
             `leg_count`, `source`: how many legs, and whether they came from
                 "mve_selected_legs" (structured, authoritative) or
                 "custom_strike" (parsed parallel CSVs — `side` is dropped to
@@ -568,8 +596,11 @@ def register(server: FastMCP) -> None:
         Two limits apply. Kalshi allows 5000 creations per WEEK per account,
         and this server enforces its own per-day ceiling on top
         (`MCP_MAX_COMBO_CREATIONS_PER_DAY`, default 100) so a retry loop
-        cannot burn the weekly quota. Creating the same leg set twice returns
-        the same market, but each call still counts — resolve first, create once.
+        cannot burn the weekly quota. Every call draws on that budget whether
+        or not the combo already existed, so look the combo up before creating
+        it rather than creating speculatively. (Kalshi documents creation as a
+        prerequisite for lookup and trading; it does NOT document what a repeat
+        call does, so don't rely on it being free.)
 
         Args:
             collection_ticker: The parent collection, e.g.
@@ -599,35 +630,50 @@ def register(server: FastMCP) -> None:
         registered otherwise); it is deliberately independent of
         KALSHI_TRADING_ENABLED, which gates money, not ticker creation.
         """
-        collection_ticker = _validate_ticker(collection_ticker, name="collection_ticker")
+        # Path-charset validated: this string is interpolated into the POST
+        # path (and into the message we sign), so a `/` or `..` in it would
+        # redirect a state-mutating call.
+        collection_ticker = _validate_path_ticker(collection_ticker, name="collection_ticker")
         # Authoritative runtime validation — the `list[ComboLeg]` annotation
         # only steers MCP clients, and a direct `.fn` caller bypasses it.
         normalized = _normalize_leg_specs(legs)
-        # Gate + daily ceiling BEFORE any wire call, so a refusal costs nothing.
-        safety.check_combo_creation()
+        # Gate + claim a slot BEFORE any wire call, so a refusal costs nothing
+        # and a concurrent pair can't both pass the same ceiling.
+        safety.reserve_combo_creation()
 
         try:
-            collection = await client.get(
-                f"/multivariate_event_collections/{collection_ticker}"
-            )
-        except KalshiAPIError:
-            # Fail open: Kalshi remains authoritative on whether a selection is
-            # valid. We only pre-empt the opaque-400 cases we can see locally.
-            pass
-        else:
-            contract = collection.get("multivariate_contract", collection)
-            if isinstance(contract, dict):
-                _check_against_collection(contract, normalized)
+            try:
+                collection = await client.get(
+                    f"/multivariate_event_collections/{collection_ticker}"
+                )
+            except KalshiAPIError:
+                # Fail open: Kalshi remains authoritative on whether a selection
+                # is valid. We only pre-empt the opaque-400s we can see locally.
+                pass
+            else:
+                contract = collection.get("multivariate_contract", collection)
+                if isinstance(contract, dict):
+                    _check_against_collection(contract, normalized)
 
-        body: dict[str, Any] = {"selected_markets": normalized}
-        if with_market_payload:
-            body["with_market_payload"] = True
-        response = await client.post(
-            f"/multivariate_event_collections/{collection_ticker}", json=body
-        )
-        # Only count it after Kalshi accepts — a rejected call consumed no
-        # creation quota, so it must not consume local budget either.
-        safety.record_combo_creation()
+            body: dict[str, Any] = {"selected_markets": normalized}
+            if with_market_payload:
+                body["with_market_payload"] = True
+            response = await client.post(
+                f"/multivariate_event_collections/{collection_ticker}", json=body
+            )
+        except KalshiAPIError as exc:
+            # Give the reserved slot back ONLY when Kalshi unambiguously
+            # refused (4xx) — nothing was created, so nothing was spent. A
+            # timeout (status 0) or a 5xx is ambiguous: the combo may exist,
+            # and that is exactly the case a retry loop hits, so the slot
+            # stays spent. See SafetyController.reserve_combo_creation.
+            if 400 <= exc.status < 500:
+                safety.release_combo_creation()
+            raise
+        except SafetyError:
+            # Local pre-flight refusal — no request went out.
+            safety.release_combo_creation()
+            raise
 
         view = safety.combo_creation_view()
         return {

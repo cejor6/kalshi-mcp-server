@@ -313,7 +313,7 @@ def register(server: FastMCP) -> None:
     # in the Args: block, which FastMCP routes to the parameter schema.
     @server.tool
     async def kalshi_get_orderbooks(
-        tickers: list[str],
+        tickers: Annotated[list[str], Field(max_length=_MAX_ORDERBOOK_TICKERS)],
         depth: Annotated[int, Field(ge=1, le=100)] = 5,
     ) -> dict[str, Any]:
         """Fetch orderbooks for up to 25 markets in ONE call.
@@ -323,9 +323,11 @@ def register(server: FastMCP) -> None:
         keeps the read bucket for the next sweep, and the shallow default
         depth keeps 25 books inside a normal tool-result budget.
 
-        Errors are isolated per ticker. A bad, unknown, or event-level ticker
-        yields an `error` entry for THAT ticker only — the batch still returns
-        every book it could resolve, so one typo never costs you the call.
+        Errors are isolated per ticker. An unknown or event-level ticker yields
+        an `error` entry for THAT ticker only — the batch still returns every
+        book it could resolve. (A structurally invalid ticker, i.e. empty or
+        blank, is different: it fails the whole call up front, because it means
+        the argument itself is malformed rather than one entry being wrong.)
 
         Args:
             tickers: 1-25 MARKET tickers (with outcome suffixes, e.g.
@@ -333,7 +335,8 @@ def register(server: FastMCP) -> None:
                 applies AFTER de-duping. Over 25 is rejected with a message
                 telling you to split the batch — the cap protects your context,
                 not Kalshi (its endpoint allows 100). An EVENT ticker has no
-                single book and comes back as an error entry.
+                single book and comes back as an error entry. An empty or
+                blank-string entry rejects the whole call.
             depth: Price levels to keep PER SIDE, 1-100. Default 5 — enough
                 for top-of-book plus a few levels of context, which is what a
                 liquidity or anomaly lens actually reads. Raise it only for a
@@ -388,6 +391,15 @@ def register(server: FastMCP) -> None:
         by_ticker: dict[str, dict[str, Any]] = {}
         source = "batch"
         try:
+            # `tickers` is passed as a LIST, which httpx encodes as repeated
+            # `tickers=A&tickers=B` params. That is deliberate and differs from
+            # the comma-joined `market_tickers` on the batch candlestick tool:
+            # the API reference specs THIS parameter as an array with style
+            # "form, exploded" (max 100 items), and specs that one as a
+            # comma-separated string. They genuinely disagree; don't "unify"
+            # them. If this endpoint ever rejects the exploded form, the
+            # per-ticker fallback below still returns correct books, so the
+            # failure mode is extra reads rather than wrong data.
             body = await client.get("/markets/orderbooks", params={"tickers": cleaned}, cost=cost)
         except RateLimitError:
             # Never answer "you are going too fast" by firing N more requests.
@@ -556,7 +568,7 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_batch_candlesticks(
-        market_tickers: list[str],
+        market_tickers: Annotated[list[str], Field(max_length=_MAX_BATCH_CANDLESTICK_TICKERS)],
         start_ts: int,
         end_ts: int,
         period_interval: Literal[1, 60, 1440] = 60,

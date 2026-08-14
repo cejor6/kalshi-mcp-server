@@ -99,6 +99,43 @@ def _validate_ticker(ticker: str, *, name: str = "ticker") -> str:
     return ticker.strip()
 
 
+# Characters a real Kalshi ticker uses: upper/lower alphanumerics plus `-`,
+# `.` and `_` (e.g. "KXFED-26MAR19-B5.25", "KXMVECROSSCATEGORY-SHARD1-R").
+_TICKER_ALLOWED_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._"
+)
+
+
+def _validate_path_ticker(ticker: str, *, name: str = "ticker") -> str:
+    """Validate a ticker that will be INTERPOLATED INTO A URL PATH.
+
+    Tools build paths with f-strings (`/markets/{ticker}/orderbook`), and the
+    path we sign is reconstructed the same way. A ticker containing `/`, `?`,
+    `#`, or a `..` segment would therefore change which endpoint the request
+    reaches — and the canonical message we sign along with it. That is a
+    problem worth closing on any path, and a genuine one on the POST path
+    (`/multivariate_event_collections/{collection_ticker}`), where a
+    model-supplied string would otherwise steer a state-mutating call.
+
+    Restricting to the charset real tickers actually use is the whole fix:
+    every dangerous character is a separator, and none of them are legal in a
+    ticker. Rejecting is correct rather than escaping — an escaped `/` would
+    just 404 more confusingly.
+    """
+    ticker = _validate_ticker(ticker, name=name)
+    bad = sorted(set(ticker) - _TICKER_ALLOWED_CHARS)
+    if bad:
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"{name} contains characters that are not valid in a Kalshi ticker: "
+                f"{''.join(bad)!r}. Tickers are alphanumerics plus '-', '.' and '_' "
+                f"(e.g. 'KXFED-26MAR19-B5.25'). Got {ticker!r}."
+            ),
+        )
+    return ticker
+
+
 # Whitelist for `minimal=True`. Unlike `compact` (a blacklist), this keeps
 # ONLY these fields — small enough to stay under an LLM tool-result token
 # cap even for multivariate combo markets, whose bulk lives in fields not
@@ -237,6 +274,35 @@ def _rank_liquid_markets(
     return [_minimal_market(m) for m in eligible[:limit]]
 
 
+class _TopKByVolume:
+    """Streaming top-K by 24h volume, for use as the pager's `on_page` fold.
+
+    A full sweep can cross tens of thousands of markets at ~2KB each; holding
+    them all just to sort once and keep 20 is a lot of memory for nothing.
+    Folding each page down to the running top-K instead bounds retention at
+    `limit` markets regardless of sweep size, and the result is identical —
+    top-K of the union is the top-K of the running top-K.
+    """
+
+    def __init__(self, *, limit: int, min_volume: float = 0.0) -> None:
+        self._limit = max(1, limit)
+        self._min_volume = min_volume
+        self._best: list[dict[str, Any]] = []
+
+    def __call__(self, page: list[dict[str, Any]]) -> None:
+        eligible = [m for m in page if _volume_24h(m) >= self._min_volume]
+        if not eligible:
+            return
+        self._best.extend(eligible)
+        # Re-sort and clip once per page rather than per market — pages are
+        # ~1000 and the list never exceeds limit + page size.
+        self._best.sort(key=_volume_24h, reverse=True)
+        del self._best[self._limit :]
+
+    def result(self) -> list[dict[str, Any]]:
+        return [_minimal_market(m) for m in self._best]
+
+
 # ── Listing pager (shared by find_liquid_markets and get_series_summary) ────
 #
 # Budgets for the opt-in `scan_all` full sweep. Without a hard wall the pager
@@ -332,6 +398,10 @@ async def _scan_markets_excluding_mve(
         if result.requests >= max_requests:
             result.stopped_by = "request_budget"
             return result
+        # Checked BETWEEN requests, not around an in-flight one — so the true
+        # worst case is this budget plus one request's own timeout
+        # (DEFAULT_TIMEOUT_S), not the budget exactly. Bounding it precisely
+        # would mean cancelling a request mid-flight for no real gain.
         if result.requests and (time.monotonic() - started) >= max_seconds:
             result.stopped_by = "time_budget"
             return result
@@ -749,14 +819,25 @@ def register(server: FastMCP) -> None:
             `stopped_by`: null when `complete`, else the binding wall (above).
         """
         effective_scan = max(1, min(scan_limit, 1000))
+        # A full sweep folds each page into a running top-K instead of
+        # retaining every market — tens of thousands of ~2KB objects held only
+        # to sort once and keep `limit`. The windowed path keeps the simple
+        # collect-then-rank shape; its retention is already bounded by
+        # scan_limit <= 1000.
+        topk = _TopKByVolume(limit=limit, min_volume=min_volume) if scan_all else None
         scan = await _scan_markets_excluding_mve(
             client,
             scan_limit=effective_scan,
             status=status,
             series_ticker=series_ticker,
             scan_all=scan_all,
+            on_page=topk,
         )
-        ranked = _rank_liquid_markets(scan.markets, min_volume=min_volume, limit=limit)
+        ranked = (
+            topk.result()
+            if topk is not None
+            else _rank_liquid_markets(scan.markets, min_volume=min_volume, limit=limit)
+        )
         return {
             "markets": ranked,
             "scanned": scan.scanned,

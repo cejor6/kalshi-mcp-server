@@ -26,7 +26,9 @@ from kalshi_mcp_server.tools.discovery import (
     _scan_markets_excluding_mve,
     _series_of,
     _single_ticker,
+    _TopKByVolume,
     _validate_mve_filter,
+    _validate_path_ticker,
     _validate_ticker,
     _volume_24h,
     _yes_spread,
@@ -91,6 +93,87 @@ def test_validate_ticker_custom_param_name():
     with pytest.raises(KalshiAPIError) as exc:
         _validate_ticker("", name="event_ticker")
     assert "event_ticker" in exc.value.message
+
+
+# ── _validate_path_ticker (charset guard on URL-path interpolation) ────────
+
+
+def test_validate_path_ticker_accepts_real_ticker_shapes():
+    for good in (
+        "KXFED-26MAR19-B5.25",
+        "KXMVECROSSCATEGORY-SHARD1-R",
+        "KXMLBGAME-26AUG141910SDCLE-CLE",
+        "KX_TEST.1",
+    ):
+        assert _validate_path_ticker(good) == good
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../portfolio/orders",
+        "KX-R/../../x",
+        "KX-R?limit=1",
+        "KX-R#frag",
+        "KX R",
+        "KX-R%2F",
+        "KX\nR",
+    ],
+)
+def test_validate_path_ticker_rejects_separators_and_whitespace(bad):
+    """These strings get interpolated into a request path AND into the message
+    we sign, so a separator would change which endpoint is hit. Rejecting beats
+    escaping — an escaped '/' would just 404 more confusingly."""
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker(bad)
+    assert "not valid in a Kalshi ticker" in exc.value.message
+
+
+def test_validate_path_ticker_still_rejects_empty():
+    with pytest.raises(KalshiAPIError) as exc:
+        _validate_path_ticker("   ", name="collection_ticker")
+    assert "collection_ticker" in exc.value.message
+
+
+# ── _TopKByVolume (streaming fold for scan_all) ────────────────────────────
+
+
+def test_topk_by_volume_matches_a_full_sort():
+    """Top-K of the union equals top-K of the running top-K — the property the
+    streaming fold relies on. Pin it against the batch implementation."""
+    pages = [
+        [{"ticker": f"P{p}-{i}", "volume_24h_fp": str((p * 7 + i * 3) % 20)} for i in range(5)]
+        for p in range(4)
+    ]
+    fold = _TopKByVolume(limit=3)
+    for page in pages:
+        fold(page)
+    streamed = fold.result()
+
+    flat = [m for page in pages for m in page]
+    batched = _rank_liquid_markets(flat, limit=3)
+    assert [m["ticker"] for m in streamed] == [m["ticker"] for m in batched]
+
+
+def test_topk_by_volume_bounds_retention():
+    fold = _TopKByVolume(limit=2)
+    for p in range(50):
+        fold([{"ticker": f"T{p}-{i}", "volume_24h_fp": str(p)} for i in range(100)])
+    assert len(fold.result()) == 2
+    # Highest volume wins; 5000 markets crossed, 2 retained.
+    assert all(m["volume_24h_fp"] == "49" for m in fold.result())
+
+
+def test_topk_by_volume_applies_min_volume():
+    fold = _TopKByVolume(limit=10, min_volume=5)
+    fold([{"ticker": "A", "volume_24h_fp": "10"}, {"ticker": "B", "volume_24h_fp": "1"}])
+    assert [m["ticker"] for m in fold.result()] == ["A"]
+
+
+def test_topk_by_volume_projects_minimally():
+    fold = _TopKByVolume(limit=1)
+    fold([{"ticker": "A", "volume_24h_fp": "10", "rules_primary": "long text"}])
+    assert "rules_primary" not in fold.result()[0]
 
 
 # ── _compact_market ────────────────────────────────────────────────────────
