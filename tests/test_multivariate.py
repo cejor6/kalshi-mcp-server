@@ -748,6 +748,20 @@ def test_project_collection_always_reports_a_count():
     assert (
         _project_collection(with_events, include_event_tickers=False)["associated_event_count"] == 2
     )
+    # Only the ticker list present → counts it.
+    only_tickers = {"associated_event_tickers": ["a", "b", "c"]}
+    assert (
+        _project_collection(only_tickers, include_event_tickers=False)["associated_event_count"]
+        == 3
+    )
+    # Both present but differing lengths → the TICKER list wins (the docstring's
+    # "prefer the ticker list" claim, pinned in isolation).
+    both = {"associated_event_tickers": ["a", "b", "c"], "associated_events": [{"ticker": "a"}]}
+    assert _project_collection(both, include_event_tickers=False)["associated_event_count"] == 3
+    # Non-list junk → 0, never a crash.
+    for junk in (None, "", "nope", 5):
+        proj = _project_collection({"associated_event_tickers": junk}, include_event_tickers=False)
+        assert proj["associated_event_count"] == 0
 
 
 @pytest.mark.asyncio

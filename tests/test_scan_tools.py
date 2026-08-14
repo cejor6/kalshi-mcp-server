@@ -694,3 +694,27 @@ async def test_batch_orderbooks_rejects_injection_ticker_before_the_wire(rsa_pri
     with pytest.raises(KalshiAPIError):
         await fn(tickers=["KX-A", "KX/../../x"])
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_markets_injection_ticker_never_reaches_event_hint_wire(rsa_private_key):
+    """REGRESSION (qa NIT): `kalshi_get_markets` is the one path that reaches
+    `_event_hint` with an UNVALIDATED value — its `tickers` arg. On an empty
+    result it extracts the sole ticker and probes `/events/{ticker}`; a ticker
+    with a path separator must be rejected by `_event_hint`'s defensive guard
+    (fail-open) so it never steers that probe. The `/markets` query call still
+    happens (httpx encodes the query), but no `/events` call does."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"markets": []})  # empty → triggers the hint path
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_markets")
+
+    out = await fn(tickers="KX/../../portfolio/balance")
+
+    assert out == {"markets": []}  # clean passthrough, no crash, no hint raised
+    assert not any(p.endswith("/events/KX/../../portfolio/balance") for p in paths)
+    assert not any("/events/" in p for p in paths)  # the injection never probed /events
