@@ -18,8 +18,13 @@ from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
 from kalshi_mcp_server.errors import KalshiAPIError, SafetyError, TradingDisabledError
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
-from kalshi_mcp_server.safety import SafetyController
+from kalshi_mcp_server.safety import OrderIntent, SafetyController
 from kalshi_mcp_server.tools import orders
+from kalshi_mcp_server.tools.orders import (
+    _build_v2_order_body,
+    _PendingOrder,
+    _v2_side_and_price_cents,
+)
 
 
 def _make_config(*, trading_enabled: bool = True) -> Config:
@@ -126,13 +131,16 @@ async def test_prepare_returns_confirmation_id(rsa_private_key):
 
 
 @pytest.mark.asyncio
-async def test_confirm_sends_correct_body_and_idempotency(rsa_private_key):
+async def test_confirm_sends_v2_body_to_v2_endpoint(rsa_private_key):
+    """Issue #83: confirm must hit the V2 create path with the V2 body shape.
+    The old `POST /portfolio/orders` + yes/no+cents body is retired (410)."""
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/portfolio/orders"):
+        captured["path"] = request.url.path
+        if request.url.path.endswith("/portfolio/events/orders"):
             captured["body"] = jsonlib.loads(request.content)
-            return httpx.Response(200, json={"order": {"id": "ord_xyz", "status": "resting"}})
+            return httpx.Response(200, json={"order_id": "ord_xyz", "remaining_count": "10"})
         return httpx.Response(404)
 
     server = _make_server(rsa_private_key, handler)
@@ -147,17 +155,21 @@ async def test_confirm_sends_correct_body_and_idempotency(rsa_private_key):
         limit_price_cents=25,
     )
     response = await confirm(confirmation_id=prepared["confirmation_id"])
-    assert response["order"]["id"] == "ord_xyz"
+    assert response["order_id"] == "ord_xyz"
+    assert captured["path"].endswith("/portfolio/events/orders")  # V2 path, not legacy
 
     body = captured["body"]
     assert body["ticker"] == "KX-TEST"
-    assert body["action"] == "buy"
-    assert body["side"] == "yes"
-    assert body["count"] == 10
-    assert body["yes_price"] == 25
+    assert body["side"] == "bid"  # buy YES → bid
+    assert body["price"] == "0.2500"  # 25¢ → fixed-point YES dollars
+    assert body["count"] == "10"  # FixedPointCount STRING
+    assert body["time_in_force"] == "good_till_canceled"  # limit rests
+    assert body["self_trade_prevention_type"] == "taker_at_cross"
     assert body["client_order_id"] == prepared["idempotency_key"]
     assert body["client_order_id"].startswith("mcp-")
-    assert "no_price" not in body  # side=yes -> yes_price only
+    # The retired v1 fields must be gone.
+    for gone in ("action", "yes_price", "no_price", "type"):
+        assert gone not in body
 
 
 @pytest.mark.asyncio
@@ -205,7 +217,8 @@ async def test_cancel_works_even_when_trading_disabled(rsa_private_key):
     response = await cancel(order_id="ord_a")
     assert response["order"]["status"] == "canceled"
     assert received_method["method"] == "DELETE"
-    assert received_method["path"] == "/trade-api/v2/portfolio/orders/ord_a"
+    # Issue #83: cancel moved to the V2 /portfolio/events/orders path.
+    assert received_method["path"] == "/trade-api/v2/portfolio/events/orders/ord_a"
 
 
 # ── order_id path-segment validation (security hardening) ───────────────────
@@ -264,3 +277,152 @@ async def test_order_id_accepts_a_real_uuid(rsa_private_key):
     fn = await _get_tool_fn(server, "kalshi_get_order")
     out = await fn(order_id="a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d")
     assert out["order"]["id"] == "ok"
+
+
+# ── V2 order-body conversion (issue #83, real-money-critical) ───────────────
+
+
+@pytest.mark.parametrize(
+    "action,side,cents,exp_side,exp_price_cents",
+    [
+        # YES leg: bid=buy, ask=sell, same price.
+        ("buy", "yes", 25, "bid", 25),
+        ("sell", "yes", 25, "ask", 25),
+        # NO leg converts to the equivalent YES-side order at the complement:
+        #   buy NO @ 30 = sell YES @ 70  → ask, 70
+        #   sell NO @ 30 = buy YES @ 70  → bid, 70
+        ("buy", "no", 30, "ask", 70),
+        ("sell", "no", 30, "bid", 70),
+    ],
+)
+def test_v2_side_and_price_cents_all_four_quadrants(action, side, cents, exp_side, exp_price_cents):
+    """The inversion that must be exactly right — getting the NO mapping
+    backwards would place a completely different real-money bet."""
+    v2_side, price_cents = _v2_side_and_price_cents(action, side, cents)
+    assert v2_side == exp_side
+    assert price_cents == exp_price_cents
+
+
+def _pending(action="buy", side="yes", count=2, cents=54, type="limit", post_only=False, exp=None):
+    return _PendingOrder(
+        intent=OrderIntent(
+            ticker="KX-T", side=side, action=action, count=count, limit_price_cents=cents
+        ),
+        type=type,
+        post_only=post_only,
+        expiration_ts=exp,
+        idempotency_key="mcp-abc",
+        expires_at=0.0,
+    )
+
+
+def test_build_v2_body_buy_yes_limit():
+    body = _build_v2_order_body(_pending(action="buy", side="yes", count=2, cents=54))
+    assert body == {
+        "ticker": "KX-T",
+        "side": "bid",
+        "price": "0.5400",
+        "count": "2",
+        "client_order_id": "mcp-abc",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+    }
+
+
+def test_build_v2_body_buy_no_converts_to_yes_ask_at_complement():
+    """buy NO @ 47¢ → sell YES @ 53¢ → side=ask price=0.5300. This is the case
+    the trading-agent's NYY entry hit; it must not become a YES bet."""
+    body = _build_v2_order_body(_pending(action="buy", side="no", cents=47))
+    assert body["side"] == "ask"
+    assert body["price"] == "0.5300"
+
+
+def test_build_v2_body_market_order_is_immediate_or_cancel():
+    body = _build_v2_order_body(_pending(type="market"))
+    assert body["time_in_force"] == "immediate_or_cancel"
+
+
+def test_build_v2_body_passes_post_only_and_expiration():
+    body = _build_v2_order_body(_pending(post_only=True, exp=1_800_000_000))
+    assert body["post_only"] is True
+    assert body["expiration_time"] == 1_800_000_000
+
+
+@pytest.mark.asyncio
+async def test_decrease_uses_v2_path_and_string_reduce_by(rsa_private_key):
+    """Issue #83: decrease moved to the V2 path and `reduce_by` is now a
+    FixedPointCount STRING, not an int."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = jsonlib.loads(request.content)
+        return httpx.Response(200, json={"order_id": "ord_a", "remaining_count": "3"})
+
+    server = _make_server(rsa_private_key, handler, trading_enabled=True)
+    decrease = await _get_tool_fn(server, "kalshi_decrease_order")
+    await decrease(order_id="ord_a", reduce_by=2)
+
+    assert captured["path"].endswith("/portfolio/events/orders/ord_a/decrease")
+    assert captured["body"] == {"reduce_by": "2"}  # string, not int
+
+
+@pytest.mark.asyncio
+async def test_get_order_stays_on_the_legacy_read_path(rsa_private_key):
+    """Kalshi kept Get Order on /portfolio/orders/{id} (a read) while the
+    write family moved — so this one must NOT be migrated."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={"order": {"id": "ord_a"}})
+
+    server = _make_server(rsa_private_key, handler)
+    get_order = await _get_tool_fn(server, "kalshi_get_order")
+    await get_order(order_id="ord_a")
+    assert captured["path"].endswith("/portfolio/orders/ord_a")
+    assert "/events/" not in captured["path"]
+
+
+def test_build_v2_body_market_drops_expiration_and_post_only():
+    """REGRESSION: a market order (IOC) must not carry expiration_time or
+    post_only — Kalshi 400s that combination. The builder gates them even for a
+    directly-constructed pending order."""
+    body = _build_v2_order_body(_pending(type="market", post_only=True, exp=1_800_000_000))
+    assert body["time_in_force"] == "immediate_or_cancel"
+    assert "expiration_time" not in body
+    assert "post_only" not in body
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_market_order_with_expiration_ts(rsa_private_key):
+    server = _make_server(rsa_private_key, lambda _: httpx.Response(200, json={}))
+    prepare = await _get_tool_fn(server, "kalshi_prepare_order")
+    with pytest.raises(SafetyError) as exc:
+        await prepare(
+            ticker="X",
+            action="buy",
+            side="yes",
+            count=1,
+            limit_price_cents=50,
+            order_type="market",
+            expiration_ts=1_800_000_000,
+        )
+    assert "market order" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_market_order_post_only(rsa_private_key):
+    server = _make_server(rsa_private_key, lambda _: httpx.Response(200, json={}))
+    prepare = await _get_tool_fn(server, "kalshi_prepare_order")
+    with pytest.raises(SafetyError) as exc:
+        await prepare(
+            ticker="X",
+            action="buy",
+            side="yes",
+            count=1,
+            limit_price_cents=50,
+            order_type="market",
+            post_only=True,
+        )
+    assert "post_only" in str(exc.value)

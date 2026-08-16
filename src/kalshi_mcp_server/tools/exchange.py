@@ -7,10 +7,47 @@ before doing anything else.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
+
+
+def _session_auth_view() -> dict[str, Any]:
+    """Auth health for the CURRENT request's session token (issue #80).
+
+    Returns the authenticated GitHub `login` and the token's expiry when the
+    server is running under the OAuth proxy (HTTP transport) and this call is
+    inside a request context. Empty on stdio, or when there's no token.
+
+    Deliberately labeled "session" — this is the short-lived access token the
+    connector refreshes automatically, NOT the connector's long-lived
+    authorization. A healthy value here does NOT guarantee the connector won't
+    later need a human re-auth (a rotation-stranding outage blinds the session
+    entirely — it can't even reach this tool). Use it as an "am I
+    authenticated right now, and as which login" health check that a scheduled
+    run can journal, not as a multi-day expiry predictor.
+    """
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        token = get_access_token()
+    except Exception:
+        # No OAuth (stdio), or not in a request context — nothing to report.
+        return {}
+    if token is None:
+        return {}
+    claims = getattr(token, "claims", None) or {}
+    view: dict[str, Any] = {"session_authenticated": True}
+    login = claims.get("login")
+    if login:
+        view["session_login"] = login
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        view["session_token_expires_at"] = int(exp)
+        view["session_token_expires_in_seconds"] = max(0, int(exp - time.time()))
+    return view
 
 
 def register(server: FastMCP) -> None:
@@ -49,22 +86,22 @@ def register(server: FastMCP) -> None:
     async def kalshi_get_environment() -> dict[str, Any]:
         """Show which Kalshi environment this MCP server is connected to.
 
-        Returns: env (`demo` or `prod`), trading_enabled flag, the REST base
-        URL, and the safety limits.
+        Returns env (`demo`/`prod`), `trading_enabled`, the REST/WS base URLs,
+        and the fields below. Read it before any write to confirm you're where
+        (and who) you expect.
 
-        `safety_limits` are the limits **currently in force**. `safety_ceilings`
-        are the env-configured hard maximums — a runtime change (see
-        `kalshi_set_safety_limits`) may tighten a limit below its ceiling but
-        can never loosen past it. When the two differ, an operator has
-        tightened a limit at runtime. Useful for the agent to confirm whether
-        a trade would hit real money — and under what caps — before placing one.
+        `safety_limits` are in force; `safety_ceilings` are the env hard
+        maximums (a runtime `kalshi_set_safety_limits` may tighten below a
+        ceiling, never loosen past it). `combo_creation_enabled` +
+        `combo_creations_today` / `max_combo_creations_per_day` report the
+        separate `kalshi_create_combo_market` gate and today's remaining local
+        creation budget.
 
-        `combo_creation_enabled` reports the SEPARATE gate on
-        `kalshi_create_combo_market` (`MCP_ALLOW_COMBO_CREATION`), with
-        `combo_creations_today` / `max_combo_creations_per_day` showing how
-        much of today's local creation budget is left. That budget bounds the
-        draw on Kalshi's 5000-per-week account quota; it is in-process and
-        resets on restart as well as at UTC midnight.
+        On OAuth/HTTP deploys only (absent on stdio), `session_authenticated` /
+        `session_login` / `session_token_expires_in_seconds` are an auth health
+        check. They describe the auto-refreshed SESSION token, NOT the
+        connector's long-lived authorization, so a healthy value does not
+        guarantee the connector won't later need a human re-auth (issue #80).
         """
         return {
             "env": config.env,
@@ -73,6 +110,10 @@ def register(server: FastMCP) -> None:
             "ws_url": config.ws_url,
             **safety.environment_view(),
             **safety.combo_creation_view(),
+            # Session-token auth health (HTTP/OAuth only; empty on stdio). See
+            # `_session_auth_view` — it's a "who am I / is auth live" signal,
+            # not the connector's long-lived credential.
+            **_session_auth_view(),
         }
 
     # Operator control to tighten the safety envelope at runtime. Gated by

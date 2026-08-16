@@ -162,24 +162,52 @@ async def test_fetch_truncates_at_max_bytes():
         transport=_transport(handler),
     )
     assert result["truncated"] is True
+    # `bytes_returned` is what we read off the wire (capped at max_bytes)...
     assert result["bytes_returned"] == 2_000
-    assert len(_unwrap(result["body"])) == 2_000
+    # ...but the DELIVERED result stays within max_bytes, so the body text is
+    # trimmed below 2000 to leave room for the wrapper + metadata (issue #82).
+    import json as _json
+
+    assert len(_json.dumps(result)) <= 2_000
+    assert len(_unwrap(result["body"])) < 2_000
 
 
-async def test_fetch_chunk_exactly_equal_to_remaining_not_marked_truncated():
-    """Boundary: the payload fits max_bytes exactly — nothing was cut, so
-    truncated must be False (QA nit: dedicated boundary coverage)."""
+async def test_fetch_delivered_size_stays_within_max_bytes():
+    """Issue #82: the live failure was max_bytes=50000 delivering 53267 chars
+    (wrapper + JSON-escaping overhead) and getting client-rejected. The
+    DELIVERED result must now fit the budget."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="z" * 2_000)
+        # A page full of characters that JSON-escaping inflates (quotes,
+        # backslashes, newlines) — the worst case for delivered-size overhead.
+        return httpx.Response(200, text=('"\\\n' * 20_000))
 
     result = await _fetch_external(
         "https://api.open-meteo.com/v1/forecast",
-        max_bytes=2_000,
+        max_bytes=50_000,
         transport=_transport(handler),
     )
-    assert result["bytes_returned"] == 2_000
+    import json as _json
+
+    assert len(_json.dumps(result)) <= 50_000
+    assert result["truncated"] is True
+
+
+async def test_fetch_small_body_not_trimmed():
+    """A body comfortably under the budget (even with wrapper + escaping) comes
+    back whole and untruncated."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="z" * 500)
+
+    result = await _fetch_external(
+        "https://api.open-meteo.com/v1/forecast",
+        max_bytes=5_000,
+        transport=_transport(handler),
+    )
+    assert result["bytes_returned"] == 500
     assert result["truncated"] is False
+    assert _unwrap(result["body"]) == "z" * 500
 
 
 async def test_fetch_max_bytes_clamped_to_floor_and_ceiling():
@@ -321,3 +349,121 @@ async def test_fetch_response_shape_is_uniform_across_branches():
         "https://api.weather.gov/x", max_bytes=10_000, transport=_transport(body_handler)
     )
     assert set(r1.keys()) == set(r2.keys())
+
+
+async def test_fetch_delivered_cap_holds_even_with_a_long_url():
+    """REGRESSION: the caller-supplied url is a variable-length field too, so a
+    long query string could blow the delivered cap even with an empty body. The
+    guarantee must hold — the echoed url is bounded when the scaffold overflows."""
+    import json as _json
+
+    long_url = "https://api.weather.gov/x?" + "a" * 5_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="short body")
+
+    result = await _fetch_external(long_url, max_bytes=1_000, transport=_transport(handler))
+    assert len(_json.dumps(result)) <= 1_000
+    assert "truncated to fit" in result["url"]  # echoed url was bounded
+
+
+async def test_fetch_delivered_cap_holds_with_a_long_content_type_header():
+    """REGRESSION (round 2 of the delivered-cap guard): the upstream
+    content_type header is unbounded caller-uncontrolled data that also counts
+    toward the delivered size. A verbose/hostile header must not blow the cap."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="short", headers={"content-type": "x" * 5_000})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=1_000, transport=_transport(handler)
+    )
+    assert len(_json.dumps(result)) <= 1_000
+
+
+async def test_redirect_delivered_cap_holds_with_a_long_location():
+    """REGRESSION: the redirect branch echoes the upstream Location header, also
+    unbounded — it must be bounded to the same delivered guarantee."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://api.weather.gov/" + "a" * 5_000})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=1_000, transport=_transport(handler)
+    )
+    assert result["status"] == 302
+    assert len(_json.dumps(result)) <= 1_000
+    assert "truncated to fit" in result["redirect_location"]
+
+
+async def test_redirect_short_location_unchanged():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://api.weather.gov/elsewhere"})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=100_000, transport=_transport(handler)
+    )
+    assert result["redirect_location"] == "https://api.weather.gov/elsewhere"
+
+
+async def test_fetch_delivered_cap_holds_with_long_url_and_content_type_together():
+    """The 'trim whichever field is longest' logic must handle BOTH echoed
+    metadata fields being oversized at once (qa: this branch wasn't pinned)."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="body", headers={"content-type": "y" * 4_000})
+
+    # A long (but under the 8192 input guard) url plus a long content_type.
+    long_url = "https://api.weather.gov/x?" + "a" * 4_000
+    result = await _fetch_external(long_url, max_bytes=1_000, transport=_transport(handler))
+    assert len(_json.dumps(result)) <= 1_000
+
+
+def test_fetch_delivered_cap_is_not_quadratic_on_a_huge_upstream_header():
+    """REGRESSION (perf CRITICAL): content_type/location come from the upstream
+    response, so no input guard bounds them. A linear char-by-char trim was
+    O(n^2) and froze the event loop for ~96s on a 2M header. The binary-search
+    fitter must handle it in well under a second — this test would hang for
+    minutes under the O(n^2) implementation."""
+    import json as _json
+    import time
+
+    from kalshi_mcp_server.tools.external_data import _fit_to_delivered_budget
+
+    t0 = time.monotonic()
+    result = _fit_to_delivered_budget(
+        url="https://api.weather.gov/x",
+        status=200,
+        content_type="a" * 2_000_000,
+        text="x",
+        raw_bytes=1,
+        fetch_truncated=False,
+        max_bytes=1_000,
+    )
+    elapsed = time.monotonic() - t0
+    assert len(_json.dumps(result)) <= 1_000
+    assert elapsed < 2.0, f"delivered-cap trim took {elapsed:.1f}s — likely regressed to O(n^2)"
+
+
+def test_validate_rejects_absurdly_long_url():
+    from kalshi_mcp_server.tools.external_data import _MAX_URL_LEN
+
+    with pytest.raises(KalshiAPIError, match="too long"):
+        _validate_external_url("https://api.weather.gov/" + "a" * (_MAX_URL_LEN + 1))
+
+
+def test_fit_field_never_returns_over_budget_even_for_tiny_budget():
+    """The latent-edge fix: for a budget smaller than the marker's own encoded
+    length, `_fit_field` returns '' rather than an over-budget bare marker."""
+    import json as _json
+
+    from kalshi_mcp_server.tools.external_data import _fit_field
+
+    for budget in (0, 1, 5, 20, 35):
+        out = _fit_field("hello world " * 100, budget)
+        assert len(_json.dumps(out)) <= budget or out == "", f"budget={budget} out={out!r}"
+    # Empty input is a no-op regardless.
+    assert _fit_field("", 1000) == ""
