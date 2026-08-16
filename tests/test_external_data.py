@@ -406,3 +406,50 @@ async def test_redirect_short_location_unchanged():
         "https://api.weather.gov/x", max_bytes=100_000, transport=_transport(handler)
     )
     assert result["redirect_location"] == "https://api.weather.gov/elsewhere"
+
+
+async def test_fetch_delivered_cap_holds_with_long_url_and_content_type_together():
+    """The 'trim whichever field is longest' logic must handle BOTH echoed
+    metadata fields being oversized at once (qa: this branch wasn't pinned)."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="body", headers={"content-type": "y" * 4_000})
+
+    # A long (but under the 8192 input guard) url plus a long content_type.
+    long_url = "https://api.weather.gov/x?" + "a" * 4_000
+    result = await _fetch_external(long_url, max_bytes=1_000, transport=_transport(handler))
+    assert len(_json.dumps(result)) <= 1_000
+
+
+def test_fetch_delivered_cap_is_not_quadratic_on_a_huge_upstream_header():
+    """REGRESSION (perf CRITICAL): content_type/location come from the upstream
+    response, so no input guard bounds them. A linear char-by-char trim was
+    O(n^2) and froze the event loop for ~96s on a 2M header. The binary-search
+    fitter must handle it in well under a second — this test would hang for
+    minutes under the O(n^2) implementation."""
+    import json as _json
+    import time
+
+    from kalshi_mcp_server.tools.external_data import _fit_to_delivered_budget
+
+    t0 = time.monotonic()
+    result = _fit_to_delivered_budget(
+        url="https://api.weather.gov/x",
+        status=200,
+        content_type="a" * 2_000_000,
+        text="x",
+        raw_bytes=1,
+        fetch_truncated=False,
+        max_bytes=1_000,
+    )
+    elapsed = time.monotonic() - t0
+    assert len(_json.dumps(result)) <= 1_000
+    assert elapsed < 2.0, f"delivered-cap trim took {elapsed:.1f}s — likely regressed to O(n^2)"
+
+
+def test_validate_rejects_absurdly_long_url():
+    from kalshi_mcp_server.tools.external_data import _MAX_URL_LEN
+
+    with pytest.raises(KalshiAPIError, match="too long"):
+        _validate_external_url("https://api.weather.gov/" + "a" * (_MAX_URL_LEN + 1))
