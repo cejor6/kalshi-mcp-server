@@ -59,6 +59,83 @@ def _new_token() -> str:
     return uuid.uuid4().hex
 
 
+# ── Kalshi V2 order model (endpoint migration, issue #83) ───────────────────
+#
+# Kalshi retired the old `POST /portfolio/orders` create path (migration
+# deadline was 2026-05-06) — it now returns `410 Gone: Please switch to the V2
+# endpoints`. The replacement is `POST /portfolio/events/orders` with a
+# YES-CENTRIC SINGLE-BOOK request shape, which is a materially different body,
+# so the conversion below is the load-bearing part of this fix.
+#
+# The V2 side is `bid`/`ask` on the YES leg ONLY:
+#   bid  = buy YES
+#   ask  = sell YES
+# and `price` is the YES-side price as fixed-point dollars ("0.5600").
+# A NO order has no native representation — you express it on the YES side at
+# the complementary price, because buying NO at X¢ is economically selling YES
+# at (100-X)¢ (and selling NO at X¢ is buying YES at (100-X)¢). Get this
+# inversion wrong and a "buy NO" becomes a "buy YES" — a completely different
+# real-money bet — so it is unit-tested for all four action-by-side combinations.
+#
+# The intuitive yes/no + buy/sell + cents model is preserved everywhere the
+# operator and the safety layer see it (prepare_order, OrderIntent,
+# safety.check_order); this converter runs only at confirm time, translating to
+# the wire shape. Safety semantics are unchanged.
+#
+# NOT YET VALIDATED against the live demo API — this environment has no demo
+# credentials to place a test order. Three fields carry residual uncertainty
+# and should be confirmed with a demo prepare→confirm before trusting real
+# money (see the issue): the `count` string format, the
+# `self_trade_prevention_type` default, and the market-order → IOC mapping.
+_V2_SELF_TRADE_PREVENTION = "taker_at_cross"  # cancel the incoming order if it would self-cross
+
+
+def _v2_side_and_price_cents(action: str, side: str, limit_price_cents: int) -> tuple[str, int]:
+    """Map our (action, side, cents) onto the V2 (bid/ask, YES-price-cents).
+
+    V2 is YES-centric: bid = buy YES, ask = sell YES, price is the YES price.
+      - yes+buy  → bid at the same cents
+      - yes+sell → ask at the same cents
+      - no+buy   → ask at (100 - cents)   [buy NO @ X = sell YES @ 100-X]
+      - no+sell  → bid at (100 - cents)    [sell NO @ X = buy YES @ 100-X]
+    """
+    if side == "yes":
+        return ("bid" if action == "buy" else "ask"), limit_price_cents
+    # NO side → convert to the equivalent YES-side order at the complement.
+    return ("ask" if action == "buy" else "bid"), 100 - limit_price_cents
+
+
+def _build_v2_order_body(prepared: _PendingOrder) -> dict[str, Any]:
+    """Build the `POST /portfolio/events/orders` (V2) request body."""
+    intent = prepared.intent
+    v2_side, yes_price_cents = _v2_side_and_price_cents(
+        intent.action, intent.side, intent.limit_price_cents
+    )
+    body: dict[str, Any] = {
+        "ticker": intent.ticker,
+        "side": v2_side,
+        # Fixed-point dollars, always 2 cents of precision (e.g. 56 → "0.5600").
+        "price": f"{yes_price_cents / 100:.4f}",
+        # FixedPointCount string per the V2 schema.
+        "count": str(intent.count),
+        "client_order_id": prepared.idempotency_key,
+        # A "market" order becomes take-now-or-cancel (the price bound from the
+        # limit still caps how far it crosses — the safety cost check used it).
+        # A limit order rests until cancelled.
+        "time_in_force": (
+            "immediate_or_cancel" if prepared.type == "market" else "good_till_canceled"
+        ),
+        "self_trade_prevention_type": _V2_SELF_TRADE_PREVENTION,
+    }
+    if prepared.post_only:
+        body["post_only"] = True
+    if prepared.expiration_ts is not None:
+        # GTC + an expiration is Kalshi's good-till-time; only meaningful for a
+        # resting (limit) order.
+        body["expiration_time"] = prepared.expiration_ts
+    return body
+
+
 def register(server: FastMCP) -> None:
     """Register order-management tools against the FastMCP server."""
     client = server._kalshi_client  # type: ignore[attr-defined]
@@ -193,25 +270,11 @@ def register(server: FastMCP) -> None:
             )
 
         intent = prepared.intent
-        body: dict[str, Any] = {
-            "ticker": intent.ticker,
-            "action": intent.action,
-            "side": intent.side,
-            "type": prepared.type,
-            "count": intent.count,
-            "client_order_id": prepared.idempotency_key,
-        }
-        # Kalshi names the price field after the side you're acting on.
-        if intent.side == "yes":
-            body["yes_price"] = intent.limit_price_cents
-        else:
-            body["no_price"] = intent.limit_price_cents
-        if prepared.post_only:
-            body["post_only"] = True
-        if prepared.expiration_ts is not None:
-            body["expiration_ts"] = prepared.expiration_ts
-
-        response = await client.post("/portfolio/orders", json=body)
+        # V2 order model — see `_build_v2_order_body` and the note above it. The
+        # old `POST /portfolio/orders` path is retired (410); this is the
+        # `POST /portfolio/events/orders` shape.
+        body = _build_v2_order_body(prepared)
+        response = await client.post("/portfolio/events/orders", json=body)
         # Only update the daily counter after Kalshi accepts the order.
         safety.record_order_committed(intent)
         return response
@@ -227,7 +290,8 @@ def register(server: FastMCP) -> None:
             order_id: The Kalshi order id to cancel.
         """
         order_id = _validate_path_segment(order_id, name="order_id", kind="identifier")
-        return await client.delete(f"/portfolio/orders/{order_id}")
+        # V2 path (issue #83): the order family moved to /portfolio/events/orders.
+        return await client.delete(f"/portfolio/events/orders/{order_id}")
 
     @server.tool
     async def kalshi_decrease_order(
@@ -248,9 +312,11 @@ def register(server: FastMCP) -> None:
         if reduce_by <= 0:
             raise SafetyError(f"reduce_by must be positive, got {reduce_by}.")
         order_id = _validate_path_segment(order_id, name="order_id", kind="identifier")
-        body = {"reduce_by": reduce_by}
+        # V2 path + shape (issue #83): moved to /portfolio/events/orders, and
+        # `reduce_by` is now a FixedPointCount STRING, not an integer.
+        body = {"reduce_by": str(reduce_by)}
         return await client.post(
-            f"/portfolio/orders/{order_id}/decrease",
+            f"/portfolio/events/orders/{order_id}/decrease",
             json=body,
         )
 

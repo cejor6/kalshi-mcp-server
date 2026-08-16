@@ -20,17 +20,34 @@ def register(server: FastMCP) -> None:
 
     @server.tool
     async def kalshi_get_balance() -> dict[str, Any]:
-        """Get the current cash balance and unrealized P&L.
+        """Get the account's cash balance and total value.
 
-        Returns a dict with both raw and pre-formatted values:
-            balance: integer cents (e.g. 12500 = $125.00)
-            balance_dollars: string-formatted USD (e.g. "125.0000")
-            portfolio_value: integer cents — total cash + position value
-            balance_breakdown: per-subaccount breakdown if applicable
+        Kalshi returns: `balance` (available CASH, integer cents),
+        `balance_dollars` (same, formatted), `portfolio_value`, `updated_ts`,
+        and `balance_breakdown` (per-subaccount, if any).
 
-        Prefer `balance_dollars` for display — it's already formatted.
+        WATCH `portfolio_value`: it is the value of OPEN POSITIONS ONLY, not
+        cash and not the account total, so it is legitimately 0 on a flat
+        account. Do NOT read `portfolio_value == 0` as "account drained" — that
+        is the single most common misread here. Key "is it funded / drained?"
+        on `balance` (cash) or on `total_value` below.
+
+        This MCP adds (computed, so no caller needs the tribal knowledge):
+        `total_value` = balance + portfolio_value (integer cents, the real
+        "what is this account worth"), and `total_value_dollars` (formatted).
         """
-        return await client.get("/portfolio/balance")
+        body = await client.get("/portfolio/balance")
+        # Compute a trustworthy total so downstream never has to hand-combine
+        # cash + positions (or worse, alarm on portfolio_value==0). Additive
+        # and defensive: if either field is missing/non-integer, skip rather
+        # than fabricate a wrong total.
+        cash = body.get("balance")
+        positions = body.get("portfolio_value")
+        if isinstance(cash, int) and isinstance(positions, int):
+            total = cash + positions
+            body["total_value"] = total
+            body["total_value_dollars"] = f"{total / 100:.4f}"
+        return body
 
     @server.tool
     async def kalshi_get_positions(

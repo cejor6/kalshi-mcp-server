@@ -718,3 +718,38 @@ async def test_get_markets_injection_ticker_never_reaches_event_hint_wire(rsa_pr
     assert out == {"markets": []}  # clean passthrough, no crash, no hint raised
     assert not any(p.endswith("/events/KX/../../portfolio/balance") for p in paths)
     assert not any("/events/" in p for p in paths)  # the injection never probed /events
+
+
+# ── find_liquid_markets `fields` projection (issue #82) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_find_liquid_markets_fields_narrows_the_projection(rsa_private_key):
+    """A `fields` whitelist shrinks each shortlist entry so a high `limit`
+    stays under the client token cap — the default minimal view is ~500 B/mkt,
+    ~50 KB at limit=100."""
+    handler, _ = _listing_pages(4, 3, terminal=False)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_find_liquid_markets")
+
+    out = await fn(limit=5, scan_limit=3, fields="ticker,volume_24h_fp")
+
+    assert out["markets"]  # non-empty
+    for m in out["markets"]:
+        assert set(m) <= {"ticker", "volume_24h_fp"}  # only the whitelist
+        assert "yes_bid_dollars" not in m  # a default-minimal field is gone
+
+
+@pytest.mark.asyncio
+async def test_find_liquid_markets_fields_applies_under_scan_all(rsa_private_key):
+    """The streaming (scan_all) path must honor `fields` too, not just the
+    windowed path."""
+    handler, _ = _listing_pages(3, 2)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_find_liquid_markets")
+
+    out = await fn(limit=10, scan_all=True, fields="ticker")
+
+    assert out["markets"]
+    for m in out["markets"]:
+        assert set(m) == {"ticker"}

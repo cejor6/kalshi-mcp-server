@@ -261,9 +261,14 @@ def _rank_liquid_markets(
     *,
     min_volume: float = 0.0,
     limit: int = 20,
+    fields: str | None = None,
 ) -> list[dict[str, Any]]:
     """Filter by min 24h volume, sort by 24h volume (desc), take the top
-    `limit`, and project each survivor to the minimal triage view.
+    `limit`, and project each survivor.
+
+    `fields` (comma-separated whitelist) narrows the per-market projection past
+    the default minimal set — the lever that keeps a `limit=100` shortlist
+    small (issue #82). None → the default `_MINIMAL_MARKET_FIELDS`.
 
     `limit` is clamped at 0 so this and the streaming `_TopKByVolume` agree on
     the degenerate inputs a direct `.fn` caller can reach (the schema's `ge=1`
@@ -272,7 +277,7 @@ def _rank_liquid_markets(
     """
     eligible = [m for m in markets if _volume_24h(m) >= min_volume]
     eligible.sort(key=_volume_24h, reverse=True)
-    return [_minimal_market(m) for m in eligible[: max(0, limit)]]
+    return [_minimal_market(m, fields) for m in eligible[: max(0, limit)]]
 
 
 class _TopKByVolume:
@@ -285,12 +290,13 @@ class _TopKByVolume:
     top-K of the union is the top-K of the running top-K.
     """
 
-    def __init__(self, *, limit: int, min_volume: float = 0.0) -> None:
+    def __init__(self, *, limit: int, min_volume: float = 0.0, fields: str | None = None) -> None:
         # Clamp at 0, matching `_rank_liquid_markets`, so the streaming and
         # batch paths agree even on the degenerate limits a direct `.fn`
         # caller can pass (the schema's `ge=1` only binds MCP clients).
         self._limit = max(0, limit)
         self._min_volume = min_volume
+        self._fields = fields
         self._best: list[dict[str, Any]] = []
 
     def __call__(self, page: list[dict[str, Any]]) -> None:
@@ -304,7 +310,7 @@ class _TopKByVolume:
         del self._best[self._limit :]
 
     def result(self) -> list[dict[str, Any]]:
-        return [_minimal_market(m) for m in self._best]
+        return [_minimal_market(m, self._fields) for m in self._best]
 
 
 # ── Listing pager (shared by find_liquid_markets and get_series_summary) ────
@@ -777,6 +783,7 @@ def register(server: FastMCP) -> None:
         series_ticker: str | None = None,
         min_volume: Annotated[float, Field(ge=0)] = 0.0,
         scan_all: bool = False,
+        fields: str | None = None,
     ) -> dict[str, Any]:
         """Find the most liquid SINGLE (non-combo) markets, ranked by 24h volume.
 
@@ -806,6 +813,14 @@ def register(server: FastMCP) -> None:
             series_ticker: Restrict the scan to one series (e.g. "KXMLBGAME").
             min_volume: Drop markets whose 24h volume is below this (same
                 units as `volume_24h_fp`). Default 0.0 (keep all).
+            fields: Comma-separated whitelist of exact field names to keep on
+                each returned market, narrowing the default minimal projection
+                (e.g. "ticker,yes_bid_dollars,yes_ask_dollars,volume_24h_fp").
+                Same semantics as `kalshi_get_markets`' `fields`. Use this at
+                high `limit` to keep the shortlist small: the default minimal
+                view is ~500 bytes/market, so `limit=100` is ~50KB and can
+                exceed a client tool-result cap — a 4-field whitelist cuts that
+                to a few KB. Unknown names are ignored; a blank list is rejected.
             scan_all: Sweep as much of the matching listing as the internal
                 caps allow before ranking, instead of just the first
                 `scan_limit` markets — a far wider ranking than a fixed window.
@@ -847,7 +862,9 @@ def register(server: FastMCP) -> None:
         # to sort once and keep `limit`. The windowed path keeps the simple
         # collect-then-rank shape; its retention is already bounded by
         # scan_limit <= 1000.
-        topk = _TopKByVolume(limit=limit, min_volume=min_volume) if scan_all else None
+        topk = (
+            _TopKByVolume(limit=limit, min_volume=min_volume, fields=fields) if scan_all else None
+        )
         scan = await _scan_markets_excluding_mve(
             client,
             scan_limit=effective_scan,
@@ -859,7 +876,9 @@ def register(server: FastMCP) -> None:
         ranked = (
             topk.result()
             if topk is not None
-            else _rank_liquid_markets(scan.markets, min_volume=min_volume, limit=limit)
+            else _rank_liquid_markets(
+                scan.markets, min_volume=min_volume, limit=limit, fields=fields
+            )
         )
         return {
             "markets": ranked,

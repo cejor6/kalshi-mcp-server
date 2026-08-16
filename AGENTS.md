@@ -422,6 +422,37 @@ Order-placing tools (anything that puts money at risk) MUST:
 - Generate a client-side idempotency key
 - Call `safety.record_order_committed(...)` after the response succeeds
 
+**The order write family is on Kalshi's V2 `/portfolio/events/orders` path,
+and the request shape is YES-centric (issue #83).** Kalshi retired the old
+`POST /portfolio/orders` create path (deadline 2026-05-06 — it now `410`s
+"switch to the V2 endpoints"), taking order placement fully down on prod until
+migrated. The current paths: create `POST /portfolio/events/orders`, cancel
+`DELETE /portfolio/events/orders/{id}`, decrease
+`POST /portfolio/events/orders/{id}/decrease` (its `reduce_by` is now a
+FixedPointCount **string**). Get-order is the exception — it stayed on the
+legacy read path `GET /portfolio/orders/{id}`, so don't "consistency-fix" it
+onto the events path.
+
+The V2 body is the load-bearing risk. It is single-book YES-centric: `side` is
+`bid` (buy YES) / `ask` (sell YES), `price` is the YES price in fixed-point
+dollars, and a NO order has **no native representation** — you convert it to
+the YES side at the complement (buy NO @ X¢ = sell YES @ (100−X)¢; sell NO @ X¢
+= buy YES @ (100−X)¢). `_v2_side_and_price_cents` / `_build_v2_order_body` do
+this and are unit-tested for all four action-by-side quadrants because getting
+the inversion wrong turns a "buy NO" into a "buy YES" — a completely different
+real-money bet. The intuitive yes/no+buy/sell+cents model is preserved for the
+operator and the safety layer; the converter runs only at confirm time. Three
+V2 fields carry residual uncertainty that only a live **demo** prepare→confirm
+can settle (this environment has no demo creds): the `count` string format, the
+`self_trade_prevention_type` default (`taker_at_cross`), and the market-order →
+`immediate_or_cancel` mapping.
+
+**Don't alarm on `kalshi_get_balance`'s `portfolio_value` (issue #81).** Kalshi
+defines it as the value of OPEN POSITIONS only — legitimately `0` on a flat
+account, NOT "drained." The tool now adds a computed `total_value` (=
+`balance` + `portfolio_value`); key funded/drained checks on `balance` (cash)
+or `total_value`, never on `portfolio_value` alone.
+
 A state-mutating tool that risks NO money still needs a gate, a
 consumable-budget check, and a record-after-success — just not this one.
 `kalshi_create_combo_market` is the worked example; see the combo-creation

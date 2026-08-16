@@ -162,24 +162,52 @@ async def test_fetch_truncates_at_max_bytes():
         transport=_transport(handler),
     )
     assert result["truncated"] is True
+    # `bytes_returned` is what we read off the wire (capped at max_bytes)...
     assert result["bytes_returned"] == 2_000
-    assert len(_unwrap(result["body"])) == 2_000
+    # ...but the DELIVERED result stays within max_bytes, so the body text is
+    # trimmed below 2000 to leave room for the wrapper + metadata (issue #82).
+    import json as _json
+
+    assert len(_json.dumps(result)) <= 2_000
+    assert len(_unwrap(result["body"])) < 2_000
 
 
-async def test_fetch_chunk_exactly_equal_to_remaining_not_marked_truncated():
-    """Boundary: the payload fits max_bytes exactly — nothing was cut, so
-    truncated must be False (QA nit: dedicated boundary coverage)."""
+async def test_fetch_delivered_size_stays_within_max_bytes():
+    """Issue #82: the live failure was max_bytes=50000 delivering 53267 chars
+    (wrapper + JSON-escaping overhead) and getting client-rejected. The
+    DELIVERED result must now fit the budget."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="z" * 2_000)
+        # A page full of characters that JSON-escaping inflates (quotes,
+        # backslashes, newlines) — the worst case for delivered-size overhead.
+        return httpx.Response(200, text=('"\\\n' * 20_000))
 
     result = await _fetch_external(
         "https://api.open-meteo.com/v1/forecast",
-        max_bytes=2_000,
+        max_bytes=50_000,
         transport=_transport(handler),
     )
-    assert result["bytes_returned"] == 2_000
+    import json as _json
+
+    assert len(_json.dumps(result)) <= 50_000
+    assert result["truncated"] is True
+
+
+async def test_fetch_small_body_not_trimmed():
+    """A body comfortably under the budget (even with wrapper + escaping) comes
+    back whole and untruncated."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="z" * 500)
+
+    result = await _fetch_external(
+        "https://api.open-meteo.com/v1/forecast",
+        max_bytes=5_000,
+        transport=_transport(handler),
+    )
+    assert result["bytes_returned"] == 500
     assert result["truncated"] is False
+    assert _unwrap(result["body"]) == "z" * 500
 
 
 async def test_fetch_max_bytes_clamped_to_floor_and_ceiling():
