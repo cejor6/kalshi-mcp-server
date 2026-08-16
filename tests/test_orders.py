@@ -382,3 +382,47 @@ async def test_get_order_stays_on_the_legacy_read_path(rsa_private_key):
     await get_order(order_id="ord_a")
     assert captured["path"].endswith("/portfolio/orders/ord_a")
     assert "/events/" not in captured["path"]
+
+
+def test_build_v2_body_market_drops_expiration_and_post_only():
+    """REGRESSION: a market order (IOC) must not carry expiration_time or
+    post_only — Kalshi 400s that combination. The builder gates them even for a
+    directly-constructed pending order."""
+    body = _build_v2_order_body(_pending(type="market", post_only=True, exp=1_800_000_000))
+    assert body["time_in_force"] == "immediate_or_cancel"
+    assert "expiration_time" not in body
+    assert "post_only" not in body
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_market_order_with_expiration_ts(rsa_private_key):
+    server = _make_server(rsa_private_key, lambda _: httpx.Response(200, json={}))
+    prepare = await _get_tool_fn(server, "kalshi_prepare_order")
+    with pytest.raises(SafetyError) as exc:
+        await prepare(
+            ticker="X",
+            action="buy",
+            side="yes",
+            count=1,
+            limit_price_cents=50,
+            order_type="market",
+            expiration_ts=1_800_000_000,
+        )
+    assert "market order" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_market_order_post_only(rsa_private_key):
+    server = _make_server(rsa_private_key, lambda _: httpx.Response(200, json={}))
+    prepare = await _get_tool_fn(server, "kalshi_prepare_order")
+    with pytest.raises(SafetyError) as exc:
+        await prepare(
+            ticker="X",
+            action="buy",
+            side="yes",
+            count=1,
+            limit_price_cents=50,
+            order_type="market",
+            post_only=True,
+        )
+    assert "post_only" in str(exc.value)

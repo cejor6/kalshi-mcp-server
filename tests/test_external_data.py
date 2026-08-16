@@ -349,3 +349,19 @@ async def test_fetch_response_shape_is_uniform_across_branches():
         "https://api.weather.gov/x", max_bytes=10_000, transport=_transport(body_handler)
     )
     assert set(r1.keys()) == set(r2.keys())
+
+
+async def test_fetch_delivered_cap_holds_even_with_a_long_url():
+    """REGRESSION: the caller-supplied url is a variable-length field too, so a
+    long query string could blow the delivered cap even with an empty body. The
+    guarantee must hold — the echoed url is bounded when the scaffold overflows."""
+    import json as _json
+
+    long_url = "https://api.weather.gov/x?" + "a" * 5_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="short body")
+
+    result = await _fetch_external(long_url, max_bytes=1_000, transport=_transport(handler))
+    assert len(_json.dumps(result)) <= 1_000
+    assert "url truncated" in result["url"]  # echoed url was bounded

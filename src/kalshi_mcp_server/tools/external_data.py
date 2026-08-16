@@ -189,9 +189,9 @@ def _fit_to_delivered_budget(
         "overhead), not just the fetched bytes; raise max_bytes for more"
     )
 
-    def build(t: str, truncated: bool, note: str = "") -> dict[str, Any]:
+    def build(t: str, truncated: bool, note: str = "", *, echoed_url: str = url) -> dict[str, Any]:
         return _result(
-            url,
+            echoed_url,
             status,
             content_type=content_type,
             body=_wrap_body(t),
@@ -207,17 +207,38 @@ def _fit_to_delivered_budget(
     if delivered_len(full) <= max_bytes:
         return full
 
-    # Over budget: binary-search the largest prefix whose delivered result
-    # fits. The `trim_note` is included in every measured candidate — it costs
-    # ~140 chars, and adding it AFTER the search would blow the guarantee.
+    # The body text is not the only variable-length field: the echoed `url`
+    # (and `note`) count too, and the url is caller-supplied with no length cap
+    # (a long query string). If the scaffold — everything but the body — already
+    # exceeds the budget, trimming the body can't save it, so bound the echoed
+    # url first. Its inner-fetch use already happened; this only shortens what's
+    # reflected back. Then the body search runs against the remaining room.
+    echoed_url = url
+    scaffold_len = delivered_len(build("", True, trim_note, echoed_url=echoed_url))
+    if scaffold_len > max_bytes:
+        _URL_CUT_MARK = "…[url truncated to fit max_bytes]"
+        # Shrink the echoed url by the overflow (+ marker), never below 0.
+        keep = max(0, len(url) - (scaffold_len - max_bytes) - len(_URL_CUT_MARK))
+        echoed_url = url[:keep] + _URL_CUT_MARK
+        # One correction pass covers JSON-escaping wobble in the trimmed url.
+        while (
+            keep > 0
+            and delivered_len(build("", True, trim_note, echoed_url=echoed_url)) > max_bytes
+        ):
+            keep = max(0, keep - 32)
+            echoed_url = url[:keep] + _URL_CUT_MARK
+
+    # Binary-search the largest body prefix whose delivered result fits. The
+    # `trim_note` is included in every measured candidate — it costs ~140 chars,
+    # and adding it AFTER the search would blow the guarantee.
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if delivered_len(build(text[:mid], True, trim_note)) <= max_bytes:
+        if delivered_len(build(text[:mid], True, trim_note, echoed_url=echoed_url)) <= max_bytes:
             lo = mid
         else:
             hi = mid - 1
-    return build(text[:lo], True, trim_note)
+    return build(text[:lo], True, trim_note, echoed_url=echoed_url)
 
 
 async def _fetch_external(

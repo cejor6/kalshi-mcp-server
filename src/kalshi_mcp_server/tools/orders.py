@@ -127,11 +127,15 @@ def _build_v2_order_body(prepared: _PendingOrder) -> dict[str, Any]:
         ),
         "self_trade_prevention_type": _V2_SELF_TRADE_PREVENTION,
     }
-    if prepared.post_only:
+    # `post_only` (maker-only) and `expiration_time` (good-till-time) only make
+    # sense on a RESTING order, and Kalshi rejects either combined with a
+    # market order's immediate-or-cancel. prepare_order already rejects those
+    # combinations, but gate them here too so a directly-built _PendingOrder
+    # can never emit a contradictory body.
+    is_market = prepared.type == "market"
+    if prepared.post_only and not is_market:
         body["post_only"] = True
-    if prepared.expiration_ts is not None:
-        # GTC + an expiration is Kalshi's good-till-time; only meaningful for a
-        # resting (limit) order.
+    if prepared.expiration_ts is not None and not is_market:
         body["expiration_time"] = prepared.expiration_ts
     return body
 
@@ -201,6 +205,23 @@ def register(server: FastMCP) -> None:
             raise SafetyError(f"side must be 'yes' or 'no', got {side!r}")
         if order_type_lc not in {"limit", "market"}:
             raise SafetyError(f"order_type must be 'limit' or 'market', got {order_type!r}")
+        # A market order maps to immediate-or-cancel on Kalshi's V2 API, which
+        # cannot rest and cannot be maker-only — so `expiration_ts` and
+        # `post_only` are contradictory with it and Kalshi 400s the combination.
+        # Reject locally with an actionable message (the authoritative
+        # order-write guard) instead of letting an agent loop on that 400.
+        if order_type_lc == "market":
+            if expiration_ts is not None:
+                raise SafetyError(
+                    "A market order executes immediately (immediate-or-cancel) and "
+                    "cannot carry an expiration_ts. Use order_type='limit' to rest an "
+                    "order with an expiration."
+                )
+            if post_only:
+                raise SafetyError(
+                    "A market order takes liquidity and cannot be post_only (maker-only). "
+                    "Drop post_only, or use order_type='limit'."
+                )
 
         intent = OrderIntent(
             ticker=ticker,
