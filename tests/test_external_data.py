@@ -453,3 +453,17 @@ def test_validate_rejects_absurdly_long_url():
 
     with pytest.raises(KalshiAPIError, match="too long"):
         _validate_external_url("https://api.weather.gov/" + "a" * (_MAX_URL_LEN + 1))
+
+
+def test_fit_field_never_returns_over_budget_even_for_tiny_budget():
+    """The latent-edge fix: for a budget smaller than the marker's own encoded
+    length, `_fit_field` returns '' rather than an over-budget bare marker."""
+    import json as _json
+
+    from kalshi_mcp_server.tools.external_data import _fit_field
+
+    for budget in (0, 1, 5, 20, 35):
+        out = _fit_field("hello world " * 100, budget)
+        assert len(_json.dumps(out)) <= budget or out == "", f"budget={budget} out={out!r}"
+    # Empty input is a no-op regardless.
+    assert _fit_field("", 1000) == ""

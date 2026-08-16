@@ -180,15 +180,18 @@ def _fit_field(s: str, budget: int) -> str:
     """Largest prefix of `s` whose JSON-STRING length stays within `budget`.
 
     Used to bound an echoed metadata field's contribution to the delivered
-    result. Binary-searches the cut point — O(log n) serializations of the
-    field alone — because these fields can be huge and upstream-controlled
-    (`content_type` / redirect `location` come from the response headers, so no
-    input-length guard can bound them), and a linear char-by-char trim over a
-    multi-megabyte header would freeze the single-threaded event loop.
+    result. Binary-searches the cut point — ~log n serializations, each of an
+    O(n) prefix, so LINEAR in the field length (32M chars in ~0.1s), which is
+    the point: content_type / redirect `location` come from the upstream
+    response headers (no input-length guard can bound them), and the earlier
+    char-by-char trim was O(n²) and froze the single-threaded event loop.
 
     `budget` is measured against the JSON-encoded string (`json.dumps` includes
-    the surrounding quotes and per-char escaping). When trimmed, the returned
-    value carries a truncation marker and still fits `budget`.
+    the surrounding quotes and per-char escaping). When trimmed the return
+    carries a truncation marker and still fits `budget` — UNLESS `budget` is too
+    small to hold even the marker (~36 chars encoded), in which case it returns
+    `""` rather than an over-budget marker. Callers pass a quarter of a
+    >=1000-floor budget, so that degenerate case is unreachable via the tool.
     """
     if len(json.dumps(s)) <= budget:
         return s
@@ -199,7 +202,11 @@ def _fit_field(s: str, budget: int) -> str:
             lo = mid
         else:
             hi = mid - 1
-    return s[:lo] + _DELIVERED_MARK
+    candidate = s[:lo] + _DELIVERED_MARK
+    # If even the marker alone overflows (budget < ~36), don't return something
+    # over budget — an empty string always fits (a >= 1000-floor caller can't
+    # reach this, but keep the function's own contract unconditional).
+    return candidate if len(json.dumps(candidate)) <= budget else ""
 
 
 def _bounded_redirect_result(
