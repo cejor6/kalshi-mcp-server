@@ -161,6 +161,50 @@ def _wrap_body(text: str) -> str:
     return f"{_UNTRUSTED_OPEN}\n{text}\n{_UNTRUSTED_CLOSE}"
 
 
+_DELIVERED_MARK = "…[truncated to fit max_bytes]"
+
+_REDIRECT_NOTE = (
+    "redirects are not followed; re-fetch the redirect_location yourself if its host is allowlisted"
+)
+
+
+def _bounded_redirect_result(
+    url: str, status: int, location: str, max_bytes: int
+) -> dict[str, Any]:
+    """Build a redirect result whose DELIVERED size stays within `max_bytes`.
+
+    The redirect branch has no body, but both echoed strings — the caller `url`
+    and the upstream-controlled `location` header — are variable-length and
+    could blow the same delivered-size guarantee the body branch enforces. Bound
+    the longer of the two (measuring serialized length) until it fits, reserving
+    room for the truncation marker.
+    """
+
+    def build(u: str, loc: str) -> dict[str, Any]:
+        return _result(u, status, redirect_location=loc, note=_REDIRECT_NOTE)
+
+    full = build(url, location)
+    if len(json.dumps(full)) <= max_bytes:
+        return full
+
+    # Target a reduced budget so appending the marker(s) afterward still fits.
+    target = max(0, max_bytes - 2 * len(_DELIVERED_MARK) - 8)
+    u_shown, loc_shown = url, location
+    u_cut = loc_cut = False
+    while len(json.dumps(build(u_shown, loc_shown))) > target and (u_shown or loc_shown):
+        if len(loc_shown) >= len(u_shown) and loc_shown:
+            loc_shown, loc_cut = loc_shown[:-32], True
+        elif u_shown:
+            u_shown, u_cut = u_shown[:-32], True
+        else:
+            break
+    if u_cut:
+        u_shown += _DELIVERED_MARK
+    if loc_cut:
+        loc_shown += _DELIVERED_MARK
+    return build(u_shown, loc_shown)
+
+
 def _fit_to_delivered_budget(
     *,
     url: str,
@@ -189,11 +233,11 @@ def _fit_to_delivered_budget(
         "overhead), not just the fetched bytes; raise max_bytes for more"
     )
 
-    def build(t: str, truncated: bool, note: str = "", *, echoed_url: str = url) -> dict[str, Any]:
+    def build(t: str, truncated: bool, note: str, echoed_url: str, ct: str) -> dict[str, Any]:
         return _result(
             echoed_url,
             status,
-            content_type=content_type,
+            content_type=ct,
             body=_wrap_body(t),
             truncated=truncated,
             bytes_returned=raw_bytes,
@@ -203,42 +247,43 @@ def _fit_to_delivered_budget(
     def delivered_len(result: dict[str, Any]) -> int:
         return len(json.dumps(result))
 
-    full = build(text, fetch_truncated)
+    full = build(text, fetch_truncated, "", url, content_type)
     if delivered_len(full) <= max_bytes:
         return full
 
-    # The body text is not the only variable-length field: the echoed `url`
-    # (and `note`) count too, and the url is caller-supplied with no length cap
-    # (a long query string). If the scaffold — everything but the body — already
-    # exceeds the budget, trimming the body can't save it, so bound the echoed
-    # url first. Its inner-fetch use already happened; this only shortens what's
-    # reflected back. Then the body search runs against the remaining room.
-    echoed_url = url
-    scaffold_len = delivered_len(build("", True, trim_note, echoed_url=echoed_url))
-    if scaffold_len > max_bytes:
-        _URL_CUT_MARK = "…[url truncated to fit max_bytes]"
-        # Shrink the echoed url by the overflow (+ marker), never below 0.
-        keep = max(0, len(url) - (scaffold_len - max_bytes) - len(_URL_CUT_MARK))
-        echoed_url = url[:keep] + _URL_CUT_MARK
-        # One correction pass covers JSON-escaping wobble in the trimmed url.
-        while (
-            keep > 0
-            and delivered_len(build("", True, trim_note, echoed_url=echoed_url)) > max_bytes
-        ):
-            keep = max(0, keep - 32)
-            echoed_url = url[:keep] + _URL_CUT_MARK
+    # Over budget. The body text is NOT the only variable-length field: the
+    # echoed `url` (caller-supplied) AND `content_type` (an unbounded upstream
+    # response header) both count toward the delivered size, and either can
+    # dominate on its own. Patching them one field at a time is whack-a-mole, so
+    # bound ALL echoed metadata generically: shrink whichever field is currently
+    # longest, 32 chars at a time, until the empty-body scaffold uses at most
+    # half the budget — measuring the actual SERIALIZED length each pass, so
+    # JSON-escaping inflation is accounted for. Half leaves the body real room;
+    # these fields are references, not the payload, so trimming them is cheap.
+    url_shown, ct_shown = url, content_type
+    url_cut = ct_cut = False
+    while delivered_len(build("", True, trim_note, url_shown, ct_shown)) > max_bytes // 2:
+        if len(url_shown) >= len(ct_shown) and url_shown:
+            url_shown, url_cut = url_shown[:-32], True
+        elif ct_shown:
+            ct_shown, ct_cut = ct_shown[:-32], True
+        else:
+            break  # both empty — the scaffold is now just fixed fields (< floor)
+    if url_cut:
+        url_shown += _DELIVERED_MARK
+    if ct_cut:
+        ct_shown += _DELIVERED_MARK
 
     # Binary-search the largest body prefix whose delivered result fits. The
-    # `trim_note` is included in every measured candidate — it costs ~140 chars,
-    # and adding it AFTER the search would blow the guarantee.
+    # `trim_note` and the (now-bounded) metadata are in every measured candidate.
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if delivered_len(build(text[:mid], True, trim_note, echoed_url=echoed_url)) <= max_bytes:
+        if delivered_len(build(text[:mid], True, trim_note, url_shown, ct_shown)) <= max_bytes:
             lo = mid
         else:
             hi = mid - 1
-    return build(text[:lo], True, trim_note, echoed_url=echoed_url)
+    return build(text[:lo], True, trim_note, url_shown, ct_shown)
 
 
 async def _fetch_external(
@@ -273,15 +318,8 @@ async def _fetch_external(
                 # also 3xx but has nothing to re-fetch — let it fall through
                 # to the body branch (typically empty body).
                 if response.is_redirect and "location" in response.headers:
-                    return _result(
-                        url,
-                        response.status_code,
-                        redirect_location=response.headers["location"],
-                        note=(
-                            "redirects are not followed; re-fetch the "
-                            "redirect_location yourself if its host is "
-                            "allowlisted"
-                        ),
+                    return _bounded_redirect_result(
+                        url, response.status_code, response.headers["location"], max_bytes
                     )
                 raw = bytearray()
                 truncated = False

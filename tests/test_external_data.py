@@ -364,4 +364,45 @@ async def test_fetch_delivered_cap_holds_even_with_a_long_url():
 
     result = await _fetch_external(long_url, max_bytes=1_000, transport=_transport(handler))
     assert len(_json.dumps(result)) <= 1_000
-    assert "url truncated" in result["url"]  # echoed url was bounded
+    assert "truncated to fit" in result["url"]  # echoed url was bounded
+
+
+async def test_fetch_delivered_cap_holds_with_a_long_content_type_header():
+    """REGRESSION (round 2 of the delivered-cap guard): the upstream
+    content_type header is unbounded caller-uncontrolled data that also counts
+    toward the delivered size. A verbose/hostile header must not blow the cap."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="short", headers={"content-type": "x" * 5_000})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=1_000, transport=_transport(handler)
+    )
+    assert len(_json.dumps(result)) <= 1_000
+
+
+async def test_redirect_delivered_cap_holds_with_a_long_location():
+    """REGRESSION: the redirect branch echoes the upstream Location header, also
+    unbounded — it must be bounded to the same delivered guarantee."""
+    import json as _json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://api.weather.gov/" + "a" * 5_000})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=1_000, transport=_transport(handler)
+    )
+    assert result["status"] == 302
+    assert len(_json.dumps(result)) <= 1_000
+    assert "truncated to fit" in result["redirect_location"]
+
+
+async def test_redirect_short_location_unchanged():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "https://api.weather.gov/elsewhere"})
+
+    result = await _fetch_external(
+        "https://api.weather.gov/x", max_bytes=100_000, transport=_transport(handler)
+    )
+    assert result["redirect_location"] == "https://api.weather.gov/elsewhere"
