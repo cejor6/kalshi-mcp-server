@@ -11,13 +11,12 @@ from kalshi_mcp_server.tools import exchange
 def test_session_auth_view_empty_without_a_token(monkeypatch):
     """On stdio / outside a request context there's no token — empty dict, no
     crash. This is the default in every stdio test and deploy."""
+
     # Simulate get_access_token() raising (no request context / no oauth).
     def _raise():
         raise RuntimeError("no request context")
 
-    monkeypatch.setattr(
-        "fastmcp.server.dependencies.get_access_token", _raise, raising=False
-    )
+    monkeypatch.setattr("fastmcp.server.dependencies.get_access_token", _raise, raising=False)
     assert exchange._session_auth_view() == {}
 
 
