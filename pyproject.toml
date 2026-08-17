@@ -33,6 +33,11 @@ dependencies = [
     "websockets>=12.0",
     "pydantic>=2.6.0",
     "python-dotenv>=1.0.0",
+    # Used by tools/exchange.py to decode the session-JWT expiry (issue #80).
+    # It resolves transitively via `mcp` today, but declaring it explicitly
+    # keeps that read from silently going inert if the transitive pull ever
+    # changes (the import is swallowed by a fail-open except).
+    "pyjwt>=2.10.1",
 ]
 
 [project.optional-dependencies]

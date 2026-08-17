@@ -240,6 +240,24 @@ Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
 itself is the operator.
 
+**The session-token expiry (`kalshi_get_environment`, issue #80) comes from the
+raw incoming bearer JWT — NOT from `get_access_token()`.** Under `GitHubProvider`
+the `AccessToken` that `get_access_token()` returns has `expires_at=None` (GitHub
+OAuth tokens don't expire) and no `exp` in `claims` — so the obvious read
+surfaces nothing on prod (the original #80 miss shipped exactly that). The
+expiry that matters lives on the short-lived FastMCP reference JWT claude.ai
+presents in the `Authorization` header (issued with `exp` in `jwt_issuer.py`,
+TTL tracking the ~8h GitHub-App session). `exchange.py:_session_token_expiry`
+recovers it via `get_http_headers(include={"authorization"})` (the helper strips
+`authorization` by default) and decodes the bearer with **`verify_signature=False`
+on purpose**: the proxy middleware has already cryptographically validated the
+token before any tool runs, this is a read-only health signal (not an auth
+decision), and verifying here would couple us to FastMCP's unexported JWT key
+derivation. It fails open (`{}`) on stdio / non-JWT / missing-`exp`, and rejects
+non-finite `exp` before `int()` (same NaN/inf fail-closed rule as `safety.py` —
+otherwise it would raise and take the whole tool down). Don't "simplify" it back
+to reading `expires_at`/`claims["exp"]` — that's the inert path.
+
 **`health_check_interval` on the Redis client is load-bearing — don't
 strip it.** On the `Redis.from_url` path, `Connection.__init__` ends up
 with `Retry(NoBackoff(), 0)` and `health_check_interval=0` — no liveness
