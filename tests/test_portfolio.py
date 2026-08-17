@@ -58,22 +58,22 @@ async def _tool_fn(server: FastMCP, name: str):
 
 @pytest.mark.asyncio
 async def test_balance_adds_total_value_flat_account(rsa_private_key):
-    """The live false-drain repro: $87 cash, no positions → portfolio_value 0.
-    total_value must equal cash, not 0."""
+    """The false-drain repro (synthetic values): cash present, no positions →
+    portfolio_value 0. total_value must equal cash, not 0."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"balance": 8737, "balance_dollars": "87.3707", "portfolio_value": 0},
+            json={"balance": 12500, "balance_dollars": "125.0000", "portfolio_value": 0},
         )
 
     server = _make_server(rsa_private_key, handler)
     out = await (await _tool_fn(server, "kalshi_get_balance"))()
-    assert out["total_value"] == 8737
-    assert out["total_value_dollars"] == "87.3700"
+    assert out["total_value"] == 12500
+    assert out["total_value_dollars"] == "125.0000"
     # The raw Kalshi fields are preserved unchanged.
     assert out["portfolio_value"] == 0
-    assert out["balance"] == 8737
+    assert out["balance"] == 12500
 
 
 @pytest.mark.asyncio
