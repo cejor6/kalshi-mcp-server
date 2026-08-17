@@ -843,6 +843,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "pyjwt" },
     { name = "python-dotenv" },
     { name = "websockets" },
 ]
@@ -873,6 +874,7 @@ requires-dist = [
     { name = "py-key-value-aio", extras = ["redis"], marker = "extra == 'dev'", specifier = ">=0.4.4" },
     { name = "py-key-value-aio", extras = ["redis"], marker = "extra == 'oauth'", specifier = ">=0.4.4" },
     { name = "pydantic", specifier = ">=2.6.0" },
+    { name = "pyjwt", specifier = ">=2.10.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },

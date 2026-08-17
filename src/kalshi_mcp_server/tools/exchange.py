@@ -37,6 +37,11 @@ def _session_token_expiry() -> dict[str, Any]:
     `exp` — because it must never break `kalshi_get_environment`. Non-finite
     `exp` (NaN/inf) is rejected before `int()`, which would otherwise raise and
     take the whole tool down (same fail-closed rule as `safety.py`).
+
+    Safety of the unverified decode depends on the CALLER: `_session_auth_view`
+    invokes this only behind its `get_access_token() is not None` gate — an
+    already-authenticated request. Don't call it from an ungated path; that would
+    decode a bearer the auth middleware hasn't validated.
     """
     try:
         import jwt

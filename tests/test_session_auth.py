@@ -156,3 +156,51 @@ def test_session_token_expiry_clamps_past_expiry(monkeypatch):
     out = exchange._session_token_expiry()
     assert out["session_token_expires_at"] == exp
     assert out["session_token_expires_in_seconds"] == 0
+
+
+def test_session_auth_view_none_token_is_not_authenticated(monkeypatch):
+    """get_access_token() returns None on the real no-auth path (it does NOT
+    raise). This must return {} — NOT {"session_authenticated": True}. Guards
+    the `if token is None` branch so a false auth-health positive can't slip in
+    if that check is ever dropped."""
+    monkeypatch.setattr(
+        "fastmcp.server.dependencies.get_access_token",
+        lambda: None,
+        raising=False,
+    )
+    assert exchange._session_auth_view() == {}
+
+
+def test_session_token_expiry_accepts_lowercase_bearer_scheme(monkeypatch):
+    """The scheme match is case-insensitive — a lowercase `bearer` decodes."""
+    exp = int(time.time()) + 3600
+    token = jwt.encode({"exp": exp}, "k" * 32, algorithm="HS256")
+    monkeypatch.setattr(
+        "fastmcp.server.dependencies.get_http_headers",
+        lambda include=None: {"authorization": f"bearer {token}"},
+        raising=False,
+    )
+    assert exchange._session_token_expiry()["session_token_expires_at"] == exp
+
+
+def test_session_token_expiry_rejects_string_exp(monkeypatch):
+    """A non-numeric `exp` (e.g. a string epoch) is ignored, not int()-ed."""
+    monkeypatch.setattr(
+        "fastmcp.server.dependencies.get_http_headers",
+        lambda include=None: {"authorization": "Bearer x"},
+        raising=False,
+    )
+    monkeypatch.setattr(jwt, "decode", lambda *a, **k: {"exp": "1700000000"})
+    assert exchange._session_token_expiry() == {}
+
+
+def test_session_token_expiry_rejects_bool_exp(monkeypatch):
+    """`exp` as a bool (int subclass) is excluded by the explicit bool guard —
+    otherwise `True` would int() to 1 and surface a nonsense 1970 expiry."""
+    monkeypatch.setattr(
+        "fastmcp.server.dependencies.get_http_headers",
+        lambda include=None: {"authorization": "Bearer x"},
+        raising=False,
+    )
+    monkeypatch.setattr(jwt, "decode", lambda *a, **k: {"exp": True})
+    assert exchange._session_token_expiry() == {}
