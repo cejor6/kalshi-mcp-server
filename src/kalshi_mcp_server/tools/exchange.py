@@ -7,6 +7,7 @@ before doing anything else.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -14,12 +15,58 @@ if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
+def _session_token_expiry() -> dict[str, Any]:
+    """Recover the CURRENT session token's expiry countdown (issue #80).
+
+    The expiry that matters for "how long is this session good for" lives on the
+    short-lived FastMCP reference JWT that claude.ai presents in the
+    `Authorization` header — issued with an `exp` claim (`jwt_issuer.py`), whose
+    TTL tracks the upstream GitHub-App session (~8h). It is NOT on the
+    `AccessToken` that `get_access_token()` returns: under `GitHubProvider` the
+    verifier hardcodes `expires_at=None` (GitHub OAuth tokens don't expire) and
+    puts no `exp` in `claims`, so reading from there surfaces nothing on prod
+    (the original #80 miss). The proxy verifies this JWT and reads its `exp`,
+    then discards it — we recover it from the raw bearer.
+
+    Decoded WITHOUT signature verification on purpose: the proxy middleware has
+    already cryptographically validated this token before the request reaches
+    any tool, this field is a non-authoritative health signal (not an
+    authorization decision), and verifying here would couple us to FastMCP's
+    unexported JWT key derivation. Fails open (returns {}) on anything
+    unexpected — stdio (no HTTP request), a non-JWT bearer, a missing/garbage
+    `exp` — because it must never break `kalshi_get_environment`. Non-finite
+    `exp` (NaN/inf) is rejected before `int()`, which would otherwise raise and
+    take the whole tool down (same fail-closed rule as `safety.py`).
+    """
+    try:
+        import jwt
+        from fastmcp.server.dependencies import get_http_headers
+
+        # get_http_headers strips `authorization` by default; opt it back in.
+        auth = get_http_headers(include={"authorization"}).get("authorization", "")
+        scheme, _, raw = auth.partition(" ")
+        if scheme.lower() != "bearer" or not raw:
+            return {}
+        exp = jwt.decode(raw, options={"verify_signature": False}).get("exp")
+    except Exception:
+        return {}
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+        return {}
+    return {
+        "session_token_expires_at": int(exp),
+        "session_token_expires_in_seconds": max(0, int(exp - time.time())),
+    }
+
+
 def _session_auth_view() -> dict[str, Any]:
     """Auth health for the CURRENT request's session token (issue #80).
 
-    Returns the authenticated GitHub `login` and the token's expiry when the
-    server is running under the OAuth proxy (HTTP transport) and this call is
-    inside a request context. Empty on stdio, or when there's no token.
+    Returns the authenticated GitHub `login` and the token's expiry countdown
+    when the server is running under the OAuth proxy (HTTP transport) and this
+    call is inside a request context. Empty on stdio, or when there's no token.
+    (`login` comes from the validated `AccessToken`; the expiry is recovered
+    from the raw session JWT — see `_session_token_expiry` for why the two have
+    different sources.)
 
     Deliberately labeled "session" — this is the short-lived access token the
     connector refreshes automatically, NOT the connector's long-lived
@@ -43,10 +90,7 @@ def _session_auth_view() -> dict[str, Any]:
     login = claims.get("login")
     if login:
         view["session_login"] = login
-    exp = claims.get("exp")
-    if isinstance(exp, (int, float)):
-        view["session_token_expires_at"] = int(exp)
-        view["session_token_expires_in_seconds"] = max(0, int(exp - time.time()))
+    view.update(_session_token_expiry())
     return view
 
 
