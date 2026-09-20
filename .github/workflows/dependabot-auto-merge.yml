@@ -1,8 +1,10 @@
 name: Dependabot auto-merge
 
-# Auto-enables squash auto-merge on Dependabot patch/minor PRs. GitHub holds the
-# merge until the required status checks on main pass, so nothing merges red.
-# Major bumps are left open for manual review.
+# Auto-enables squash auto-merge on Dependabot patch/minor PRs. This relies on
+# branch protection on main with required status checks: GitHub holds the merge
+# until they pass, so nothing merges red. If those required checks are ever
+# removed, auto-merge degrades to merging immediately. Major bumps are left open
+# for manual review.
 
 on: pull_request
 
