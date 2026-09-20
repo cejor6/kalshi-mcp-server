@@ -352,6 +352,7 @@ the worked example.
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
 | Live (WebSocket) | `kalshi_get_live_orderbook`, `kalshi_sample_trades` |
 | External data (read-only) | `kalshi_fetch_external_data` — host-allowlisted, GET-only, https-only fetch of public data feeds (Polymarket gamma/clob, NWS `api.weather.gov`, Open-Meteo incl. ensemble, Tennis Abstract, Deribit public). No credentials attached (`trust_env=False`), redirects not followed, body size- and wall-clock-capped and returned wrapped in UNTRUSTED-EXTERNAL-DATA delimiters. Exists so clients whose own egress is restricted (e.g. claude.ai cloud routines) can reach the public feeds their read-only research needs; the allowlist is enforced at runtime, additions are a code change, and the boundary rationale lives in AGENTS.md. |
+| Scoring (read-only, optional) | `kalshi_score_markets` — ranks liquid markets by apparent edge using [Jev](https://typesafe.ai) (a fast typed-decision model), for a trading loop that scores many markets cheaply and escalates only the top few. Places no orders. Registered only when `MCP_ALLOW_JEV_SCORING=1` (default off). Jev is optional: with no `TYPESAFE_API_KEY`, or on any Jev failure, markets fall back to a deterministic liquidity/spread heuristic (`jev_scored=false`). See "Optional Jev scoring" below. |
 
 Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
 local safety checks and returns a `confirmation_id`; nothing is sent to
@@ -449,6 +450,57 @@ event ticker to `kalshi_get_market` / `kalshi_get_orderbook` / `kalshi_get_marke
 used to fail silently (404, or an empty book/list read as "no liquidity").
 These tools now detect that case and raise an actionable hint naming the
 real market tickers instead.
+
+### Optional Jev scoring
+
+`kalshi_score_markets` is an **opt-in, read-only** ranking aid for a trading
+loop that wants to score many markets cheaply and escalate only the top few
+to an expensive reasoning model. It reuses the liquid-market scan, builds a
+compact plaintext situation per market (title, quoted YES/NO prices, spread,
+volume, time-to-close, resolution-rule snippet), and asks
+[Jev](https://typesafe.ai) — TypeSafe's fast typed-decision model — a
+*batched* question set per market (an edge `score` plus a `side` choice) in
+one call. Results come back ranked by `confidence * edge`. **It places no
+orders and commits no money.**
+
+Two gates, both fail safe:
+
+- **Registration.** Off by default. Set `MCP_ALLOW_JEV_SCORING=1` to register
+  the tool at all (same pattern as `MCP_ALLOW_COMBO_CREATION` — when off, the
+  tool isn't advertised to the model). A default clone stays a pure Kalshi
+  surface.
+- **Jev is optional — never a dependency.** Even when registered, if
+  `TYPESAFE_API_KEY` is unset the tool ranks by a deterministic
+  liquidity/spread heuristic with `jev_scored=false`. Every Jev call is
+  wrapped in a timeout budget and falls back to that heuristic on **any**
+  failure — 402 (out of credits), 429 (rate-limited), other non-2xx, network
+  error, timeout, malformed/missing answer, or confidence below the
+  threshold. The whole fan-out is also bounded by an aggregate wall-clock
+  budget, so a slow host degrades to the heuristic rather than blocking, and a
+  429 trips a short global back-off so a rate-limited upstream isn't hammered.
+  The tool never crashes; genuine failures are logged once per scan and
+  returned as `fallback_reasons`.
+
+**No new hard dependency:** the Jev call is plain REST over the `httpx` this
+server already ships — there is no `typesafe-sdk` requirement. Only public
+Kalshi market data is sent to Jev (no account data, balances, or secrets),
+and the API key is sent only to the configured Jev host over https. Like
+`kalshi_fetch_external_data`, this is a deliberate, documented exception to
+the "Kalshi surface only" boundary (see AGENTS.md) — it exists because the
+egress-restricted clients that consume this server can't reach
+`api.typesafe.ai` directly.
+
+Env vars (all optional; add to your `.env` only if you enable scoring):
+
+```bash
+MCP_ALLOW_JEV_SCORING=0            # 1 registers kalshi_score_markets
+TYPESAFE_API_KEY=                  # Jev key; unset => heuristic-only fallback
+MCP_JEV_CONFIDENCE_THRESHOLD=0.6   # below this, a market falls back
+MCP_JEV_MODEL=jev-latest
+MCP_JEV_TIMEOUT_SECONDS=8          # per-request budget
+MCP_JEV_RATE_COOLDOWN_SECONDS=60   # global back-off after a 429 (capped at 1h)
+# MCP_JEV_BASE_URL=https://api.typesafe.ai/v1/systemone  # override for self-host/tests
+```
 
 ## Resources
 

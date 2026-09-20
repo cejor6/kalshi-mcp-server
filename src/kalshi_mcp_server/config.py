@@ -113,6 +113,15 @@ class Config:
     combo_creation_enabled: bool = False
     max_combo_creations_per_day: int = 100
 
+    # Optional Jev-powered market scoring (kalshi_score_markets). Off by
+    # default (fail closed): a default clone never advertises this
+    # signal-adjacent, read-only capability. When True the tool is registered
+    # but still self-gates behind TYPESAFE_API_KEY, falling back to a
+    # deterministic liquidity heuristic when Jev is unavailable. Mirrors the
+    # combo-creation / runtime-tuning registration gates. Has a default so
+    # existing constructors stay valid.
+    jev_scoring_enabled: bool = False
+
     @classmethod
     def from_env(cls) -> Config:
         key_id = os.environ.get("KALSHI_API_KEY_ID", "").strip()
@@ -166,6 +175,7 @@ class Config:
             runtime_limit_tuning_enabled=_get_bool("MCP_ALLOW_RUNTIME_LIMIT_TUNING", default=True),
             combo_creation_enabled=_get_bool("MCP_ALLOW_COMBO_CREATION", default=False),
             max_combo_creations_per_day=_get_int("MCP_MAX_COMBO_CREATIONS_PER_DAY", 100),
+            jev_scoring_enabled=_get_bool("MCP_ALLOW_JEV_SCORING", default=False),
         )
 
 

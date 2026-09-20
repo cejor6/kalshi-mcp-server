@@ -144,7 +144,8 @@ def register(server: FastMCP) -> None:
         ceiling, never loosen past it). `combo_creation_enabled` +
         `combo_creations_today` / `max_combo_creations_per_day` report the
         separate `kalshi_create_combo_market` gate and today's remaining local
-        creation budget.
+        creation budget. `jev_scoring_enabled` shows whether the optional
+        `kalshi_score_markets` tool is registered.
 
         On OAuth/HTTP deploys only (absent on stdio), `session_authenticated` /
         `session_login` / `session_token_expires_in_seconds` are an auth health
@@ -159,6 +160,7 @@ def register(server: FastMCP) -> None:
             "ws_url": config.ws_url,
             **safety.environment_view(),
             **safety.combo_creation_view(),
+            "jev_scoring_enabled": config.jev_scoring_enabled,
             # Session-token auth health (HTTP/OAuth only; empty on stdio). See
             # `_session_auth_view` — it's a "who am I / is auth live" signal,
             # not the connector's long-lived credential.

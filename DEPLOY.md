@@ -905,6 +905,25 @@ weekly quota. `kalshi_get_environment` and the `kalshi://environment` resource
 both report `combo_creation_enabled`, `combo_creations_today`, and
 `max_combo_creations_per_day`.
 
+**Optional Jev market scoring — another separate gate.** `kalshi_score_markets`
+is a read-only ranking aid backed by the external Jev API. It's **off by
+default** and, like combo creation, isn't registered at all unless enabled — so
+a default deploy never advertises it. Turn it on with two vars:
+
+```bash
+MCP_ALLOW_JEV_SCORING=0            # default; 1 registers kalshi_score_markets
+TYPESAFE_API_KEY=                  # Jev key; unset => the tool heuristic-ranks only
+```
+
+With the flag on but no `TYPESAFE_API_KEY`, the tool registers but every scan
+falls back to a deterministic liquidity heuristic (`jev_scored=false`) — set
+both together. Optional tunables (`MCP_JEV_CONFIDENCE_THRESHOLD`,
+`MCP_JEV_MODEL`, `MCP_JEV_TIMEOUT_SECONDS`, `MCP_JEV_RATE_COOLDOWN_SECONDS`,
+`MCP_JEV_BASE_URL`) have safe defaults — see the README's "Optional Jev
+scoring". `kalshi_get_environment` and the `kalshi://environment` resource both
+report `jev_scoring_enabled`. Only public market data is sent to Jev; the key
+goes only to the configured https host.
+
 **Disabling runtime tuning.** Set `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0` to
 drop the `kalshi_set_safety_limits` tool entirely. Limits then change only
 via env var + redeploy. Worth doing on a shared HTTP deploy where every
