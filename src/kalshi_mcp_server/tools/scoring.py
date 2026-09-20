@@ -28,9 +28,11 @@ Two independent gates (both fail safe):
   ``jev_scored=false``. Every Jev call is wrapped in a timeout budget and
   falls back to that heuristic on ANY failure — non-2xx (402 out-of-credits,
   429 rate-limited, other), network error, timeout, malformed/missing
-  answer, or confidence below the configured threshold. The tool never
-  crashes and never blocks on Jev; the fallback reason is logged ONCE per
-  scan and returned as an aggregate ``fallback_reasons`` count.
+  answer, or confidence below the configured threshold. The whole fan-out is
+  also bounded by an aggregate wall-clock budget, so a slow/drip-feeding host
+  degrades to the heuristic instead of blocking. The tool never crashes;
+  genuine Jev failures are logged ONCE per scan and returned as an aggregate
+  ``fallback_reasons`` count.
 
 Boundary note: like ``kalshi_fetch_external_data``, this is a deliberate,
 documented exception to the "Kalshi surface only" rule (see AGENTS.md).
@@ -54,8 +56,9 @@ import math
 import os
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import Field
@@ -64,6 +67,7 @@ from kalshi_mcp_server.tools.discovery import (
     _MINIMAL_MARKET_FIELDS,
     _minimal_market,
     _scan_markets_excluding_mve,
+    _TopKByVolume,
     _volume_24h,
     _yes_spread,
 )
@@ -82,8 +86,37 @@ _DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
 _DEFAULT_MODEL = "jev-latest"
 _DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 _DEFAULT_TIMEOUT_SECONDS = 8.0  # per-market Jev request (connect+read budget)
-_DEFAULT_MAX_CONCURRENCY = 4  # bounds simultaneous outbound Jev calls per scan
 _DEFAULT_RATE_COOLDOWN_SECONDS = 60.0  # global back-off window after a 429
+_MAX_RATE_COOLDOWN_SECONDS = 3600.0  # cap so a typo'd env can't disable Jev ~forever
+
+# Hard ceiling on markets scored per scan — each is one PAID Jev call, so this
+# is a budget guard, not just paging: it MUST be enforced at runtime, since the
+# tool's `limit` schema bound (le=50) is advisory and a direct `.fn` caller
+# (or `scan_all=True`) bypasses it. Matches the schema max.
+_MAX_SCORE_LIMIT = 50
+
+# Aggregate wall-clock budget for the whole Jev fan-out. The per-request timeout
+# bounds ONE call, but limit x waves could still run ~100s, and a drip-feeding
+# host resets the per-op read timer indefinitely — so the batch as a whole is
+# also deadline-bounded (mirrors external_data's _WALL_CLOCK_SECONDS and
+# discovery's _SCAN_ALL_MAX_SECONDS). On expiry the batch degrades to heuristic.
+_WALL_CLOCK_SECONDS = 30.0
+
+# Bounds simultaneous outbound Jev calls PROCESS-WIDE (module-global, like
+# external_data's fetch semaphore) — not per scan, so N concurrent scans can't
+# multiply into N x this against a single upstream.
+_MAX_CONCURRENCY = 4
+_jev_semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+
+# The only sides Jev may return; anything else is dropped to None. The response
+# is UNTRUSTED (a hostile/misconfigured host could plant arbitrary text into a
+# trusted-looking field a trading loop reads), so `side`/`probabilities` are
+# allowlisted, never passed through verbatim.
+_ALLOWED_SIDES: frozenset[str] = frozenset({"yes", "no", "pass"})
+
+# Whole-scan disabled states that are steady-state config, not faults — a scan
+# in one of these does NOT emit a warning (only genuine Jev failures do).
+_STEADY_STATE_REASONS: frozenset[str] = frozenset({"no_api_key", "bad_base_url", "no_candidates"})
 
 # Process-global back-off: once Jev returns a 429, every subsequent scan skips
 # Jev entirely (heuristic) until this monotonic deadline, rather than hammering
@@ -106,6 +139,7 @@ def _trip_rate_cooldown(seconds: float) -> None:
 
 def _in_rate_cooldown() -> bool:
     return time.monotonic() < _rate_limited_until
+
 
 # The edge Score question's ordered levels (low->high mispricing). Per the Jev
 # contract a Score `criteria` is an ARRAY of 2-10 level descriptions, and the
@@ -135,13 +169,12 @@ class _JevSettings:
     __slots__ = (
         "api_key",
         "base_url",
+        "cooldown",
+        "disabled_reason",
+        "enabled",
         "model",
         "threshold",
         "timeout",
-        "concurrency",
-        "cooldown",
-        "enabled",
-        "disabled_reason",
     )
 
     def __init__(self, *, min_confidence: float | None) -> None:
@@ -150,18 +183,24 @@ class _JevSettings:
         self.model = (os.environ.get("MCP_JEV_MODEL") or "").strip() or _DEFAULT_MODEL
         self.threshold = _resolve_threshold(min_confidence)
         self.timeout = _env_float("MCP_JEV_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS, minimum=0.1)
-        self.concurrency = _env_int("MCP_JEV_MAX_CONCURRENCY", _DEFAULT_MAX_CONCURRENCY, minimum=1)
-        self.cooldown = _env_float(
-            "MCP_JEV_RATE_COOLDOWN_SECONDS", _DEFAULT_RATE_COOLDOWN_SECONDS, minimum=0.0
+        # Cap the cooldown so a fat-fingered env value can't disable Jev for a
+        # practically unbounded time.
+        self.cooldown = min(
+            _env_float(
+                "MCP_JEV_RATE_COOLDOWN_SECONDS", _DEFAULT_RATE_COOLDOWN_SECONDS, minimum=0.0
+            ),
+            _MAX_RATE_COOLDOWN_SECONDS,
         )
         self.enabled = True
         self.disabled_reason = ""
         if not self.api_key:
             self.enabled = False
             self.disabled_reason = "no_api_key"
-        elif not self.base_url.lower().startswith("https://"):
+        elif not _base_url_ok(self.base_url):
             # Operator misconfiguration — never ship the bearer token over a
-            # non-TLS URL. Disable rather than leak the key.
+            # non-TLS URL, to another host via userinfo (httpx would turn
+            # `user:pass@host` into a Basic-Auth header, silently REPLACING the
+            # Bearer), or to a non-default port. Disable rather than leak.
             self.enabled = False
             self.disabled_reason = "bad_base_url"
         elif _in_rate_cooldown():
@@ -184,15 +223,26 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return value
 
 
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
+def _base_url_ok(url: str) -> bool:
+    """True only for an https URL with no userinfo and a default/443 port.
+
+    The Jev base URL is operator-set (trusted config, not model input), but a
+    misconfiguration must never leak the bearer token: a non-https scheme sends
+    it in the clear, userinfo (`user:pass@host`) makes httpx emit a Basic-Auth
+    header that silently REPLACES our Authorization, and a stray port routes it
+    somewhere unexpected. Reject rather than repair.
+    """
     try:
-        value = int(raw)
+        parts = urlsplit(url)
+        port = parts.port  # may raise ValueError on a junk port
     except ValueError:
-        return default
-    return value if value >= minimum else default
+        return False
+    return (
+        parts.scheme == "https"
+        and bool(parts.hostname)
+        and "@" not in parts.netloc
+        and port in (None, 443)
+    )
 
 
 def _resolve_threshold(min_confidence: float | None) -> float:
@@ -219,8 +269,8 @@ def _hours_to_close(market: dict[str, Any]) -> float | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    delta = parsed - datetime.now(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    delta = parsed - datetime.now(UTC)
     return round(delta.total_seconds() / 3600.0, 1)
 
 
@@ -316,10 +366,39 @@ def _heuristic_score(market: dict[str, Any]) -> float:
     penalized as the worst case. Bounded and monotonic; only relative order
     matters for ranking.
     """
-    volume_term = math.log10(_volume_24h(market) + 1.0)
+    # Clamp volume at 0 before log10: _volume_24h happily floats a negative
+    # `volume_24h_fp` from a malformed upstream payload, and log10 of <= 0
+    # raises ValueError — which, called for every row, would crash the whole
+    # tool and break the "never crashes" contract.
+    volume_term = math.log10(max(0.0, _volume_24h(market)) + 1.0)
     spread = _yes_spread(market)
     spread_cents = spread * 100.0 if spread is not None else 100.0
     return volume_term / (1.0 + spread_cents)
+
+
+def _clean_probabilities(probs: Any) -> dict[str, float] | None:
+    """Project an untrusted `probabilities` map to known sides + finite floats.
+
+    The raw value comes straight off the Jev response, so it must not be echoed
+    verbatim: unknown keys are arbitrary attacker-/misconfig-controlled text,
+    and a NaN/inf float re-serializes to bare `NaN`/`Infinity` — invalid JSON
+    that breaks the ENTIRE tool result for a strict client (the same
+    fail-closed-on-non-finite rule enforced on edge/confidence above). Keep only
+    `yes`/`no`/`pass` keys whose value is a finite float.
+    """
+    if not isinstance(probs, dict):
+        return None
+    cleaned: dict[str, float] = {}
+    for key, value in probs.items():
+        if key not in _ALLOWED_SIDES:
+            continue
+        try:
+            fv = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            cleaned[key] = fv
+    return cleaned or None
 
 
 # ── Jev call (single market; returns parsed answer OR a fallback reason) ─────
@@ -358,8 +437,11 @@ def _parse_answers(payload: Any) -> dict[str, Any] | None:
     side_conf = None
     probabilities = None
     if isinstance(side, dict):
+        # UNTRUSTED response: allowlist the choice to the three sides we asked
+        # for — never pass an arbitrary string into a field a trading loop feeds
+        # to prepare_order(side=...). Anything else becomes None.
         choice = side.get("choice")
-        if isinstance(choice, str):
+        if isinstance(choice, str) and choice in _ALLOWED_SIDES:
             side_choice = choice
         try:
             sc = float(side["confidence"])
@@ -367,9 +449,7 @@ def _parse_answers(payload: Any) -> dict[str, Any] | None:
                 side_conf = max(0.0, min(1.0, sc))
         except (KeyError, TypeError, ValueError):
             pass
-        probs = side.get("probabilities")
-        if isinstance(probs, dict):
-            probabilities = probs
+        probabilities = _clean_probabilities(side.get("probabilities"))
 
     return {
         "edge01": edge01,
@@ -406,7 +486,10 @@ async def _score_one(
         return None, "credits"
     if resp.status_code == 429:
         return None, "rate"
-    if resp.status_code >= 400:
+    # Anything non-2xx is a failure. Redirects aren't followed (the Bearer must
+    # not walk to another host), so a 3xx has no body to parse — bucket it as an
+    # http_error rather than letting it fall through to a misleading "malformed".
+    if resp.status_code >= 300:
         return None, "http_error"
 
     try:
@@ -431,6 +514,7 @@ def _fallback_market(market: dict[str, Any], reason: str) -> dict[str, Any]:
             "edge_score": None,
             "side": None,
             "confidence": None,
+            "side_confidence": None,  # keep row schema uniform with scored rows
             "probabilities": None,
             "heuristic_score": round(heuristic, 6),
             "rank_score": round(heuristic, 6),
@@ -482,12 +566,16 @@ async def _score_markets(
     """
     settings = _JevSettings(min_confidence=min_confidence)
 
+    # Runtime-clamp the number of markets scored — each is one PAID Jev call, so
+    # the schema `le=50` bound is NOT sufficient (a direct `.fn` caller, or a
+    # `scan_all` sweep with a huge `limit`, would otherwise fan out to thousands
+    # of paid calls). This runtime guard is authoritative; the schema is additive.
+    limit = max(1, min(limit, _MAX_SCORE_LIMIT))
+
     # Rank the scanned listing down to the top `limit` candidates, keeping the
     # resolution rule for the `state`. Streaming top-K bounds retention even on
     # a full sweep. Reuses discovery's ranker so behavior matches the rest of
     # the tool surface exactly.
-    from kalshi_mcp_server.tools.discovery import _TopKByVolume
-
     topk = _TopKByVolume(limit=limit, min_volume=min_volume, fields=",".join(_SCORING_SCAN_FIELDS))
     scan = await _scan_markets_excluding_mve(
         client,
@@ -506,15 +594,19 @@ async def _score_markets(
         # Jev off (no key / misconfigured) or nothing to score → heuristic only.
         if not settings.enabled and candidates:
             reasons[settings.disabled_reason] = len(candidates)
-        rows = [_fallback_market(m, settings.disabled_reason or "no_candidates") for m in candidates]
+        rows = [
+            _fallback_market(m, settings.disabled_reason or "no_candidates") for m in candidates
+        ]
         jev_status = "disabled" if not settings.enabled else "ok"
     else:
         rows = await _score_all(candidates, settings, jev_transport, reasons)
         scored = sum(1 for r in rows if r["jev_scored"])
         jev_status = "ok" if scored == len(rows) else ("degraded" if scored else "fallback")
 
-    # Log the fallback reasons ONCE per scan (aggregate), never per market.
-    if reasons:
+    # Log ONCE per scan (aggregate), and only for GENUINE Jev failures — a scan
+    # that's simply unconfigured (no key / bad base url) is steady state, not a
+    # fault, and warning on it every call would be noise.
+    if reasons and set(reasons) - _STEADY_STATE_REASONS:
         logger.warning(
             "kalshi_score_markets: Jev fallback for %d/%d market(s): %s",
             sum(reasons.values()),
@@ -537,7 +629,7 @@ async def _score_markets(
         "complete": scan.complete,
         "stopped_by": scan.stopped_by,
         "jev_enabled": settings.enabled,
-        "jev_status": jev_status if candidates else "ok",
+        "jev_status": jev_status,
         "confidence_threshold": settings.threshold,
         "fallback_reasons": dict(reasons),
     }
@@ -551,13 +643,16 @@ async def _score_all(
 ) -> list[dict[str, Any]]:
     """Score every candidate via Jev with bounded concurrency; build result rows.
 
-    Any unexpected failure constructing/using the client degrades the WHOLE
-    batch to the heuristic — Jev must never be able to crash the tool.
+    Concurrency is bounded PROCESS-WIDE by the module semaphore, and the whole
+    fan-out by an aggregate wall-clock deadline. Any unexpected failure — or the
+    deadline — degrades the WHOLE batch to the heuristic; Jev must never be able
+    to crash or indefinitely block the tool.
     """
-    semaphore = asyncio.Semaphore(settings.concurrency)
 
-    async def run(market: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
-        async with semaphore:
+    async def run(
+        market: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+        async with _jev_semaphore:
             answer, reason = await _score_one(jev_client, market, settings)
         return market, answer, reason
 
@@ -573,7 +668,17 @@ async def _score_all(
                 "Accept": "application/json",
             },
         ) as jev_client:
-            outcomes = await asyncio.gather(*(run(m) for m in candidates))
+            async with asyncio.timeout(_WALL_CLOCK_SECONDS):
+                outcomes = await asyncio.gather(*(run(m) for m in candidates))
+    except TimeoutError:
+        # The aggregate budget blew (a slow/drip-feeding host). Don't block the
+        # caller any longer — degrade the whole batch to the heuristic.
+        logger.warning(
+            "kalshi_score_markets: Jev fan-out exceeded the %.0fs budget; using heuristic",
+            _WALL_CLOCK_SECONDS,
+        )
+        reasons["deadline"] = len(candidates)
+        return [_fallback_market(m, "deadline") for m in candidates]
     except Exception:  # Jev must never crash the tool — degrade the whole batch
         logger.warning("kalshi_score_markets: Jev client failed; using heuristic", exc_info=True)
         reasons["client_error"] = len(candidates)
@@ -636,7 +741,8 @@ def register(server: FastMCP) -> None:
 
         Args:
             limit: How many top-by-volume candidates to score and return
-                (1-50, default 10). Each is one Jev call.
+                (1-50, default 10). Each is one paid Jev call, so it's hard-
+                capped at 50 at runtime even for direct callers.
             scan_limit: How many markets to fetch+rank before taking the top
                 `limit` (1-1000, default 200). IGNORED when `scan_all=True`.
             status: Lifecycle filter (default "open"); same values as
@@ -655,14 +761,19 @@ def register(server: FastMCP) -> None:
                 `confidence * edge`) sort above heuristic-fallback rows (ranked
                 by the liquidity proxy) — the two use different bases, so
                 always read `jev_scored`. Each row carries the minimal market
-                projection plus: `jev_scored`, `edge_score` (0-1 or null),
-                `side` ("yes"/"no"/"pass" or null), `confidence`,
-                `probabilities`, `heuristic_score`, `rank_score`,
-                `fallback_reason`.
+                projection plus a uniform set of scoring fields (present on
+                every row, null on fallback rows): `jev_scored`, `edge_score`
+                (0-1 or null), `side` ("yes"/"no"/"pass" or null — never any
+                other value), `confidence`, `side_confidence`, `probabilities`
+                (a map over yes/no/pass, or null), `heuristic_score`,
+                `rank_score`, `fallback_reason`.
             `jev_enabled`: whether a usable Jev key was configured this scan.
-            `jev_status`: "ok" (all scored), "degraded" (some fell back),
-                "fallback" (all Jev calls fell back), or "disabled" (no key).
-            `fallback_reasons`: aggregate count of why markets fell back.
+            `jev_status`: "ok" (all scored, or nothing to score), "degraded"
+                (some fell back), "fallback" (all Jev calls fell back), or
+                "disabled" (no key / not usable this scan).
+            `fallback_reasons`: aggregate count of why markets fell back
+                (e.g. no_api_key, credits, rate, rate_cooldown, timeout,
+                deadline, network, http_error, malformed, lowconf).
             `confidence_threshold`: the threshold in force.
             `scanned`/`requests`/`complete`/`stopped_by`/`scan_all`/
                 `scan_limit`: scan coverage, same meaning as

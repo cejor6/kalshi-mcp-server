@@ -51,6 +51,9 @@ def register(server: FastMCP) -> None:
             # draws on a different budget (Kalshi's weekly creation quota, not
             # dollars), so it is surfaced alongside rather than folded in.
             **safety.combo_creation_view(),
+            # Optional read-only Jev scoring tool gate (MCP_ALLOW_JEV_SCORING),
+            # separate from trading — surfaced so operators can see it's live.
+            "jev_scoring_enabled": config.jev_scoring_enabled,
             "rate_limit_headroom": {
                 "read_tokens": round(rate_limiter.read.tokens, 2),
                 "read_capacity": rate_limiter.read.capacity,

@@ -475,9 +475,11 @@ Two gates, both fail safe:
   wrapped in a timeout budget and falls back to that heuristic on **any**
   failure — 402 (out of credits), 429 (rate-limited), other non-2xx, network
   error, timeout, malformed/missing answer, or confidence below the
-  threshold. A 429 trips a short global back-off so a rate-limited upstream
-  isn't hammered. The tool never crashes and never blocks on Jev; the
-  fallback reason is logged once per scan and returned as `fallback_reasons`.
+  threshold. The whole fan-out is also bounded by an aggregate wall-clock
+  budget, so a slow host degrades to the heuristic rather than blocking, and a
+  429 trips a short global back-off so a rate-limited upstream isn't hammered.
+  The tool never crashes; genuine failures are logged once per scan and
+  returned as `fallback_reasons`.
 
 **No new hard dependency:** the Jev call is plain REST over the `httpx` this
 server already ships — there is no `typesafe-sdk` requirement. Only public
@@ -495,9 +497,8 @@ MCP_ALLOW_JEV_SCORING=0            # 1 registers kalshi_score_markets
 TYPESAFE_API_KEY=                  # Jev key; unset => heuristic-only fallback
 MCP_JEV_CONFIDENCE_THRESHOLD=0.6   # below this, a market falls back
 MCP_JEV_MODEL=jev-latest
-MCP_JEV_TIMEOUT_SECONDS=8
-MCP_JEV_MAX_CONCURRENCY=4
-MCP_JEV_RATE_COOLDOWN_SECONDS=60   # global back-off after a 429
+MCP_JEV_TIMEOUT_SECONDS=8          # per-request budget
+MCP_JEV_RATE_COOLDOWN_SECONDS=60   # global back-off after a 429 (capped at 1h)
 # MCP_JEV_BASE_URL=https://api.typesafe.ai/v1/systemone  # override for self-host/tests
 ```
 

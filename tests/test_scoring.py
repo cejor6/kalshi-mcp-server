@@ -10,6 +10,7 @@ right `fallback_reason`. Async per the repo convention (asyncio_mode="auto").
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -21,9 +22,14 @@ from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.tools import scoring
 from kalshi_mcp_server.tools.scoring import (
-    _build_state,
     _EDGE_CRITERIA,
+    _MAX_RATE_COOLDOWN_SECONDS,
+    _MAX_SCORE_LIMIT,
+    _base_url_ok,
+    _build_state,
+    _clean_probabilities,
     _heuristic_score,
+    _JevSettings,
     _reset_rate_cooldown,
     _score_markets,
 )
@@ -398,7 +404,9 @@ def _make_server(rsa_private_key, *, enabled: bool):
     config = _make_config(jev_scoring_enabled=enabled)
     signer = KalshiSigner(key_id="test-key", private_key=rsa_private_key)
     limiter = KalshiRateLimiter(TierLimits.basic())
-    http = httpx.AsyncClient(base_url=config.rest_base, transport=httpx.MockTransport(_kalshi_handler))
+    http = httpx.AsyncClient(
+        base_url=config.rest_base, transport=httpx.MockTransport(_kalshi_handler)
+    )
     client = KalshiClient(config=config, signer=signer, rate_limiter=limiter, http_client=http)
     server = FastMCP(name="kalshi-test")
     server._kalshi_client = client  # type: ignore[attr-defined]
@@ -416,3 +424,217 @@ async def test_tool_not_registered_by_default(rsa_private_key):
 async def test_tool_registered_when_flag_on(rsa_private_key):
     server = _make_server(rsa_private_key, enabled=True)
     assert await server.get_tool("kalshi_score_markets") is not None
+
+
+# ── Untrusted-response hardening (side allowlist, probabilities, non-finite) ───
+
+
+async def test_invalid_side_becomes_none_but_stays_scored(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        # A hostile/garbled host returns an off-menu side.
+        return httpx.Response(200, json=_jev_answer(score=3.0, edge_conf=0.9, choice="buy_now"))
+
+    out = await _run(rsa_private_key, handler)
+    top = out["markets"][0]
+    assert top["jev_scored"] is True
+    assert top["side"] is None  # "buy_now" is not in {yes,no,pass}
+
+
+async def test_probabilities_stripped_of_nonfinite_and_unknown_keys(rsa_private_key):
+    # A real host can emit non-compliant JSON (bare NaN/Infinity); httpx.json()
+    # parses it back to floats. Build the body as raw text so it reproduces that
+    # faithfully — the exact case _clean_probabilities exists to neutralize.
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            '{"answers": {"edge": {"score": 3.0, "confidence": 0.9},'
+            ' "side": {"choice": "yes", "confidence": 0.7,'
+            ' "probabilities": {"yes": NaN, "no": 0.4, "pass": Infinity, "sideways": 0.9}}}}'
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/json"}
+        )
+
+    out = await _run(rsa_private_key, handler)
+    probs = out["markets"][0]["probabilities"]
+    assert probs == {"no": 0.4}
+    # Whole result must be strict-JSON-serializable (no bare NaN/Infinity).
+    json.dumps(out, allow_nan=False)
+
+
+async def test_absent_side_object_still_scored(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"answers": {"edge": {"score": 2.0, "confidence": 0.9}}})
+
+    out = await _run(rsa_private_key, handler)
+    top = out["markets"][0]
+    assert top["jev_scored"] is True
+    assert top["side"] is None
+    assert top["side_confidence"] is None
+    assert top["probabilities"] is None
+
+
+async def test_confidence_equal_to_threshold_is_scored(rsa_private_key):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_jev_answer(score=2.0, edge_conf=0.6))
+
+    # Strict `<` threshold: confidence == threshold counts as scored.
+    out = await _run(rsa_private_key, handler, min_confidence=0.6)
+    assert out["fallback_reasons"] == {}
+    assert all(r["jev_scored"] for r in out["markets"])
+
+
+def test_fallback_rows_carry_side_confidence_none(rsa_private_key):
+    # Uniform schema: side_confidence is present (None) on fallback rows too.
+    row = scoring._fallback_market(_MARKETS[0], "credits")
+    assert row["side_confidence"] is None
+    assert set(
+        scoring._scored_market(
+            _MARKETS[0],
+            {
+                "edge01": 0.5,
+                "edge_confidence": 0.9,
+                "side": "yes",
+                "side_confidence": 0.8,
+                "probabilities": None,
+            },
+        )
+    ) == set(row)  # scored and fallback rows expose the same keys
+
+
+# ── Heuristic robustness ───────────────────────────────────────────────────────
+
+
+def test_heuristic_does_not_crash_on_negative_volume():
+    bad = {**_MARKETS[0], "volume_24h_fp": "-5"}  # malformed upstream payload
+    # Must not raise ValueError from log10(<=0) — the "never crashes" contract.
+    assert _heuristic_score(bad) >= 0.0
+
+
+# ── jev_status honesty with zero candidates ────────────────────────────────────
+
+
+async def test_disabled_with_zero_candidates_reports_disabled(rsa_private_key):
+    def empty_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"markets": [], "cursor": ""})
+
+    client = _make_client(rsa_private_key, empty_handler)
+    out = await _score_markets(
+        client,
+        limit=10,
+        scan_limit=200,
+        status="open",
+        series_ticker=None,
+        min_volume=0.0,
+        scan_all=False,
+        min_confidence=None,
+        jev_transport=None,
+    )
+    assert out["candidates_scored"] == 0
+    assert out["jev_enabled"] is False
+    assert out["jev_status"] == "disabled"  # NOT silently "ok"
+
+
+# ── Runtime limit clamp (paid fan-out budget) ──────────────────────────────────
+
+
+async def test_limit_clamped_to_max_at_runtime(rsa_private_key):
+    # 60-market page + a `.fn` caller passing an over-max limit: only _MAX_SCORE_LIMIT
+    # candidates may be scored, no matter the schema bound.
+    markets = [
+        {**_MARKETS[0], "ticker": f"KX{i:03d}", "volume_24h_fp": str(1000 - i)} for i in range(60)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"markets": markets, "cursor": ""})
+
+    client = _make_client(rsa_private_key, handler)
+    out = await _score_markets(
+        client,
+        limit=10_000,
+        scan_limit=1000,
+        status="open",
+        series_ticker=None,
+        min_volume=0.0,
+        scan_all=False,
+        min_confidence=None,
+        jev_transport=None,
+    )
+    assert out["candidates_scored"] == _MAX_SCORE_LIMIT
+    assert len(out["markets"]) == _MAX_SCORE_LIMIT
+
+
+# ── scan_all forwards scan coverage ────────────────────────────────────────────
+
+
+async def test_scan_all_forwards_completion(rsa_private_key):
+    out = await _run(rsa_private_key, None, api_key=None, scan_all=True)
+    assert out["scan_all"] is True
+    assert out["scan_limit"] is None
+    assert out["complete"] is True
+
+
+# ── Wall-clock deadline and client-error degrade the whole batch ───────────────
+
+
+async def test_wall_clock_deadline_falls_back(rsa_private_key, monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", _API_KEY)
+    monkeypatch.setattr(scoring, "_WALL_CLOCK_SECONDS", 0.05)
+
+    async def slow(jev_client, market, settings):
+        await asyncio.sleep(1.0)  # exceeds the tiny budget
+        return {
+            "edge01": 1.0,
+            "edge_confidence": 1.0,
+            "side": "yes",
+            "side_confidence": 1.0,
+            "probabilities": None,
+        }, None
+
+    monkeypatch.setattr(scoring, "_score_one", slow)
+    out = await _run(rsa_private_key, lambda r: httpx.Response(200, json={}), api_key=None)
+    assert out["fallback_reasons"] == {"deadline": 2}
+    assert all(r["fallback_reason"] == "deadline" for r in out["markets"])
+
+
+async def test_client_error_falls_back(rsa_private_key, monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", _API_KEY)
+
+    async def boom(jev_client, market, settings):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(scoring, "_score_one", boom)
+    out = await _run(rsa_private_key, lambda r: httpx.Response(200, json={}), api_key=None)
+    assert out["fallback_reasons"] == {"client_error": 2}
+    assert all(r["fallback_reason"] == "client_error" for r in out["markets"])
+
+
+# ── Base-URL validation and cooldown cap (unit) ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("https://api.typesafe.ai/v1/systemone", True),
+        ("https://api.typesafe.ai:443/v1", True),
+        ("http://api.typesafe.ai/v1", False),  # not https
+        ("https://user:pass@evil.example/v1", False),  # userinfo -> Basic-Auth replaces Bearer
+        ("https://api.typesafe.ai:8080/v1", False),  # non-default port
+        ("https:///v1", False),  # no host
+        ("not a url", False),
+    ],
+)
+def test_base_url_ok(url, ok):
+    assert _base_url_ok(url) is ok
+
+
+def test_cooldown_is_capped(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", _API_KEY)
+    monkeypatch.setenv("MCP_JEV_RATE_COOLDOWN_SECONDS", "999999999")
+    settings = _JevSettings(min_confidence=None)
+    assert settings.cooldown == _MAX_RATE_COOLDOWN_SECONDS
+
+
+def test_clean_probabilities_none_on_empty():
+    assert _clean_probabilities({"unknown": 1.0}) is None
+    assert _clean_probabilities("not a dict") is None
+    assert _clean_probabilities({"yes": 0.5, "no": "x"}) == {"yes": 0.5}
