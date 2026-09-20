@@ -22,6 +22,7 @@ from kalshi_mcp_server.tools import (
     multivariate,
     orders,
     portfolio,
+    scoring,
 )
 
 
@@ -38,3 +39,4 @@ def register_all_tools(server: FastMCP) -> None:
     orders.register(server)
     live.register(server)
     external_data.register(server)
+    scoring.register(server)

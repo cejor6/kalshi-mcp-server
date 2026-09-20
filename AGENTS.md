@@ -736,10 +736,41 @@ bypassed locally — discipline is the actual safeguard.
 
 - **FIX protocol.** Kalshi supports it for institutional users. This
   server is for the REST + WS surface only.
-- **Trading strategies / signal generation.** This server exposes the
-  Kalshi API. The decision of *what* to trade belongs in a separate
-  program that consumes this MCP. Keeping that separation makes the
-  server trustable and fork-able.
+- **Trading strategies / signal generation — with ONE documented,
+  opt-in exception.** This server exposes the Kalshi API. The decision of
+  *what* to trade belongs in a separate program that consumes this MCP;
+  keeping that separation makes the server trustable and fork-able. The
+  exception is `kalshi_score_markets` (`tools/scoring.py`, added
+  2026-09-20): a read-only, opt-in ranking aid that scores liquid markets
+  by apparent edge via Jev (TypeSafe's fast typed-decision model) so a
+  trading loop can score many markets cheaply and escalate only the top
+  few. It brushes the "no signal generation" line deliberately, and is
+  fenced so a default clone is unaffected:
+  - **Registered only when `MCP_ALLOW_JEV_SCORING=1`** (default off, not
+    advertised to the model when off) — same registration-gate pattern as
+    `kalshi_create_combo_market` / `kalshi_set_safety_limits`.
+  - **It places no orders and commits no money** — it imports nothing from
+    the order/safety write path, and its only Kalshi traffic is the same
+    `GET /markets` scan `kalshi_find_liquid_markets` already does.
+  - **Jev is an enhancement, never a dependency.** Self-gated behind
+    `TYPESAFE_API_KEY`; with no key (or on ANY Jev failure — 402/429/other
+    non-2xx, network, timeout, malformed answer, or sub-threshold
+    confidence) it falls back to a deterministic liquidity/spread heuristic
+    with `jev_scored=false`. Never crashes, never blocks; a 429 trips a
+    short process-global back-off; fallback reasons are logged once per
+    scan. This mirrors the house rule in the `typesafe-ai` skill.
+  - **Why it belongs here** (the same egress argument as
+    `kalshi_fetch_external_data`): the egress-restricted claude.ai
+    cloud-routine environment that consumes this server can't reach
+    `api.typesafe.ai` directly; this server (unrestricted egress, already
+    a connector) can. Decision notes: no `typesafe-sdk` hard dependency
+    (plain REST over the existing `httpx`); only PUBLIC market data enters
+    the Jev `state` (no account data / balances / secrets), and the key is
+    sent only to the configured Jev host over https; the Score `criteria`
+    is an ordered array and the returned `score` is normalized `0..(N-1) →
+    0..1` (verified against the live TypeSafe API contract). Forks that
+    don't want this surface leave the flag off, or delete the module + its
+    registration line — nothing else depends on it.
 - **Non-Kalshi data feeds — with ONE documented exception.** The rule
   stands: this server exposes the Kalshi API, and strategy/signal
   concerns live in the programs that consume it. The exception is
