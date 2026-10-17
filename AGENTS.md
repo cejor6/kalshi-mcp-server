@@ -171,7 +171,16 @@ too. Reservations carry the **UTC day** they were charged to
 day's counter (full daily check — otherwise day 2 could place its cap plus the
 retried order), and `release_order` never credits a previous day's reservation
 to today. A retry also re-runs the per-order caps and the cash floor against
-the limits and balance in force now. A *refused retry* also keeps the reservation —
+the limits and balance in force now — including the daily cap: today's total
+(which already includes the order) must not exceed the cap in force, so an
+operator clamp-down after the first send stops the resend. An order checked
+just before UTC midnight is counted on the day it was checked even if its POST
+lands after midnight — every dollar is still counted against some day's cap.
+The day counter only rolls forward, so a clock stepping back across midnight
+can't reset it. For the cash floor, unknown-outcome orders are tracked in a
+ledger separate from the pending map, kept until the end of the following UTC
+day or until resolved, since one may hold cash after its token expires.
+A *refused retry* also keeps the reservation —
 Kalshi rejects a duplicate `client_order_id` when the first send landed, so a
 4xx there proves nothing. Over-reserving is the acceptable failure here;
 under-reserving is not. The pending map is capped at 100 live entries.

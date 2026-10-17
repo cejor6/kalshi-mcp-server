@@ -27,6 +27,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field
@@ -99,6 +100,12 @@ def _validate_expiration_ts(expiration_ts: Any, *, now: float) -> int | None:
             "a good-till-cancelled order."
         )
     return expiration_ts
+
+
+def _end_of_next_utc_day(now: float) -> float:
+    """Unix time of the UTC midnight that ENDS the day after `now`'s UTC day."""
+    today = datetime.fromtimestamp(now, UTC).date()
+    return datetime.combine(today + timedelta(days=2), datetime.min.time(), UTC).timestamp()
 
 
 def _new_token() -> str:
@@ -197,6 +204,13 @@ def register(server: FastMCP) -> None:
     # server.
     pending: dict[str, _PendingOrder] = {}
     confirm_lock = asyncio.Lock()
+    # Reserved cost of every order whose send outcome is UNKNOWN, keyed by
+    # confirmation_id → (cost_usd, drop_after_unix). Deliberately separate
+    # from `pending`: a pending entry expires after its TTL, but an ambiguous
+    # order may land (and hold cash) after that, so the cash-reserve check
+    # keeps subtracting it until the end of the following UTC day, or until
+    # the order is resolved (success, or a refused retry) — whichever is first.
+    ambiguous_ledger: dict[str, tuple[float, float]] = {}
 
     @server.tool
     async def kalshi_prepare_order(
@@ -490,6 +504,10 @@ def register(server: FastMCP) -> None:
                 _mark_ambiguous(confirmation_id, prepared)  # still unknown; refresh TTL
                 raise
             pending.pop(confirmation_id, None)
+            # Kalshi has now answered for this client_order_id, so the first
+            # send is settled either way — and if it landed, the balance shows
+            # it. Stop subtracting it separately.
+            ambiguous_ledger.pop(confirmation_id, None)
             raise KalshiAPIError(
                 status=exc.status,
                 message=(
@@ -509,6 +527,7 @@ def register(server: FastMCP) -> None:
 
         # Accepted. The reservation becomes the committed spend.
         pending.pop(confirmation_id, None)
+        ambiguous_ledger.pop(confirmation_id, None)
         return response
 
     def _release(prepared: _PendingOrder) -> None:
@@ -517,15 +536,21 @@ def register(server: FastMCP) -> None:
             prepared.reservation = None
 
     def _outstanding_ambiguous_usd(confirmation_id: str) -> float:
-        """Reserved cost of OTHER pending orders whose send outcome is unknown."""
+        """Reserved cost of OTHER orders whose send outcome is unknown."""
+        now = time.time()
+        for token in [t for t, (_, drop_after) in ambiguous_ledger.items() if drop_after < now]:
+            del ambiguous_ledger[token]
         return sum(
-            p.reservation.cost_usd
-            for token, p in pending.items()
-            if token != confirmation_id and p.possibly_sent and p.reservation is not None
+            cost for token, (cost, _) in ambiguous_ledger.items() if token != confirmation_id
         )
 
     def _mark_ambiguous(confirmation_id: str, prepared: _PendingOrder) -> None:
         prepared.possibly_sent = True
+        if prepared.reservation is not None:
+            ambiguous_ledger[confirmation_id] = (
+                prepared.reservation.cost_usd,
+                _end_of_next_utc_day(time.time()),
+            )
         # Give the agent a full TTL to retry with the SAME idempotency key, and
         # re-insert in case a concurrent prepare's GC dropped it mid-POST.
         prepared.expires_at = max(prepared.expires_at, time.time() + _PENDING_TTL_S)

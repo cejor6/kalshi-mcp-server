@@ -805,3 +805,114 @@ async def test_first_send_408_425_are_ambiguous(rsa_private_key, status):
     assert _spent(server) == pytest.approx(_ORDER_COST)  # kept, not released
     await confirm(confirmation_id=token)  # token still valid
     assert _spent(server) == pytest.approx(_ORDER_COST)
+
+
+# ── second review: tightened daily cap on retry, clock skew, ambiguous ledger ─
+
+
+async def test_retry_refused_after_daily_cap_is_tightened(rsa_private_key):
+    """A same-day retry skipped the daily check entirely, so a clamp-down
+    after the first (ambiguous, never-placed) send didn't stop the resend."""
+    kalshi = _Kalshi()
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, daily_limit_usd=100.0)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token)
+    await server._kalshi_safety.set_limits(daily_limit_usd=10.0)  # type: ignore[attr-defined]
+
+    for _ in range(2):  # refusal sends nothing and keeps the confirmation_id
+        with pytest.raises(SafetyError, match="exceeds the active daily limit") as exc:
+            await confirm(confirmation_id=token)
+        assert "UNKNOWN" in str(exc.value)
+    assert len(kalshi.posts) == 1
+    assert _spent(server) == pytest.approx(_ORDER_COST)  # not double-counted
+
+
+async def test_same_day_retry_within_cap_does_not_double_count(rsa_private_key):
+    """The retry's daily check includes the order once: $20.80 under a $25
+    cap must still resend (counting it twice would refuse at $41.60)."""
+    kalshi = _Kalshi()
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, daily_limit_usd=25.0)
+    prepare, confirm = await _tools(server)
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token)
+    await confirm(confirmation_id=token)
+    assert len(kalshi.posts) == 2
+
+
+def test_clock_stepping_back_across_midnight_does_not_reset_the_counter(clock):
+    ctrl = SafetyController(_config(daily_limit_usd=25.0))
+    clock.when = datetime(2026, 10, 18, 0, 0, 1, tzinfo=UTC)
+    ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
+
+    clock.when = datetime(2026, 10, 17, 23, 59, 59, tzinfo=UTC)  # NTP step back
+    assert ctrl._daily.peek() == ("2026-10-18", pytest.approx(_ORDER_COST))
+    with pytest.raises(SafetyError, match="daily limit"):
+        ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
+
+    clock.when = datetime(2026, 10, 19, 0, 0, 1, tzinfo=UTC)  # forward still rolls
+    assert ctrl._daily.peek() == ("2026-10-19", 0.0)
+
+
+async def test_ambiguous_cost_outlives_the_pending_ttl_for_the_cash_check(
+    rsa_private_key, monkeypatch
+):
+    """A's token expires after 5 minutes, but A may still land and hold cash.
+    The cash check keeps subtracting it until the end of the next UTC day."""
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token_a = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token_a)
+
+    real_now = time.time()
+    monkeypatch.setattr(orders.time, "time", lambda: real_now + orders._PENDING_TTL_S + 60)
+    with pytest.raises(SafetyError, match="Unknown or expired"):
+        await confirm(confirmation_id=token_a)  # A's token is gone ...
+    token_b = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(SafetyError, match="reserve floor"):
+        await confirm(confirmation_id=token_b)  # ... but $50 - 20.80 - 20.80 < $10
+
+    # After the end of the following UTC day the ledger entry is dropped.
+    monkeypatch.setattr(orders.time, "time", lambda: real_now + 3 * 86_400)
+    await confirm(confirmation_id=(await prepare(**_ORDER))["confirmation_id"])
+    assert len(kalshi.posts) == 2
+
+
+async def test_resolved_ambiguous_order_leaves_the_ledger(rsa_private_key):
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token_a = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token_a)
+    await confirm(confirmation_id=token_a)  # resolved: placed
+
+    # The (fake) balance didn't move, so B passes only if A is no longer
+    # subtracted separately: $50 - $20.80 = $29.20 >= $10.
+    await confirm(confirmation_id=(await prepare(**_ORDER))["confirmation_id"])
+    assert len(kalshi.posts) == 3
+
+
+async def test_refused_retry_resolves_the_ledger_entry(rsa_private_key):
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow"), 409]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token_a = (await prepare(**_ORDER))["confirmation_id"]
+    for _ in range(2):
+        with pytest.raises(KalshiAPIError):
+            await confirm(confirmation_id=token_a)
+    await confirm(confirmation_id=(await prepare(**_ORDER))["confirmation_id"])
+    assert len(kalshi.posts) == 3

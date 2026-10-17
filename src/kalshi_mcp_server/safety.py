@@ -197,8 +197,12 @@ class _DailyCounter:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def _maybe_roll(self) -> None:
+        # Roll FORWARD only. ISO dates compare correctly as strings, and "" (the
+        # initial value) sorts before any date. A wall clock stepping backwards
+        # across midnight (NTP correction, VM resume) must not zero the counter
+        # and hand out a second day's budget — we just stay on the later day.
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        if today != self.day:
+        if today > self.day:
             self.day = today
             self.cost_usd = 0.0
 
@@ -644,17 +648,30 @@ class SafetyController:
         """Checks for RESENDING an order whose cost is already reserved TODAY.
 
         Used when retrying a confirm whose earlier attempt had an ambiguous
-        outcome. The daily check is skipped (today's counter already carries
-        this order — the caller must re-reserve via `reserve_order` if the
-        reservation is from an earlier UTC day). Everything else runs against
-        the limits in force now, INCLUDING the cash floor: the balance may have
-        dropped since the first attempt, and resending must not breach it. If
-        the first send did land, the balance already reflects it and the floor
-        check counts it twice — over-strict, the safe direction.
+        outcome. Today's counter already carries this order (the caller must
+        re-reserve via `reserve_order` if the reservation is from an earlier
+        UTC day), so the daily check is "today's total, which INCLUDES this
+        order, must not exceed the daily limit in force NOW" — no double count,
+        but an operator who tightened the daily cap since the first send still
+        stops the resend. Everything else runs against the limits in force now,
+        INCLUDING the cash floor: the balance may have dropped since the first
+        attempt. If the first send did land, the balance already reflects it
+        and the floor check counts it twice — over-strict, the safe direction.
         """
-        limits = self.effective_limits()
-        self._require_cash_if_reserve(limits, current_cash_usd)
-        self._check_order(intent, limits, current_cash_usd=current_cash_usd, include_daily=False)
+        with self._order_lock:
+            limits = self.effective_limits()
+            self._require_cash_if_reserve(limits, current_cash_usd)
+            self._check_order(
+                intent, limits, current_cash_usd=current_cash_usd, include_daily=False
+            )
+            _, today_so_far = self._daily.peek()
+            if today_so_far > limits.daily_limit_usd:
+                raise SafetyError(
+                    f"Today's committed cost ${today_so_far:.2f} (which already "
+                    f"includes this order) exceeds the active daily limit "
+                    f"(${limits.daily_limit_usd:.2f}), so it will not be resent. "
+                    f"Resets at UTC midnight."
+                )
 
     @staticmethod
     def _require_cash_if_reserve(limits: SafetyLimits, current_cash_usd: float | None) -> None:
