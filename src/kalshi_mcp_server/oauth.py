@@ -369,7 +369,14 @@ def build_auth_provider(*, strict: bool = True) -> tuple[GitHubProvider | None, 
             "to enable the GitHub OAuth proxy, or none of them."
         )
         if not strict:
-            logger.warning("%s Ignored: OAuth is not used on this transport.", detail)
+            # Count only, no var names: CodeQL's sensitive-name heuristic
+            # treats the literal "GITHUB_CLIENT_SECRET" as secret data.
+            logger.warning(
+                "Partial OAuth configuration (%d of %d GitHub OAuth vars set). "
+                "Ignored: OAuth is not used on this transport.",
+                len(present),
+                len(OAUTH_CORE_ENV_VARS),
+            )
             return None, ""
         raise ConfigError(
             f"{detail} Refusing to start rather than silently running without authentication."
