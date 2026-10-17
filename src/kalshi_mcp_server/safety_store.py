@@ -17,7 +17,8 @@ a restart.
 
 The store only ever holds a *sparse* override map (the fields that differ
 from the env ceiling), serialized as a small JSON object under a single
-namespaced key. `safety.py` re-clamps whatever it reads back to the current
+key namespaced by `MCP_REDIS_COLLECTION_PREFIX` (see `_limits_key`).
+`safety.py` re-clamps whatever it reads back to the current
 env ceiling on load, so the env vars remain the absolute trust anchor — a
 value in Redis can only ever tighten a limit, never loosen one.
 """
@@ -28,23 +29,47 @@ import json
 import logging
 import os
 
+from kalshi_mcp_server.redis_client import (
+    DEFAULT_REDIS_COLLECTION_PREFIX,
+    build_redis_client,
+    collection_prefix,
+    validate_redis_url,
+)
 from kalshi_mcp_server.safety import InMemoryLimitsStore, LimitsStore
 
 logger = logging.getLogger(__name__)
 
-# Single key holding the JSON override map. The `kalshi-mcp:` prefix keeps it
-# clear of the OAuth proxy's collections (now `<prefix>__mcp-*`, see
-# `oauth.py`) and of other apps on a shared Redis.
+# Key holding the JSON override map. The `kalshi-mcp:` prefix keeps it clear
+# of the OAuth proxy's collections (`<prefix>__mcp-*`, see `oauth.py`) and of
+# other apps on a shared Redis.
 #
-# Note this key is NOT per-deployment: unlike the OAuth collections there is
-# no configurable namespace, so two kalshi deployments pointed at one Redis DB
-# share a single override record and a runtime clamp on either is what both
-# load at boot. Loading always re-clamps against the *current* env ceilings
-# (`safety.py`), so a stale value can only ever tighten, never loosen — but if
-# you run two deployments with different risk envelopes, give them separate
-# Redis databases. Changing this key would silently drop any active override
-# back to the env ceilings, i.e. loosen limits — don't do it casually.
-_REDIS_KEY = "kalshi-mcp:safety-limits"
+# The key is namespaced by `MCP_REDIS_COLLECTION_PREFIX` — the same knob that
+# separates the OAuth collections — so two deployments sharing one Redis (a
+# demo and a prod service, say) no longer share one override record:
+#
+#   default prefix (`kalshi`)  -> `kalshi-mcp:safety-limits`   (legacy name)
+#   any other prefix `<p>`     -> `kalshi-mcp:<p>:safety-limits`
+#
+# The default prefix deliberately keeps the LEGACY key name. Before
+# namespacing, every deployment used `kalshi-mcp:safety-limits`; renaming it
+# for the default would silently drop every active override back to the env
+# ceilings on upgrade — a lost tightening IS a loosening. For a non-default
+# prefix, `load` falls back to the legacy key while the namespaced key has
+# never been written, so a clamp persisted before upgrade still applies. That
+# fallback can only tighten (everything loaded is re-clamped to the env
+# ceilings in `safety.py`), and it ends the first time this deployment saves
+# or resets its limits — `clear` writes an empty `{}` record rather than
+# deleting, precisely so a reset isn't undone by the fallback on next boot.
+# The legacy key itself is never written or deleted from a namespaced store:
+# with a default-prefix deployment on the same Redis, it's that deployment's
+# live record.
+_LEGACY_REDIS_KEY = "kalshi-mcp:safety-limits"
+
+
+def _limits_key(prefix: str) -> str:
+    if prefix == DEFAULT_REDIS_COLLECTION_PREFIX:
+        return _LEGACY_REDIS_KEY
+    return f"kalshi-mcp:{prefix}:safety-limits"
 
 
 class RedisLimitsStore:
@@ -58,13 +83,28 @@ class RedisLimitsStore:
 
     durable = True
 
-    def __init__(self, client: object) -> None:
+    def __init__(self, client: object, prefix: str = DEFAULT_REDIS_COLLECTION_PREFIX) -> None:
         # `client` is a `redis.asyncio.Redis`; typed loosely so this module
         # imports without the optional dependency present.
         self._client = client
+        self.key = _limits_key(prefix)
+        # Read-only fallback for overrides persisted before keys were
+        # namespaced. None when this store already uses the legacy key.
+        self._legacy_key = None if self.key == _LEGACY_REDIS_KEY else _LEGACY_REDIS_KEY
 
     async def load(self) -> dict[str, float] | None:
-        raw = await self._client.get(_REDIS_KEY)  # type: ignore[attr-defined]
+        raw = await self._client.get(self.key)  # type: ignore[attr-defined]
+        if raw is None and self._legacy_key is not None:
+            # Never written under the namespaced key: honor a clamp persisted
+            # before upgrade. Tighten-only — `safety.py` re-clamps on load.
+            raw = await self._client.get(self._legacy_key)  # type: ignore[attr-defined]
+            if raw:
+                logger.info(
+                    "No safety-limit record under %s yet; applying the legacy "
+                    "%s record (tighten-only) until this deployment saves its own.",
+                    self.key,
+                    self._legacy_key,
+                )
         if not raw:
             return None
         try:
@@ -78,10 +118,16 @@ class RedisLimitsStore:
         return data
 
     async def save(self, overrides: dict[str, float]) -> None:
-        await self._client.set(_REDIS_KEY, json.dumps(overrides))  # type: ignore[attr-defined]
+        await self._client.set(self.key, json.dumps(overrides))  # type: ignore[attr-defined]
 
     async def clear(self) -> None:
-        await self._client.delete(_REDIS_KEY)  # type: ignore[attr-defined]
+        if self._legacy_key is None:
+            await self._client.delete(self.key)  # type: ignore[attr-defined]
+        else:
+            # An explicit empty record, not a delete: a missing key would
+            # re-enable the legacy fallback in `load` on the next boot and
+            # resurrect a clamp the operator just reset.
+            await self._client.set(self.key, "{}")  # type: ignore[attr-defined]
 
 
 def build_limits_store() -> tuple[LimitsStore, str]:
@@ -91,11 +137,17 @@ def build_limits_store() -> tuple[LimitsStore, str]:
     restarts). Without it — and on every stdio client — returns the in-memory
     store (overrides reset to the env ceilings on restart).
 
-    Mirrors `oauth.py:_build_client_storage`: uses `redis.asyncio.Redis.from_url`
-    with `decode_responses=True` so `rediss://` TLS (e.g. Upstash) works and
-    GET returns `str`. The connection is lazy — an unreachable Redis does not
-    fail here; it surfaces at load/save time, where the caller degrades to the
-    env ceilings (boot) or reports the change as not-durably-persisted (set).
+    Builds its client with `redis_client.build_redis_client` — the same
+    hardened client the OAuth store uses (health check, bounded timeouts,
+    jittered retry, `decode_responses=True`) — and namespaces its key with
+    `MCP_REDIS_COLLECTION_PREFIX` (see `_limits_key`). The connection is
+    lazy — an unreachable Redis does not fail here; it surfaces at load/save
+    time, where the caller degrades to the env ceilings (boot) or reports the
+    change as not-durably-persisted (set).
+
+    Raises `ConfigError` for a cleartext `redis://` URL to a non-loopback
+    host unless `MCP_ALLOW_PLAINTEXT_REDIS=1` (`redis_client.validate_redis_url`)
+    — checked before the extras probe, so the policy holds either way.
 
     The returned description is logged at startup so the chosen backend is
     visible in the host's log stream.
@@ -104,9 +156,11 @@ def build_limits_store() -> tuple[LimitsStore, str]:
     if not url:
         return InMemoryLimitsStore(), "in-memory (resets to env ceilings on restart)"
 
+    validate_redis_url(url)
+
     # Lazy import: the base install doesn't ship redis (it's in [oauth]).
     try:
-        from redis.asyncio import Redis
+        client = build_redis_client(url)
     except ImportError:
         logger.warning(
             "MCP_REDIS_URL is set but the [oauth] extras (redis) aren't "
@@ -116,5 +170,5 @@ def build_limits_store() -> tuple[LimitsStore, str]:
         )
         return InMemoryLimitsStore(), "in-memory (redis extra missing; no persistence)"
 
-    client = Redis.from_url(url, decode_responses=True)
-    return RedisLimitsStore(client), "redis (persistent)"
+    store = RedisLimitsStore(client, prefix=collection_prefix())
+    return store, f"redis (persistent, key {store.key})"

@@ -160,6 +160,12 @@ ceiling** — so a stale/corrupt stored value can only ever tighten, never
 loosen, and raising an env ceiling takes effect for any field not actively
 tightened; (2) the in-memory update always succeeds even if the store
 write fails (the emergency clamp-down is never blocked by a Redis blip).
+The key is namespaced by `MCP_REDIS_COLLECTION_PREFIX`, except that the
+default prefix keeps the legacy name `kalshi-mcp:safety-limits` — renaming
+it would drop every live clamp on upgrade, and a lost tightening is a
+loosening. A non-default prefix reads the legacy key as a tighten-only
+fallback until it writes its own record; `clear` writes `{}` (not a delete)
+there so a reset isn't resurrected by that fallback. Don't "simplify" either.
 Caveat: persistence is single-replica-coherent (write-through + load-on-
 boot); if you scale past one instance, a mid-life change won't reach other
 replicas until they restart.
@@ -232,13 +238,23 @@ safety controls reduce blast radius but don't eliminate it.
 - `MCP_REDIS_URL` — persistent DCR client storage (optional; in-memory
   if unset, requires reconnect after each redeploy)
 - `MCP_REDIS_COLLECTION_PREFIX` — collection namespace for this
-  deployment (default `kalshi`). Give every server sharing a Redis DB a
-  distinct value; changing it is a keyspace move, so treat it like a key
-  rotation
+  deployment (default `kalshi`), also applied to the safety-limit override
+  key. Give every server sharing a Redis DB a distinct value; changing it
+  is a keyspace move, so treat it like a key rotation
+- `MCP_ALLOW_PLAINTEXT_REDIS` — `MCP_REDIS_URL` must be `rediss://` (or
+  `redis://` to loopback, or `unix://`); any other cleartext URL is a
+  startup `ConfigError` unless this is `1`. It exists for private-network
+  Redis (Render Key Value's internal URL), not for the internet.
 
 Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
 itself is the operator.
+
+**Both Redis consumers share `redis_client.py`.** `build_redis_client`
+(resilience kwargs below), `validate_redis_url` (scheme policy) and
+`collection_prefix` are used by the OAuth store *and* `safety_store.py`. The
+safety store used to call bare `Redis.from_url` and so ran without any of the
+settings below; don't give either consumer its own client again.
 
 **The session-token expiry (`kalshi_get_environment`, issue #80) comes from the
 raw incoming bearer JWT — NOT from `get_access_token()`.** Under `GitHubProvider`
