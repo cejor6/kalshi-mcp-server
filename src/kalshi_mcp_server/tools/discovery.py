@@ -592,7 +592,9 @@ def _finalize_series(
 # (404 / empty book / empty list); without this, an agent polling a real but
 # illiquid market's orderbook would fire a fresh `/events` lookup on EVERY
 # poll. Caching the "not an event" verdict bounds that to one probe per ticker
-# per TTL. A confirmed event clears its entry so a later miss re-probes.
+# per TTL. A confirmed event clears its entry so a later miss re-probes. Only
+# definitive answers are cached (a 404, or an event with no markets) — never a
+# transient failure.
 _EVENT_HINT_MISS_TTL_S: float = 300.0
 _EVENT_HINT_MISS_MAX: int = 4096
 _event_hint_misses: dict[str, float] = {}
@@ -638,8 +640,13 @@ async def _event_hint(client: Any, ticker: str) -> str | None:
         return None
     try:
         body = await client.get(f"/events/{ticker}", params={"with_nested_markets": "true"})
-    except KalshiAPIError:
-        _record_event_hint_miss(ticker, now)
+    except KalshiAPIError as exc:
+        # Only a DEFINITIVE "no such event" (404) is cached. A transient failure
+        # — local/remote rate limit (429), 5xx, timeout/transport (status 0) —
+        # says nothing about the ticker, and caching it would suppress a real
+        # event hint for the whole TTL. Fail open either way.
+        if exc.status == 404:
+            _record_event_hint_miss(ticker, now)
         return None
     markets = (body.get("markets") or []) if isinstance(body, dict) else []
     tickers = [m.get("ticker") for m in markets if isinstance(m, dict) and m.get("ticker")]

@@ -534,7 +534,10 @@ tools encode these; don't regress them.
   ticker is expected fails silently (404, empty book, empty list). The
   tools call `_event_hint` on the failed path to raise an actionable error
   naming the real market tickers. `_event_hint` must **fail open** (return
-  None on any error) so it never masks the caller's original problem.
+  None on any error) so it never masks the caller's original problem. Its
+  negative cache stores only DEFINITIVE answers (a 404, or an event with no
+  markets) — never a 429 / 5xx / timeout, which would suppress a real hint for
+  the whole TTL.
 - **Orderbook levels ascend by price, and BOTH sides are bids.** The best
   level is the LAST element, not the first. `GET /markets/orderbooks` (the
   batch endpoint, up to 100 tickers) has **no `depth` parameter** — unlike
