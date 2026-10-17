@@ -668,3 +668,58 @@ async def test_fetch_raw_identity_stream_is_capped():
     )
     assert result["truncated"] is True
     assert result["bytes_returned"] == 3_000
+
+
+# --- bounded reader: end-of-stream, cut-off streams, raw deflate -----------
+
+
+async def _read(parts: list[bytes], encoding: str | None, cap: int = 1_000):
+    from kalshi_mcp_server.tools._bounded_read import read_capped
+
+    class _Parts(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for part in parts:
+                yield part
+
+    headers = {"content-encoding": encoding} if encoding else {}
+    return await read_capped(httpx.Response(200, stream=_Parts(), headers=headers), cap)
+
+
+async def test_bounded_read_stops_at_gzip_end_and_never_buffers_trailing_bytes():
+    """After the compressed stream ends, further bytes must not be fed to the
+    finished decoder — zlib would park every one of them in `unused_data`
+    (unbounded). Reading stops, and the extra bytes mark the body truncated."""
+    trailing = [b"\x00" * 65_536] * 160  # ~10MB after a complete gzip member
+    tracemalloc.start()
+    try:
+        body, truncated = await _read([gzip.compress(b"ok"), *trailing], "gzip")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert body == b"ok"
+    assert truncated is True
+    assert peak < 1_000_000, peak
+
+
+async def test_bounded_read_complete_gzip_is_not_truncated():
+    assert await _read([gzip.compress(b"ok")], "gzip") == (b"ok", False)
+    # Exactly at the cap is complete, one byte over is truncated.
+    assert await _read([gzip.compress(b"a" * 1_000)], "gzip") == (b"a" * 1_000, False)
+    assert await _read([gzip.compress(b"a" * 1_001)], "gzip") == (b"a" * 1_000, True)
+
+
+async def test_bounded_read_cut_off_gzip_stream_is_truncated():
+    whole = gzip.compress(b"hello world" * 10)
+    body, truncated = await _read([whole[:-8]], "gzip")  # drop the gzip trailer
+    assert truncated is True
+    assert body == (b"hello world" * 10)[: len(body)]
+
+
+async def test_bounded_read_deflate_accepts_zlib_wrapped_and_raw():
+    import zlib
+
+    assert await _read([zlib.compress(b"wrapped")], "deflate") == (b"wrapped", False)
+    raw = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    headerless = raw.compress(b"raw deflate") + raw.flush()
+    # Split so the bad zlib header is only detectable across chunks.
+    assert await _read([headerless[:1], headerless[1:]], "deflate") == (b"raw deflate", False)

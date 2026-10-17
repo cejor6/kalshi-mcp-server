@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import tracemalloc
 
 import httpx
 import pytest
@@ -412,8 +413,15 @@ async def test_gzip_bomb_from_jev_falls_back_without_inflating(rsa_private_key):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=_RawStream(bomb), headers={"content-encoding": "gzip"})
 
-    out = await _run(rsa_private_key, handler)
+    tracemalloc.start()
+    try:
+        out = await _run(rsa_private_key, handler)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
     assert out["fallback_reasons"] == {"oversize": 2}
+    # Inflating even one 4KB wire chunk whole would be ~4MB.
+    assert peak < 3_000_000, peak
 
 
 async def test_streamed_valid_answer_still_scores(rsa_private_key):
