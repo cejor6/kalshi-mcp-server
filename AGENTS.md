@@ -589,8 +589,14 @@ tools encode these; don't regress them.
   — bounds worst-case payload size for `KXMVE…` combo markets, whose bulk
   lives outside the blacklist (`custom_strike`, `mve_selected_legs`, long
   `*_sub_title`s). Prefer `minimal` for listing/scanning. The same
-  projection applies to nested markets on the event tools. Precedence:
-  `fields` > `minimal` > `compact` > full.
+  projection applies to nested markets on the event tools, and
+  `kalshi_get_event` defaults `compact=True` because it nests markets by
+  default. NOT `minimal`: the whitelist drops `floor_strike` / `cap_strike` /
+  `strike_type` / `result`, which consumers read off bucket markets, so it
+  stays opt-in there. Precedence:
+  `fields` > `minimal` > `compact` > full. `fields` is validated once, up
+  front (`_validate_fields`): a blank whitelist raises before any request in
+  every tool — never silently ignored, never after a scan.
 - **Combos dominate the default listing.** A bare `status=open` page is
   mostly multivariate combos with empty/one-sided books. Kalshi has **no
   server-side sort**, but it does have `mve_filter` (`exclude`/`only`).
@@ -604,7 +610,10 @@ tools encode these; don't regress them.
   ticker is expected fails silently (404, empty book, empty list). The
   tools call `_event_hint` on the failed path to raise an actionable error
   naming the real market tickers. `_event_hint` must **fail open** (return
-  None on any error) so it never masks the caller's original problem.
+  None on any error) so it never masks the caller's original problem. Its
+  negative cache stores only DEFINITIVE answers (a 404, or an event with no
+  markets) — never a 429 / 5xx / timeout, which would suppress a real hint for
+  the whole TTL.
 - **Orderbook levels ascend by price, and BOTH sides are bids.** The best
   level is the LAST element, not the first. `GET /markets/orderbooks` (the
   batch endpoint, up to 100 tickers) has **no `depth` parameter** — unlike
@@ -641,7 +650,14 @@ tools encode these; don't regress them.
   50 is *legal* and silently means the 0.5th percentile — a wrong answer, not
   an error — which is why the docstring leads with the scale and the validator
   only enforces the hard bounds. `period_interval=0` (5-second bars) is legal
-  on that endpoint and ONLY that one.
+  on that endpoint and ONLY that one. The window SIZE is not enforced
+  locally: Kalshi documents no period cap for this endpoint, and a guessed
+  hard cap could refuse requests Kalshi accepts. Instead
+  `_LIKELY_MAX_FORECAST_PERIODS` (5000, ASSUMED from the candlestick cap;
+  `ceil`, 0 counted as 5s — a week at 0 is ~121k) only steers the diagnosis:
+  an OPAQUE 400 ("bad request") on a window above it says "window likely too
+  large" plus how to shrink it, otherwise the "may not publish forecasts"
+  hint. A 400 with a specific Kalshi message passes through untouched.
 - **`custom_strike`'s three columns are PARALLEL ARRAYS — index is the only
   thing linking them.** Two different ways of destroying that have already
   shipped here, both caught in review, so use `_split_csv_positional` and
@@ -832,8 +848,12 @@ bypassed locally — discipline is the actual safeguard.
     non-2xx, network, timeout, malformed answer, or sub-threshold
     confidence) it falls back to a deterministic liquidity/spread heuristic
     with `jev_scored=false`. The whole fan-out is also wall-clock-bounded
-    (degrade, don't block); a 429 trips a short process-global back-off
-    (capped so a bad env can't disable Jev ~forever); genuine failures are
+    (degrade, don't block); a 429 immediately short-circuits the rest of
+    the batch (queued calls fall back unsent) and trips a short
+    process-global back-off (capped so a bad env can't disable Jev
+    ~forever); Jev bodies are read with `Accept-Encoding: identity` and a
+    64KB cap before parsing (`tools/_bounded_read.py`), so an oversize or
+    compressed-bomb response degrades to `oversize`; genuine failures are
     logged once per scan.
   - **Why it's here rather than in the consumer** (a weaker version of the
     `kalshi_fetch_external_data` egress argument): the egress-restricted
@@ -870,7 +890,17 @@ bypassed locally — discipline is the actual safeguard.
   either way, and N typed tools would 5× the surface to review); no
   wildcard content hosts are allowlisted (a raw.githubusercontent.com
   entry was removed in review); fetched bodies are delimiter-wrapped
-  UNTRUSTED data; DNS rebinding is an accepted, documented residual.
+  UNTRUSTED data, with a fresh random nonce in both markers per call (the
+  primary defence — don't go back to fixed marker strings) plus in-body
+  neutralization as depth: on an NFKC, format-char-stripped view, any
+  `untrusted…external…data` with non-alphanumeric separators and any 3+ run
+  of `<`/`>` is rewritten in the original text (`_neutralize_markers`; it
+  does not cover cross-script homoglyphs — keep the docstring/README claims
+  exactly in sync with what it does); the size cap
+  applies to DECODED bytes via `Accept-Encoding: identity` plus the bounded
+  reader in `tools/_bounded_read.py` (httpx's default gzip decoding inflates a
+  whole chunk before any cap); the 45s wall clock also covers the wait for a
+  concurrency slot; DNS rebinding is an accepted, documented residual.
   Forks that don't want this surface can delete the module + its
   registration line — nothing else depends on it.
 - **Multi-user tenant isolation.** The server's identity is the

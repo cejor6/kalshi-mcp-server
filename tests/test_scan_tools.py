@@ -642,6 +642,137 @@ async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
     assert "does not publish" not in exc.value.message
 
 
+_OVERSIZED_WINDOWS = [
+    (0, 7 * 86_400),  # a week of 5-SECOND bars: ~121k periods
+    (0, 5_000 * 5 + 1),  # one second over 5000 periods at 5s (ceil -> 5001)
+    (1, 5_000 * 60 + 1),  # one second over at 1m
+    (60, 5_001 * 3_600),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_interval", "span_s"), _OVERSIZED_WINDOWS)
+async def test_forecast_history_sends_oversized_window_to_kalshi(
+    rsa_private_key, period_interval, span_s
+):
+    """The 5000-period figure is ASSUMED for this endpoint, so it is not a
+    local rejection — a large window still goes out, and succeeds if Kalshi
+    accepts it."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"forecast_history": []})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+    out = await fn(
+        event_ticker="KXHIGHNY-26AUG14",
+        series_ticker="KXHIGHNY",
+        start_ts=1_000_000,
+        end_ts=1_000_000 + span_s,
+        period_interval=period_interval,
+    )
+    assert out == {"forecast_history": []}
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_interval", "span_s"), _OVERSIZED_WINDOWS)
+async def test_forecast_history_opaque_400_on_oversized_window_blames_the_window(
+    rsa_private_key, period_interval, span_s
+):
+    """An oversized window's opaque 400 used to be misdiagnosed as 'no forecast
+    data'. It must now say the window is likely too large and how to shrink it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_000_000 + span_s,
+            period_interval=period_interval,
+        )
+    msg = exc.value.message
+    assert exc.value.status == 400
+    assert "likely too large" in msg
+    assert "larger period_interval" in msg
+    assert "does not publish" not in msg
+    assert "bad request" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_interval", "span_s"), [(0, 5_000 * 5), (1, 5_000 * 60)])
+async def test_forecast_history_opaque_400_within_5000_periods_keeps_no_data_hint(
+    rsa_private_key, period_interval, span_s
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_000_000 + span_s,
+            period_interval=period_interval,
+        )
+    assert "does not publish percentile-forecast data" in exc.value.message
+    assert "likely too large" not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_passes_through_a_specific_400(rsa_private_key):
+    """A 400 that SAYS what's wrong must not be rewritten into the
+    'doesn't publish forecasts' guess — Kalshi's own message is better."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"code": "invalid_parameters", "message": "percentiles invalid"}}
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert exc.value.status == 400
+    assert exc.value.message == "percentiles invalid"
+    assert "does not publish" not in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opaque", ["bad request", "Bad Request.", "bad_request", ""])
+async def test_forecast_history_reshapes_every_opaque_400_spelling(rsa_private_key, opaque):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = {"error": {"message": opaque}} if opaque else {}
+        return httpx.Response(400, json=body)
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert "does not publish percentile-forecast data" in exc.value.message
+
+
 # ── read-path ticker injection (security hardening) ────────────────────────
 
 
@@ -753,3 +884,103 @@ async def test_find_liquid_markets_fields_applies_under_scan_all(rsa_private_key
     assert out["markets"]
     for m in out["markets"]:
         assert set(m) == {"ticker"}
+
+
+# ── blank `fields` is rejected up front, consistently ──────────────────────
+
+
+_BLANK_FIELDS = ["", "   ", ",", " , ,"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", _BLANK_FIELDS)
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        ("kalshi_get_markets", {}),
+        ("kalshi_find_liquid_markets", {}),
+        ("kalshi_find_liquid_markets", {"scan_all": True}),
+        ("kalshi_get_market", {"ticker": "KXFED-26MAR19-B5.25"}),
+        ("kalshi_get_event", {"event_ticker": "KXFED-26MAR19"}),
+        ("kalshi_get_events", {"with_nested_markets": True}),
+    ],
+)
+async def test_blank_fields_rejected_before_any_request(rsa_private_key, tool_name, kwargs, blank):
+    """A blank whitelist is a malformed request. It used to be silently ignored
+    by kalshi_get_markets (`""` fell through to the default view) and raised by
+    kalshi_find_liquid_markets only AFTER the whole scan — now every tool
+    rejects it before the wire."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"markets": [{"ticker": "KX-A"}], "cursor": ""})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, tool_name)
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(fields=blank, **kwargs)
+    assert "`fields` must list at least one field name" in exc.value.message
+    assert calls == []
+
+
+# ── kalshi_get_event: nested markets compacted by default ──────────────────
+
+
+def _event_handler(calls: list[httpx.Request]):
+    full_market = {
+        "ticker": "KXFED-26MAR19-B5.25",
+        "yes_bid_dollars": "0.4500",
+        "floor_strike": 5.25,
+        "cap_strike": 5.5,
+        "strike_type": "between",
+        "result": "",
+        "rules_primary": "x" * 2_000,
+        "previous_price_dollars": "0.4000",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "event": {"event_ticker": "KXFED-26MAR19"},
+                "markets": [dict(full_market) for _ in range(3)],
+            },
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_get_event_compacts_nested_markets_by_default_keeping_strikes(rsa_private_key):
+    """The default view must trim the verbose blacklist but keep what trading
+    consumers read off bucket markets (strikes, strike_type, result)."""
+    calls: list[httpx.Request] = []
+    server = _make_server(rsa_private_key, _event_handler(calls))
+    fn = await _tool_fn(server, "kalshi_get_event")
+
+    out = await fn(event_ticker="KXFED-26MAR19")
+
+    assert len(out["markets"]) == 3
+    for market in out["markets"]:
+        assert market["floor_strike"] == 5.25
+        assert market["cap_strike"] == 5.5
+        assert market["strike_type"] == "between"
+        assert "result" in market
+        assert "rules_primary" not in market
+        assert "previous_price_dollars" not in market
+
+
+@pytest.mark.asyncio
+async def test_get_event_full_and_minimal_views_still_available(rsa_private_key):
+    calls: list[httpx.Request] = []
+    server = _make_server(rsa_private_key, _event_handler(calls))
+    fn = await _tool_fn(server, "kalshi_get_event")
+
+    full = await fn(event_ticker="KXFED-26MAR19", compact=False)
+    assert full["markets"][0]["rules_primary"] == "x" * 2_000
+
+    minimal = await fn(event_ticker="KXFED-26MAR19", minimal=True)
+    assert "floor_strike" not in minimal["markets"][0]
+    assert minimal["markets"][0]["ticker"] == "KXFED-26MAR19-B5.25"
