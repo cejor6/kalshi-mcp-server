@@ -124,10 +124,10 @@ def register(server: FastMCP) -> None:
         """Get your account's current API rate-limit tier and remaining headroom.
 
         Returns Kalshi's view of your tier name, read/write bucket
-        capacity, and refill rate. The MCP server uses Basic-tier defaults
-        until this is called — invoking this tool periodically (or once
-        at session start) lets the rate limiter be tuned to your real
-        budget.
+        capacity, and refill rate. Read-only: calling it does NOT retune
+        this server's local rate limiter, which keeps its configured
+        (Basic-tier by default) budget. Use the result to see your real
+        headroom.
         """
         return await client.get("/account/limits")
 

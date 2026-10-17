@@ -7,9 +7,11 @@ will start:
    KALSHI_ENV=prod AND KALSHI_ALLOW_PROD=1. The second flag exists so
    that a typo or stale shell env can't accidentally route real money.
 
-2. **Read-only default.** Order placement, cancellation, and amendment
-   refuse to run unless KALSHI_TRADING_ENABLED=1. New deployments start
-   read-only and the operator has to consciously enable trading.
+2. **Read-only default.** Order placement (prepare/confirm) refuses to run
+   unless KALSHI_TRADING_ENABLED=1. New deployments start read-only and the
+   operator has to consciously enable trading. Cancel and decrease are
+   deliberately NOT gated: they only reduce exposure, and blocking them would
+   prevent an emergency cancel after switching a server to read-only.
 
 Configurable optional safety limits (max order size, daily cap, etc.) are
 held here and consulted by `safety.py` before any write is attempted.

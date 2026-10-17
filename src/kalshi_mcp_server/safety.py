@@ -479,7 +479,8 @@ class SafetyController:
             raise TradingDisabledError(
                 "Trading is disabled. The server is in read-only mode. "
                 "Set KALSHI_TRADING_ENABLED=1 and restart to enable order "
-                "placement, cancellation, and amendment."
+                "placement. (Cancelling or decreasing existing orders is always "
+                "allowed — kalshi_cancel_order / kalshi_decrease_order.)"
             )
 
     def check_order(self, intent: OrderIntent, *, current_cash_usd: float | None = None) -> None:

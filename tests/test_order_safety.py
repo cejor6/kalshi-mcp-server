@@ -21,7 +21,7 @@ from fastmcp import FastMCP
 from kalshi_mcp_server.auth import KalshiSigner
 from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
-from kalshi_mcp_server.errors import KalshiAPIError, SafetyError
+from kalshi_mcp_server.errors import KalshiAPIError, SafetyError, TradingDisabledError
 from kalshi_mcp_server.rate_limit import KalshiRateLimiter, TierLimits
 from kalshi_mcp_server.safety import OrderIntent, SafetyController
 from kalshi_mcp_server.tools import orders
@@ -585,3 +585,36 @@ async def test_pending_map_is_capped_and_prunes_expired_first(rsa_private_key, m
     later = time.time() + orders._PENDING_TTL_S + 1
     monkeypatch.setattr(orders.time, "time", lambda: later)
     assert "confirmation_id" in await prepare(**tiny)
+
+
+# ── cancel / decrease stay available with trading disabled ─────────────────
+
+
+async def test_cancel_and_decrease_run_with_trading_disabled(rsa_private_key):
+    """Deliberate: they only reduce exposure, and blocking them would prevent
+    an emergency cancel after flipping a server to read-only. Placement, by
+    contrast, refuses."""
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, json={"order_id": "ord_a"})
+
+    kalshi = _Kalshi()
+    server = _server(rsa_private_key, kalshi, trading_enabled=False)
+    server._kalshi_client._http._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+    cancel = (await server.get_tool("kalshi_cancel_order")).fn
+    decrease = (await server.get_tool("kalshi_decrease_order")).fn
+    prepare, confirm = await _tools(server)
+
+    await cancel(order_id="ord_a")
+    await decrease(order_id="ord_a", reduce_by=1)
+    assert seen == [
+        ("DELETE", "/trade-api/v2/portfolio/events/orders/ord_a"),
+        ("POST", "/trade-api/v2/portfolio/events/orders/ord_a/decrease"),
+    ]
+
+    with pytest.raises(TradingDisabledError):
+        await prepare(**_ORDER)
+    with pytest.raises(TradingDisabledError):
+        await confirm(confirmation_id="anything")
