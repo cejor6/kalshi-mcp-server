@@ -41,37 +41,19 @@ from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from kalshi_mcp_server.errors import ConfigError
+from kalshi_mcp_server.redis_client import (
+    DEFAULT_REDIS_COLLECTION_PREFIX as DEFAULT_REDIS_COLLECTION_PREFIX,
+)
+from kalshi_mcp_server.redis_client import build_redis_client, validate_redis_url
+from kalshi_mcp_server.redis_client import collection_prefix as _collection_prefix
 
 logger = logging.getLogger("kalshi_mcp_server")
 
-# Redis connection-resilience tuning for the OAuth client store. See
-# `_build_client_storage` for what each one actually buys.
-REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
-# 2s, not the redis-py default of 5s. These are the dominant term in the
-# worst case: against a *blackholed* (not refused) Redis every leaf attempt
-# burns a full timeout, and the nesting below gives ~4 leaf attempts per
-# command across the 8 sequential store ops in a token exchange. At 5s that's
-# minutes on a hung request; at 2s it's ~1 min. Upstash round-trips are
-# single-digit ms, so 2s is still ~100x headroom.
-REDIS_CONNECT_TIMEOUT_SECONDS = 2
-REDIS_SOCKET_TIMEOUT_SECONDS = 2
-# Deliberately 1, not 3. redis-py applies the retry policy at THREE nested
-# layers — `execute_command`, `connect`, and `check_health` — so the attempt
-# count multiplies to roughly (retries + 1) ** 2 TLS connects per command.
-# FastMCP issues 8 sequential store ops inside `exchange_refresh_token`
-# (~10 for the whole /token request), so retries=3
-# turns a Redis outage into a multi-minute hang on an OAuth request (and
-# hammers a provider that bills per connection). `health_check_interval` is
-# what actually fixes the stale-socket case; the retry only covers a genuine
-# single-command blip, and 1 is enough for that.
-REDIS_RETRIES = 1
-# Namespaces this server's collections so a single Redis instance can host
-# several OAuth-proxy servers. Env-configurable because the documented deploy
-# model is image-deploy from `:latest` — two instances of the *same* image
-# (e.g. a demo and a prod service) would otherwise share a prefix and
-# cross-resolve each other's registrations, the exact failure the wrapper
-# exists to prevent. See `_build_client_storage`.
-DEFAULT_REDIS_COLLECTION_PREFIX = "kalshi"
+# Redis connection policy (resilience kwargs, URL scheme policy, collection
+# prefix) is shared with the safety-limit store and lives in
+# `redis_client.py`. `DEFAULT_REDIS_COLLECTION_PREFIX` is re-exported here for
+# existing importers.
+
 # Domain-separates the storage-encryption key from the JWT signing key.
 # Changing this makes every existing stored entry undecryptable (they degrade
 # to cache misses and clients re-register) — treat it as a key rotation.
@@ -148,18 +130,6 @@ def _strict_encryption_wrapper_class() -> type:
             return super()._decrypt_value(value)
 
     return StrictFernetEncryptionWrapper
-
-
-def _collection_prefix() -> str:
-    """Collection namespace for this deployment.
-
-    Env-overridable so two instances of the *same* published image can share
-    one Redis without colliding — the documented deploy path is image-deploy
-    from `:latest`, so a source constant alone would force a fork.
-    """
-    return (
-        os.environ.get("MCP_REDIS_COLLECTION_PREFIX", "").strip() or DEFAULT_REDIS_COLLECTION_PREFIX
-    )
 
 
 def _build_client_storage() -> tuple[object | None, str]:
@@ -249,6 +219,10 @@ def _build_client_storage() -> tuple[object | None, str]:
     if not url:
         return None, "in-memory file (ephemeral; resets on container restart)"
 
+    # Scheme policy first: a cleartext URL is a config error whether or not
+    # the extras happen to be installed. See `redis_client.validate_redis_url`.
+    validate_redis_url(url)
+
     # Imports are inside the function so the base install doesn't need
     # redis + py-key-value-aio. Those are part of the [oauth] extras.
     try:
@@ -256,18 +230,6 @@ def _build_client_storage() -> tuple[object | None, str]:
         from key_value.aio.wrappers.prefix_collections import (
             PrefixCollectionsWrapper,
         )
-        from redis.asyncio import Redis
-        from redis.asyncio.retry import Retry
-
-        # FullJitterBackoff over ExponentialBackoff so pooled connections
-        # don't retry in lockstep — a small win at these delays (~0-16ms vs
-        # a flat 16ms), but free. Not ExponentialWithJitterBackoff: it
-        # landed in redis-py 6.0 and the `redis>=5.0.0` floor allows older
-        # releases, where importing it would surface as the misleading
-        # "extras aren't installed" RuntimeError below.
-        from redis.backoff import FullJitterBackoff
-        from redis.exceptions import ConnectionError as RedisConnectionError
-        from redis.exceptions import TimeoutError as RedisTimeoutError
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "MCP_REDIS_URL is set but the [oauth] extras aren't installed. "
@@ -305,21 +267,9 @@ def _build_client_storage() -> tuple[object | None, str]:
             MIN_SIGNING_KEY_LENGTH,
         )
 
-    client = Redis.from_url(
-        url,
-        decode_responses=True,
-        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
-        socket_keepalive=True,
-        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
-        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-        retry=Retry(FullJitterBackoff(), retries=REDIS_RETRIES),
-        # `Connection.__init__` *appends* to this list when `retry_on_timeout`
-        # is truthy, and the pool hands the same list to every connection it
-        # makes — so what keeps it from growing unboundedly is leaving
-        # `retry_on_timeout` at its default False, not the fresh list here.
-        # If you ever set it, copy the list per connection.
-        retry_on_error=[RedisConnectionError, RedisTimeoutError],
-    )
+    # Shared hardened client (health check, timeouts, jittered retry) — see
+    # `redis_client.build_redis_client` and the docstring above.
+    client = build_redis_client(url)
     # Encrypt at rest, and namespace the collections. See the docstring for
     # why both are needed — supplying `client_storage` opts out of the
     # equivalents FastMCP would have applied itself.

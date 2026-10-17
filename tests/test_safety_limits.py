@@ -549,7 +549,13 @@ def test_loosening_flag_env_parsing(monkeypatch):
 def test_loosen_error_names_the_real_redis_key():
     from kalshi_mcp_server import safety, safety_store
 
-    assert safety._PERSISTED_OVERRIDE_KEY == safety_store._REDIS_KEY
+    assert safety._PERSISTED_OVERRIDE_KEY == safety_store._LEGACY_REDIS_KEY
+    assert safety._PERSISTED_OVERRIDE_KEY == safety_store._limits_key(
+        safety_store.DEFAULT_REDIS_COLLECTION_PREFIX
+    )
+    assert safety._PERSISTED_OVERRIDE_KEY_TEMPLATE.replace(
+        "<prefix>", "demo"
+    ) == safety_store._limits_key("demo")
 
 
 async def test_set_safety_limits_tool_rejects_loosen_after_tighten(rsa_private_key):

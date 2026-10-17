@@ -42,10 +42,13 @@ _ALL_LIMIT_FIELDS = (
 # conservative, so its override may only go >= the env value. The env var is
 # the absolute loosest setting either way.
 _ASCENDING_LIMITS = frozenset({"cash_reserve_usd"})
-# The Redis key `safety_store.RedisLimitsStore` persists overrides under, named
-# in operator-facing errors. Duplicated (safety_store imports this module, so
-# importing it back would be circular); a test pins the two together.
+# The Redis keys `safety_store.RedisLimitsStore` persists overrides under,
+# named in operator-facing errors: the legacy key for the default
+# MCP_REDIS_COLLECTION_PREFIX, a namespaced one otherwise. Duplicated
+# (safety_store imports this module, so importing it back would be circular);
+# a test pins them to safety_store.
 _PERSISTED_OVERRIDE_KEY = "kalshi-mcp:safety-limits"
+_PERSISTED_OVERRIDE_KEY_TEMPLATE = "kalshi-mcp:<prefix>:safety-limits"
 
 
 @dataclass(frozen=True)
@@ -464,8 +467,9 @@ class SafetyController:
                 f"only be tightened. To relax a runtime-tightened limit an operator "
                 f"must either set MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1 and redeploy "
                 f"(still capped at the env ceiling), or restart the server — after "
-                f"deleting the Redis key {_PERSISTED_OVERRIDE_KEY!r} if overrides "
-                f"persist via MCP_REDIS_URL."
+                f"setting the Redis key {_PERSISTED_OVERRIDE_KEY!r} (default "
+                f"MCP_REDIS_COLLECTION_PREFIX; {_PERSISTED_OVERRIDE_KEY_TEMPLATE!r} "
+                f"otherwise) to '{{}}' if overrides persist via MCP_REDIS_URL."
             )
 
     def _overrides_of(self, effective: SafetyLimits) -> dict[str, float | int]:

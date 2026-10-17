@@ -4,7 +4,8 @@
 # Install once per clone:
 #   uv run pre-commit install
 #
-# Run on all files (CI does this too):
+# Run on all files (CI does this too — the `pre-commit` job in
+# .github/workflows/ci.yml):
 #   uv run pre-commit run --all-files
 
 repos:
