@@ -844,6 +844,15 @@ async def test_event_hint_does_not_cache_transient_failures(error):
     assert len(client.calls) == 2
 
 
+@pytest.mark.parametrize("body", [["not", "a", "dict"], "oops", {"markets": "junk"}])
+async def test_event_hint_does_not_cache_a_malformed_200(body):
+    client = _FakeClient(responses=[body, body])
+    assert await _event_hint(client, "KXEV-1") is None
+    assert "KXEV-1" not in _event_hint_misses
+    assert await _event_hint(client, "KXEV-1") is None
+    assert len(client.calls) == 2
+
+
 async def test_event_hint_caches_empty_market_list():
     client = _FakeClient(responses=[{"event": {"event_ticker": "X"}, "markets": []}])
     assert await _event_hint(client, "X") is None

@@ -663,7 +663,13 @@ async def _event_hint(client: Any, ticker: str) -> str | None:
         if exc.status == 404:
             _record_event_hint_miss(ticker, now)
         return None
-    markets = (body.get("markets") or []) if isinstance(body, dict) else []
+    # A malformed 200 (non-dict body, non-list `markets`) is not a definitive
+    # "no markets" answer either — fail open WITHOUT caching it.
+    if not isinstance(body, dict):
+        return None
+    markets = body.get("markets") or []
+    if not isinstance(markets, list):
+        return None
     tickers = [m.get("ticker") for m in markets if isinstance(m, dict) and m.get("ticker")]
     if not tickers:
         _record_event_hint_miss(ticker, now)
