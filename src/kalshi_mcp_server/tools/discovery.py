@@ -171,6 +171,30 @@ def _parse_fields(fields: str) -> list[str]:
     return list(dict.fromkeys(parsed))
 
 
+def _validate_fields(fields: str | None) -> str | None:
+    """Validate a caller's `fields` whitelist UP FRONT, before any request.
+
+    `None` means "not provided". Anything else must name at least one field:
+    a blank/whitespace/comma-only string is a malformed request and raises
+    here — consistently across every tool that takes `fields`, and before the
+    wire, rather than being silently ignored (`""` used to fall through to the
+    default view) or raising only after a full scan had already run.
+    """
+    if fields is None:
+        return None
+    if not _parse_fields(fields):
+        raise KalshiAPIError(
+            status=0,
+            message=(
+                f"`fields` must list at least one field name, got {fields!r}. "
+                "Pass a comma-separated list like "
+                "'ticker,yes_bid_dollars,volume_24h_fp', or omit it to use "
+                "the default projection."
+            ),
+        )
+    return fields
+
+
 def _minimal_market(market: dict[str, Any], fields: str | None = None) -> dict[str, Any]:
     """Project a market down to a small whitelist of fields.
 
@@ -184,17 +208,7 @@ def _minimal_market(market: dict[str, Any], fields: str | None = None) -> dict[s
     silently returning an empty market would hide the mistake.
     """
     if fields is not None:
-        keys: list[str] | tuple[str, ...] = _parse_fields(fields)
-        if not keys:
-            raise KalshiAPIError(
-                status=0,
-                message=(
-                    f"`fields` must list at least one field name, got {fields!r}. "
-                    "Pass a comma-separated list like "
-                    "'ticker,yes_bid_dollars,volume_24h_fp', or omit it to use "
-                    "the default minimal projection."
-                ),
-            )
+        keys: list[str] | tuple[str, ...] = _parse_fields(_validate_fields(fields) or "")
     else:
         keys = _MINIMAL_MARKET_FIELDS
     return {k: market[k] for k in keys if k in market}
@@ -211,9 +225,10 @@ def _project_market(
 
     Precedence: `fields` > `minimal` > `compact` > full passthrough.
     Always returns a NEW dict so the result never aliases the caller's
-    parsed response (uniform contract across all four branches).
+    parsed response (uniform contract across all four branches). A blank
+    `fields` raises (see `_validate_fields`) rather than being ignored.
     """
-    if fields:
+    if fields is not None:
         return _minimal_market(market, fields=fields)
     if minimal:
         return _minimal_market(market)
@@ -732,7 +747,7 @@ def register(server: FastMCP) -> None:
                 overriding `minimal`'s default set (e.g.
                 "ticker,yes_bid_dollars,yes_ask_dollars,volume_24h_fp").
                 Implies a minimal-style projection. Unknown field names are
-                silently ignored; an empty/blank list is rejected.
+                silently ignored; a blank list is rejected before any request.
 
         View precedence: `fields` > `minimal` > `compact` > full.
 
@@ -747,6 +762,7 @@ def register(server: FastMCP) -> None:
         from the default `compact` and `minimal` views (an explicit
         `fields=` can still request it, but it'll just be 0.0000).
         """
+        fields = _validate_fields(fields)
         params: dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
@@ -827,7 +843,8 @@ def register(server: FastMCP) -> None:
                 high `limit` to keep the shortlist small: the default minimal
                 view is ~500 bytes/market, so `limit=100` is ~50KB and can
                 exceed a client tool-result cap — a 4-field whitelist cuts that
-                to a few KB. Unknown names are ignored; a blank list is rejected.
+                to a few KB. Unknown names are ignored; a blank list is
+                rejected up front, before the scan spends any reads.
             scan_all: Sweep as much of the matching listing as the internal
                 caps allow before ranking, instead of just the first
                 `scan_limit` markets — a far wider ranking than a fixed window.
@@ -863,6 +880,9 @@ def register(server: FastMCP) -> None:
                 False means more matching markets exist beyond what was ranked.
             `stopped_by`: null when `complete`, else the binding wall (above).
         """
+        # Validate BEFORE the scan: a blank whitelist used to raise only after
+        # a full (possibly multi-request) sweep had already spent read budget.
+        fields = _validate_fields(fields)
         effective_scan = max(1, min(scan_limit, 1000))
         # A full sweep folds each page into a running top-K instead of
         # retaining every market — tens of thousands of ~2KB objects held only
@@ -917,7 +937,8 @@ def register(server: FastMCP) -> None:
                 (see `kalshi_get_markets`). Default False.
             fields: Comma-separated whitelist overriding `minimal`'s
                 default set. Implies a minimal-style projection. Unknown
-                field names are silently ignored; an empty list is rejected.
+                field names are silently ignored; a blank list is rejected
+                before any request.
 
         View precedence: `fields` > `minimal` > `compact` > full.
 
@@ -926,6 +947,7 @@ def register(server: FastMCP) -> None:
         the orderbook and `volume_24h_fp` / `open_interest_fp` instead.
         """
         ticker = _validate_path_segment(ticker, kind="ticker")
+        fields = _validate_fields(fields)
         try:
             body = await client.get(f"/markets/{ticker}")
         except KalshiAPIError as exc:
@@ -967,11 +989,12 @@ def register(server: FastMCP) -> None:
                 multivariate events whose nested combo markets are large.
             fields: Comma-separated whitelist applied to each nested market,
                 overriding `minimal`'s default set. Unknown field names are
-                silently ignored; an empty list is rejected.
+                silently ignored; a blank list is rejected before any request.
 
         Nested-market view precedence: `fields` > `minimal` > `compact` > full.
         """
         event_ticker = _validate_path_segment(event_ticker, name="event_ticker", kind="ticker")
+        fields = _validate_fields(fields)
         params = {"with_nested_markets": str(with_nested_markets).lower()}
         body = await client.get(f"/events/{event_ticker}", params=params)
 
@@ -984,7 +1007,7 @@ def register(server: FastMCP) -> None:
         # fields are market-specific and apply to the nested markets.
         if compact and "event" in body and isinstance(body["event"], dict):
             body["event"] = _compact_event(body["event"])
-        if (compact or minimal or fields) and "markets" in body:
+        if (compact or minimal or fields is not None) and "markets" in body:
             body["markets"] = [
                 _project_market(m, compact=compact, minimal=minimal, fields=fields)
                 for m in body["markets"]
@@ -1023,7 +1046,7 @@ def register(server: FastMCP) -> None:
                 to keep large multi-event listings under a token cap.
             fields: Comma-separated whitelist applied to each nested market,
                 overriding `minimal`'s default set. Unknown field names are
-                silently ignored; an empty list is rejected.
+                silently ignored; a blank list is rejected before any request.
 
         Nested-market view precedence: `fields` > `minimal` > `compact` > full.
 
@@ -1032,6 +1055,7 @@ def register(server: FastMCP) -> None:
             `milestones`: list of milestone objects (may be empty).
             `cursor`: pagination cursor for the next page.
         """
+        fields = _validate_fields(fields)
         params: dict[str, Any] = {
             "limit": limit,
             "with_nested_markets": str(with_nested_markets).lower(),
@@ -1048,7 +1072,7 @@ def register(server: FastMCP) -> None:
             body["events"] = [_compact_event(e) for e in body["events"]]
         # Nested markets get the full projection (compact/minimal/fields);
         # the event objects only have a compact view.
-        if compact or minimal or fields:
+        if compact or minimal or fields is not None:
             for event in body.get("events", []):
                 if "markets" in event:
                     event["markets"] = [

@@ -369,6 +369,8 @@ shrinks multivariate (`KXMVE…`) combo markets, whose bulk lives in
 View precedence is `fields` > `minimal` > `compact` > full. `kalshi_get_event`
 / `kalshi_get_events` accept the same `minimal` / `fields` for their nested
 markets (the event objects themselves only have the `compact` view).
+A blank `fields` (`""`, `" , "`) is rejected by every tool before any
+request is made.
 
 **Don't gate on `liquidity_dollars`:** Kalshi currently returns it as
 `0.0000` on every market, even deep books — measure liquidity from the

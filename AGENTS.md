@@ -520,7 +520,9 @@ tools encode these; don't regress them.
   lives outside the blacklist (`custom_strike`, `mve_selected_legs`, long
   `*_sub_title`s). Prefer `minimal` for listing/scanning. The same
   projection applies to nested markets on the event tools. Precedence:
-  `fields` > `minimal` > `compact` > full.
+  `fields` > `minimal` > `compact` > full. `fields` is validated once, up
+  front (`_validate_fields`): a blank whitelist raises before any request in
+  every tool — never silently ignored, never after a scan.
 - **Combos dominate the default listing.** A bare `status=open` page is
   mostly multivariate combos with empty/one-sided books. Kalshi has **no
   server-side sort**, but it does have `mve_filter` (`exclude`/`only`).

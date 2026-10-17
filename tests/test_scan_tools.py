@@ -858,3 +858,42 @@ async def test_find_liquid_markets_fields_applies_under_scan_all(rsa_private_key
     assert out["markets"]
     for m in out["markets"]:
         assert set(m) == {"ticker"}
+
+
+# ── blank `fields` is rejected up front, consistently ──────────────────────
+
+
+_BLANK_FIELDS = ["", "   ", ",", " , ,"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", _BLANK_FIELDS)
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        ("kalshi_get_markets", {}),
+        ("kalshi_find_liquid_markets", {}),
+        ("kalshi_find_liquid_markets", {"scan_all": True}),
+        ("kalshi_get_market", {"ticker": "KXFED-26MAR19-B5.25"}),
+        ("kalshi_get_event", {"event_ticker": "KXFED-26MAR19"}),
+        ("kalshi_get_events", {"with_nested_markets": True}),
+    ],
+)
+async def test_blank_fields_rejected_before_any_request(rsa_private_key, tool_name, kwargs, blank):
+    """A blank whitelist is a malformed request. It used to be silently ignored
+    by kalshi_get_markets (`""` fell through to the default view) and raised by
+    kalshi_find_liquid_markets only AFTER the whole scan — now every tool
+    rejects it before the wire."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"markets": [{"ticker": "KX-A"}], "cursor": ""})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, tool_name)
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(fields=blank, **kwargs)
+    assert "`fields` must list at least one field name" in exc.value.message
+    assert calls == []
+
