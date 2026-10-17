@@ -817,9 +817,13 @@ bypassed locally — discipline is the actual safeguard.
   either way, and N typed tools would 5× the surface to review); no
   wildcard content hosts are allowlisted (a raw.githubusercontent.com
   entry was removed in review); fetched bodies are delimiter-wrapped
-  UNTRUSTED data, with a fresh random nonce in both markers per call and
-  delimiter-like text in the body neutralized, so a fetched body can't forge
-  the end of the block (don't go back to fixed marker strings); the size cap
+  UNTRUSTED data, with a fresh random nonce in both markers per call (the
+  primary defence — don't go back to fixed marker strings) plus in-body
+  neutralization as depth: on an NFKC, format-char-stripped view, any
+  `untrusted…external…data` with non-alphanumeric separators and any 3+ run
+  of `<`/`>` is rewritten in the original text (`_neutralize_markers`; it
+  does not cover cross-script homoglyphs — keep the docstring/README claims
+  exactly in sync with what it does); the size cap
   applies to DECODED bytes via `Accept-Encoding: identity` plus the bounded
   reader in `tools/_bounded_read.py` (httpx's default gzip decoding inflates a
   whole chunk before any cap); the 45s wall clock also covers the wait for a
