@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import math
+import time
 from collections.abc import Awaitable
 
 import httpx
@@ -516,3 +517,71 @@ async def test_concurrent_confirms_of_one_token_send_once(rsa_private_key):
     assert sum(isinstance(r, SafetyError) for r in results) == 1
     assert len(kalshi.posts) == 1
     assert _spent(server) == pytest.approx(_ORDER_COST)
+
+
+# ── prepare input validation: ticker + expiration_ts ────────────────────────
+
+
+@pytest.mark.parametrize("bad", ["", "   "])
+async def test_prepare_rejects_empty_ticker(rsa_private_key, bad):
+    server = _server(rsa_private_key, _Kalshi())
+    prepare, _ = await _tools(server)
+    with pytest.raises(KalshiAPIError, match="ticker must be a non-empty string"):
+        await prepare(**{**_ORDER, "ticker": bad})
+
+
+async def test_prepare_strips_ticker_whitespace(rsa_private_key):
+    kalshi = _Kalshi()
+    server = _server(rsa_private_key, kalshi)
+    prepare, confirm = await _tools(server)
+    prepared = await prepare(**{**_ORDER, "ticker": "  KX-TEST "})
+    assert prepared["intent"]["ticker"] == "KX-TEST"
+    await confirm(confirmation_id=prepared["confirmation_id"])
+    assert kalshi.posts[0]["ticker"] == "KX-TEST"
+
+
+@pytest.mark.parametrize(
+    "bad,match",
+    [
+        (int(time.time() + 3600) * 1000, "MILLISECONDS"),  # ms, not seconds
+        (1_000_000_000, "not in the future"),  # 2001
+        (int(time.time()) - 1, "not in the future"),
+        (1.8e9, "integer"),
+        ("1800000000", "integer"),
+        (True, "integer"),
+    ],
+)
+async def test_prepare_rejects_bad_expiration_ts(rsa_private_key, bad, match):
+    server = _server(rsa_private_key, _Kalshi())
+    prepare, _ = await _tools(server)
+    with pytest.raises(SafetyError, match=match):
+        await prepare(**_ORDER, expiration_ts=bad)
+
+
+async def test_prepare_accepts_a_future_expiration_in_seconds(rsa_private_key):
+    kalshi = _Kalshi()
+    server = _server(rsa_private_key, kalshi)
+    prepare, confirm = await _tools(server)
+    expiry = int(time.time()) + 3600
+    prepared = await prepare(**_ORDER, expiration_ts=expiry)
+    await confirm(confirmation_id=prepared["confirmation_id"])
+    assert kalshi.posts[0]["expiration_time"] == expiry
+
+
+# ── the pending map is bounded ──────────────────────────────────────────────
+
+
+async def test_pending_map_is_capped_and_prunes_expired_first(rsa_private_key, monkeypatch):
+    server = _server(rsa_private_key, _Kalshi())
+    prepare, _ = await _tools(server)
+    tiny = {**_ORDER, "count": 1, "limit_price_cents": 1}  # $0.02 each
+
+    for _ in range(orders._MAX_PENDING):
+        await prepare(**tiny)
+    with pytest.raises(SafetyError, match="Too many prepared-but-unconfirmed"):
+        await prepare(**tiny)
+
+    # Once the earlier ones have expired they are pruned before the cap check.
+    later = time.time() + orders._PENDING_TTL_S + 1
+    monkeypatch.setattr(orders.time, "time", lambda: later)
+    assert "confirmation_id" in await prepare(**tiny)

@@ -33,12 +33,20 @@ from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError, SafetyError
 from kalshi_mcp_server.safety import OrderIntent
-from kalshi_mcp_server.tools._validation import _validate_path_segment
+from kalshi_mcp_server.tools._validation import _validate_path_segment, _validate_ticker
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 _PENDING_TTL_S = 300  # 5 minutes
+# Live prepared-but-unconfirmed orders. Each holds no money, but an unbounded
+# map is a memory leak an agent loop can drive; 100 is far more than any sane
+# workflow keeps open within the 5-minute TTL.
+_MAX_PENDING = 100
+# 2100-01-01T00:00:00Z in unix SECONDS. A millisecond timestamp for any date
+# after 1970-02-17 is larger than this, so the bound catches the classic
+# seconds-vs-ms mixup while allowing any plausible GTT expiry.
+_MAX_EXPIRATION_TS = 4_102_444_800
 
 
 @dataclass
@@ -62,6 +70,30 @@ def _gc_expired(pending: dict[str, _PendingOrder]) -> None:
     expired = [tok for tok, p in pending.items() if p.expires_at < now]
     for tok in expired:
         del pending[tok]
+
+
+def _validate_expiration_ts(expiration_ts: Any, *, now: float) -> int | None:
+    """Authoritative check for a GTT `expiration_ts` (unix SECONDS)."""
+    if expiration_ts is None:
+        return None
+    if isinstance(expiration_ts, bool) or not isinstance(expiration_ts, int):
+        raise SafetyError(
+            f"expiration_ts must be an integer unix timestamp in SECONDS, got "
+            f"{expiration_ts!r}. Omit it for a good-till-cancelled order."
+        )
+    if expiration_ts > _MAX_EXPIRATION_TS:
+        raise SafetyError(
+            f"expiration_ts={expiration_ts} is past the year 2100 — it looks like "
+            f"MILLISECONDS. Pass unix SECONDS (e.g. {expiration_ts // 1000} if this "
+            f"was ms)."
+        )
+    if expiration_ts <= now:
+        raise SafetyError(
+            f"expiration_ts={expiration_ts} is not in the future (now is "
+            f"{int(now)}). Pass a future unix timestamp in seconds, or omit it for "
+            "a good-till-cancelled order."
+        )
+    return expiration_ts
 
 
 def _new_token() -> str:
@@ -177,13 +209,17 @@ def register(server: FastMCP) -> None:
         Returns a `confirmation_id` you pass to `kalshi_confirm_order`
         to execute. The intent expires in 5 minutes.
 
-        Safety checks (run BEFORE returning a token):
+        Safety checks (run here as a fast-fail, and AGAIN at confirm against the
+        limits in force then):
         - Trading must be enabled (`KALSHI_TRADING_ENABLED=1`).
         - count must be positive and below MCP_MAX_CONTRACTS_PER_ORDER.
         - limit_price_cents must be 1-99.
-        - Projected cost must be below MCP_MAX_ORDER_SIZE_USD.
+        - Worst-case cost (notional + a conservative taker-fee bound) must be
+          below MCP_MAX_ORDER_SIZE_USD.
         - Today's cumulative cost (after this order) must be below
           MCP_DAILY_LIMIT_USD.
+        - At confirm only: cash left after the order must stay above
+          MCP_CASH_RESERVE_USD.
 
         Args:
             ticker: Market ticker.
@@ -194,8 +230,9 @@ def register(server: FastMCP) -> None:
             order_type: "limit" or "market". Default "limit".
             post_only: If true, reject if the order would immediately
                 take liquidity (maker-only). Default false.
-            expiration_ts: Optional GTT — unix seconds at which the
-                order auto-cancels if unfilled. Omit for GTC.
+            expiration_ts: Optional GTT — unix SECONDS (not ms) at which
+                the order auto-cancels if unfilled; must be in the future.
+                Omit for GTC.
 
         Returns: a dict with `confirmation_id`, the recorded intent,
         estimated cost, expiration timestamp, and a `safety_status`.
@@ -206,6 +243,7 @@ def register(server: FastMCP) -> None:
         # values for MCP clients; these checks (with case-normalization,
         # matching action/side) are the authoritative backstop for direct
         # `.fn` callers, who bypass Pydantic.
+        ticker = _validate_ticker(ticker)
         action_lc = action.lower()
         side_lc = side.lower()
         order_type_lc = order_type.lower()
@@ -232,6 +270,7 @@ def register(server: FastMCP) -> None:
                     "A market order takes liquidity and cannot be post_only (maker-only). "
                     "Drop post_only, or use order_type='limit'."
                 )
+        expiration_ts = _validate_expiration_ts(expiration_ts, now=time.time())
 
         intent = OrderIntent(
             ticker=ticker,
@@ -245,6 +284,13 @@ def register(server: FastMCP) -> None:
         safety.check_order(intent)
 
         _gc_expired(pending)
+        if len(pending) >= _MAX_PENDING:
+            raise SafetyError(
+                f"Too many prepared-but-unconfirmed orders ({len(pending)}, max "
+                f"{_MAX_PENDING}). Confirm the ones you intend to place, or wait for "
+                f"unused ones to expire ({_PENDING_TTL_S // 60} minutes after prepare) "
+                "before preparing more."
+            )
         token = _new_token()
         idempotency_key = f"mcp-{uuid.uuid4().hex}"
         expires_at = time.time() + _PENDING_TTL_S
