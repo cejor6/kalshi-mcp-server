@@ -873,15 +873,23 @@ envelope.
 Call it from your MCP client to lower a cap (or raise the cash reserve)
 on a running server — no redeploy. Useful for tuning to a strategy, a
 tighter per-run budget, or an emergency clamp-down. It is fail-closed:
-it can only ever make the limits *tighter* than the env ceiling, never
-looser. Trying to loosen past a ceiling is rejected. The three caps may
-only go down; `MCP_CASH_RESERVE_USD` may only go up (a bigger reserve is
-more conservative). Setting a limit back to its ceiling clears the
-override.
+by default it can only make a limit *tighter than its current value* —
+the three caps may only go down; `MCP_CASH_RESERVE_USD` may only go up (a
+bigger reserve is more conservative). So nobody calling the tool, including
+the trading agent itself, can undo a clamp-down. Loosening is rejected unless
+you set `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1` (default `0`), and even then a
+limit can never go past its env ceiling.
+
+**Undoing a runtime tighten.** Either set
+`MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`, redeploy, and set the limit back to
+its ceiling with the tool (that clears the stored override; unset the flag
+afterwards), or restart without the override: with no `MCP_REDIS_URL` a
+restart alone reverts to the env ceilings; with Redis, delete the key
+`kalshi-mcp:safety-limits` first, then restart.
 
 Check what's in force any time with the `kalshi_get_environment` tool —
 it shows `safety_limits` (active) alongside `safety_ceilings` (env hard
-max) and a `safety_limits_persist` flag.
+max), a `safety_limits_persist` flag, and `safety_limits_loosening_allowed`.
 
 **Combo (parlay) creation — a separate gate.** `kalshi_create_combo_market`
 POSTs to Kalshi to materialize a combo market ticker. It places **no order and
@@ -929,8 +937,8 @@ drop the `kalshi_set_safety_limits` tool entirely. Limits then change only
 via env var + redeploy. Worth doing on a shared HTTP deploy where every
 allowlisted user can call tools — without it, any of them (or a
 prompt-injected agent) could clamp your limits down. The change is
-fail-safe either way (it can only tighten, never loosen past the ceiling),
-but dropping the tool removes the nuisance vector.
+fail-safe either way (by default it can only tighten, and never loosen past
+the ceiling), but dropping the tool removes the nuisance vector.
 
 **Persistence.** By default a runtime override is in-memory: a restart or
 redeploy reverts to the env ceilings. If `MCP_REDIS_URL` is set (the same
