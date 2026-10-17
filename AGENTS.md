@@ -762,8 +762,12 @@ bypassed locally — discipline is the actual safeguard.
     non-2xx, network, timeout, malformed answer, or sub-threshold
     confidence) it falls back to a deterministic liquidity/spread heuristic
     with `jev_scored=false`. The whole fan-out is also wall-clock-bounded
-    (degrade, don't block); a 429 trips a short process-global back-off
-    (capped so a bad env can't disable Jev ~forever); genuine failures are
+    (degrade, don't block); a 429 immediately short-circuits the rest of
+    the batch (queued calls fall back unsent) and trips a short
+    process-global back-off (capped so a bad env can't disable Jev
+    ~forever); Jev bodies are read with `Accept-Encoding: identity` and a
+    64KB cap before parsing (`tools/_bounded_read.py`), so an oversize or
+    compressed-bomb response degrades to `oversize`; genuine failures are
     logged once per scan.
   - **Why it's here rather than in the consumer** (a weaker version of the
     `kalshi_fetch_external_data` egress argument): the egress-restricted
