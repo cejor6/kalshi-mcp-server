@@ -642,22 +642,22 @@ async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
     assert "does not publish" not in exc.value.message
 
 
+_OVERSIZED_WINDOWS = [
+    (0, 7 * 86_400),  # a week of 5-SECOND bars: ~121k periods
+    (0, 5_000 * 5 + 1),  # one second over 5000 periods at 5s (ceil -> 5001)
+    (1, 5_000 * 60 + 1),  # one second over at 1m
+    (60, 5_001 * 3_600),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("period_interval", "span_s"),
-    [
-        (0, 7 * 86_400),  # a week of 5-SECOND bars: ~121k periods
-        (0, 5_000 * 5 + 1),  # one second over the cap at 5s (ceil -> 5001)
-        (1, 5_000 * 60 + 1),  # one second over the cap at 1m
-        (60, 5_001 * 3_600),
-    ],
-)
-async def test_forecast_history_rejects_oversized_window_before_the_wire(
+@pytest.mark.parametrize(("period_interval", "span_s"), _OVERSIZED_WINDOWS)
+async def test_forecast_history_sends_oversized_window_to_kalshi(
     rsa_private_key, period_interval, span_s
 ):
-    """Without a cap, an oversized window (notably period_interval=0) reached
-    Kalshi, 400'd, and was misdiagnosed as 'no forecast data'. It must now fail
-    locally with a window message and make NO request."""
+    """The 5000-period figure is ASSUMED for this endpoint, so it is not a
+    local rejection — a large window still goes out, and succeeds if Kalshi
+    accepts it."""
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -666,7 +666,30 @@ async def test_forecast_history_rejects_oversized_window_before_the_wire(
 
     server = _make_server(rsa_private_key, handler)
     fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+    out = await fn(
+        event_ticker="KXHIGHNY-26AUG14",
+        series_ticker="KXHIGHNY",
+        start_ts=1_000_000,
+        end_ts=1_000_000 + span_s,
+        period_interval=period_interval,
+    )
+    assert out == {"forecast_history": []}
+    assert len(calls) == 1
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_interval", "span_s"), _OVERSIZED_WINDOWS)
+async def test_forecast_history_opaque_400_on_oversized_window_blames_the_window(
+    rsa_private_key, period_interval, span_s
+):
+    """An oversized window's opaque 400 used to be misdiagnosed as 'no forecast
+    data'. It must now say the window is likely too large and how to shrink it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
     with pytest.raises(KalshiAPIError) as exc:
         await fn(
             event_ticker="KXHIGHNY-26AUG14",
@@ -675,31 +698,34 @@ async def test_forecast_history_rejects_oversized_window_before_the_wire(
             end_ts=1_000_000 + span_s,
             period_interval=period_interval,
         )
-    assert calls == []
-    assert exc.value.status == 0
-    assert "5000-period cap" in exc.value.message
-    assert "does not publish" not in exc.value.message
+    msg = exc.value.message
+    assert exc.value.status == 400
+    assert "likely too large" in msg
+    assert "larger period_interval" in msg
+    assert "does not publish" not in msg
+    assert "bad request" in msg
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("period_interval", "span_s"), [(0, 5_000 * 5), (1, 5_000 * 60)])
-async def test_forecast_history_allows_window_at_the_cap(rsa_private_key, period_interval, span_s):
-    calls: list[httpx.Request] = []
-
+async def test_forecast_history_opaque_400_within_5000_periods_keeps_no_data_hint(
+    rsa_private_key, period_interval, span_s
+):
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        return httpx.Response(200, json={"forecast_history": []})
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
 
     server = _make_server(rsa_private_key, handler)
     fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
-    await fn(
-        event_ticker="KXHIGHNY-26AUG14",
-        series_ticker="KXHIGHNY",
-        start_ts=1_000_000,
-        end_ts=1_000_000 + span_s,
-        period_interval=period_interval,
-    )
-    assert len(calls) == 1
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_000_000 + span_s,
+            period_interval=period_interval,
+        )
+    assert "does not publish percentile-forecast data" in exc.value.message
+    assert "likely too large" not in exc.value.message
 
 
 @pytest.mark.asyncio

@@ -59,14 +59,16 @@ _FORECAST_PERCENTILE_MAX = 9999
 # usual minute/hour/day widths — the only place in the API where 0 is legal.
 _VALID_FORECAST_INTERVALS: tuple[int, ...] = (0, 1, 60, 1440)
 
-# Period cap for one forecast-history request. ASSUMED, not confirmed: Kalshi's
-# API reference states no limit for this endpoint and none has been measured
-# live, so this mirrors the candlestick endpoints' confirmed 5000-period cap
-# (same `ceil` counting — see _MAX_CANDLESTICK_PERIODS). Without any cap,
-# `period_interval=0` (5-SECOND bars) over a week asks for ~121k periods, and
-# the resulting 400 was being misreported as "this event doesn't publish
-# forecasts". If live testing shows a different limit, change it here.
-_MAX_FORECAST_PERIODS = 5000
+# Window size above which an opaque forecast-history 400 is diagnosed as
+# "window probably too large" rather than "no forecast data". A DIAGNOSTIC
+# threshold, NOT an enforced cap: Kalshi's API reference states no limit for
+# this endpoint and none has been measured live, so rejecting locally could
+# refuse requests Kalshi accepts. 5000 mirrors the candlestick endpoints'
+# confirmed cap (same `ceil` counting — see _MAX_CANDLESTICK_PERIODS). It
+# matters most at `period_interval=0` (5-SECOND bars), where a week is ~121k
+# periods. If live testing establishes the real limit, update this (and only
+# then consider enforcing it pre-flight).
+_LIKELY_MAX_FORECAST_PERIODS = 5000
 
 # Kalshi's own error text when it gives no reason at all. Only a 400 carrying
 # one of these is plausibly the "no forecast data for this event/window" case;
@@ -81,8 +83,17 @@ def _forecast_period_seconds(period_interval: int) -> int:
     return 5 if period_interval == 0 else period_interval * 60
 
 
+def _forecast_periods(start_ts: int, end_ts: int, period_interval: int) -> int:
+    """Periods a forecast window spans (ceil — a partial trailing period counts)."""
+    return math.ceil((end_ts - start_ts) / _forecast_period_seconds(period_interval))
+
+
 def _validate_forecast_window(start_ts: int, end_ts: int, period_interval: int) -> None:
-    """Pre-flight the forecast-history window (interval set, order, period cap)."""
+    """Pre-flight the forecast-history window: interval set and ordering only.
+
+    The window SIZE is deliberately not enforced (no documented limit); see
+    _LIKELY_MAX_FORECAST_PERIODS for how an oversized window is diagnosed.
+    """
     if period_interval not in _VALID_FORECAST_INTERVALS:
         raise KalshiAPIError(
             status=0,
@@ -99,20 +110,36 @@ def _validate_forecast_window(start_ts: int, end_ts: int, period_interval: int) 
                 "both are unix seconds."
             ),
         )
-    seconds = _forecast_period_seconds(period_interval)
-    periods = math.ceil((end_ts - start_ts) / seconds)
-    if periods > _MAX_FORECAST_PERIODS:
+
+
+def _forecast_400_message(
+    *, event_ticker: str, series_ticker: str, periods: int, period_interval: int, said: str
+) -> str:
+    """Actionable text for an OPAQUE forecast-history 400.
+
+    An oversized window is the likelier cause when the request spans more than
+    _LIKELY_MAX_FORECAST_PERIODS periods, so say that (with how to shrink it)
+    instead of guessing "no forecast data".
+    """
+    head = (
+        f"Kalshi returned 400 for forecast history on {event_ticker!r} (series {series_ticker!r}). "
+    )
+    if periods > _LIKELY_MAX_FORECAST_PERIODS:
+        seconds = _forecast_period_seconds(period_interval)
         unit = "5s" if period_interval == 0 else f"{period_interval}m"
-        max_span_s = _MAX_FORECAST_PERIODS * seconds
-        raise KalshiAPIError(
-            status=0,
-            message=(
-                f"This window spans ~{periods} periods at period_interval={period_interval} "
-                f"({unit} bars), over the {_MAX_FORECAST_PERIODS}-period cap "
-                f"(at this interval the window may span at most {max_span_s}s). Narrow "
-                "the window or use a larger period_interval (0 -> 1 -> 60 -> 1440)."
-            ),
+        return head + (
+            f"The window spans ~{periods} periods at period_interval={period_interval} "
+            f"({unit} bars) — likely too large: similar Kalshi endpoints cap a request at "
+            f"{_LIKELY_MAX_FORECAST_PERIODS} periods (here ~{_LIKELY_MAX_FORECAST_PERIODS * seconds}s "
+            "of window). Narrow start_ts..end_ts or use a larger period_interval "
+            f"(0 -> 1 -> 60 -> 1440) and retry. Kalshi said: {said!r}."
         )
+    return head + (
+        "The request shape is valid per Kalshi's API reference, so this most likely means "
+        "this event/series does not publish percentile-forecast data, or not for this "
+        "window. Not all events do. Try a different event, or confirm with Kalshi which "
+        f"series carry forecasts. Kalshi said: {said!r}."
+    )
 
 
 def _is_opaque_400(message: str) -> bool:
@@ -728,11 +755,11 @@ def register(server: FastMCP) -> None:
                 [1000, 2500, 5000, 7500, 9000] (a decile/quartile spread).
             period_interval: Period length in MINUTES. Accepts 0 (5-SECOND
                 intervals — the only endpoint where 0 is legal), 1, 60, or
-                1440. Default 60. The window may span at most 5000 periods
-                (ceil((end_ts - start_ts) / period_seconds), with 0 counted as
-                5s) — checked locally before any request. At 0 that is under
-                7 hours; at 1, ~3.5 days. (The 5000 figure mirrors the
-                candlestick cap; Kalshi documents none for this endpoint.)
+                1440. Default 60. Keep the window modest: Kalshi documents no
+                period cap here, but similar endpoints cap at 5000 periods
+                (at 0 that is under 7 hours; at 1, ~3.5 days). Not enforced
+                locally — if Kalshi 400s on a window over 5000 periods, the
+                error says the window is likely too large and how to shrink it.
 
         Returns `forecast_history`: per period, an `end_period_ts` plus
         `percentile_points` giving each requested percentile's raw, numeric,
@@ -776,14 +803,12 @@ def register(server: FastMCP) -> None:
             if exc.status == 400 and _is_opaque_400(exc.message):
                 raise KalshiAPIError(
                     status=400,
-                    message=(
-                        f"Kalshi returned 400 for forecast history on "
-                        f"{event_ticker!r} (series {series_ticker!r}). The request shape "
-                        "is valid per Kalshi's API reference, so this most likely means "
-                        "this event/series does not publish percentile-forecast data, or "
-                        "not for this window. Not all events do. Try a different event, or "
-                        "confirm with Kalshi which series carry forecasts. "
-                        f"Kalshi said: {exc.message!r}."
+                    message=_forecast_400_message(
+                        event_ticker=event_ticker,
+                        series_ticker=series_ticker,
+                        periods=_forecast_periods(start_ts, end_ts, period_interval),
+                        period_interval=period_interval,
+                        said=exc.message,
                     ),
                     body=exc.body,
                 ) from exc

@@ -580,13 +580,14 @@ tools encode these; don't regress them.
   50 is *legal* and silently means the 0.5th percentile — a wrong answer, not
   an error — which is why the docstring leads with the scale and the validator
   only enforces the hard bounds. `period_interval=0` (5-second bars) is legal
-  on that endpoint and ONLY that one. The window is capped at 5000 periods
-  (`ceil`, with 0 counted as 5s — a week at 0 would be ~121k) by
-  `_validate_forecast_window` before any request. That 5000 is ASSUMED from
-  the candlestick cap, not confirmed for this endpoint; adjust
-  `_MAX_FORECAST_PERIODS` if live testing says otherwise. Only an OPAQUE 400
-  ("bad request") is rewritten into the "may not publish forecasts" hint; a
-  400 with a specific Kalshi message passes through untouched.
+  on that endpoint and ONLY that one. The window SIZE is not enforced
+  locally: Kalshi documents no period cap for this endpoint, and a guessed
+  hard cap could refuse requests Kalshi accepts. Instead
+  `_LIKELY_MAX_FORECAST_PERIODS` (5000, ASSUMED from the candlestick cap;
+  `ceil`, 0 counted as 5s — a week at 0 is ~121k) only steers the diagnosis:
+  an OPAQUE 400 ("bad request") on a window above it says "window likely too
+  large" plus how to shrink it, otherwise the "may not publish forecasts"
+  hint. A 400 with a specific Kalshi message passes through untouched.
 - **`custom_strike`'s three columns are PARALLEL ARRAYS — index is the only
   thing linking them.** Two different ways of destroying that have already
   shipped here, both caught in review, so use `_split_csv_positional` and
