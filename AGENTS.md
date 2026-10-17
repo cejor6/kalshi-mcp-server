@@ -34,7 +34,9 @@ kalshi-mcp-server/
 │   ├── config.py        Env loader + prod/trading safety guards
 │   ├── safety.py        Order-time controls (size, daily cap, reserve)
 │   ├── errors.py        Exception hierarchy
-│   ├── cli.py           FastMCP entrypoint
+│   ├── cli.py           FastMCP entrypoint + HTTP startup policy
+│   ├── oauth.py         GitHub OAuth proxy + identity allowlist middleware
+│   ├── http_guard.py    No-auth HTTP: loopback-bind check, Host/Origin guard
 │   ├── tools/           MCP tool implementations
 │   └── resources/       MCP resource implementations
 ├── tests/               pytest suite
@@ -288,10 +290,35 @@ against the collection's own `size_min`/`size_max`/`is_all_yes` rules, which
 Kalshi otherwise rejects with an opaque 400. That contract still binds every
 order-placing tool without exception.
 
-A fourth gate fires at startup when HTTP transport is used:
+A fourth gate fires at startup when HTTP transport is used
+(`cli.py:_enforce_http_auth_policy`, every refusal a clean `Startup failed:`
+line, never a traceback):
 **`http` transport refuses to start without OAuth configured** unless
 `MCP_ALLOW_INSECURE_HTTP=1` is explicitly set. An unauthenticated HTTP
-trade server is a serious footgun; the policy fails closed.
+trade server is a serious footgun; the policy fails closed. Specifically:
+
+- A **partial** OAuth config (1 or 2 of `GITHUB_CLIENT_ID` /
+  `GITHUB_CLIENT_SECRET` / `MCP_BASE_URL`) raises `ConfigError` on HTTP. It
+  used to silently mean "no OAuth". On stdio it only warns (stdio never uses
+  OAuth, `GITHUB_CLIENT_ID` is a generic name, and `./.env` is auto-loaded).
+- OAuth on HTTP requires `MCP_ALLOWED_GITHUB_IDS` and/or
+  `MCP_ALLOWED_GITHUB_LOGINS`.
+- `MCP_ALLOW_INSECURE_HTTP=1` with a **complete** OAuth config is ignored
+  with a loud WARNING — OAuth wins. Deliberately not a refusal: a prod deploy
+  still carrying the flag from DEPLOY.md's Phase A would otherwise fail its
+  next redeploy. With a *partial* OAuth config it refuses (as above). With
+  no OAuth but `MCP_ALLOWED_GITHUB_*` set (a shared local `.env`) it runs and
+  warns that the allowlist isn't enforced — there's no identity to check.
+- Insecure HTTP on a non-loopback `--host` refuses unless
+  `MCP_ALLOW_INSECURE_PUBLIC_BIND=1` is also set — the Docker image binds
+  `0.0.0.0`, so a containerized no-auth deploy needs both flags.
+- Insecure HTTP always gets `http_guard.HostOriginGuard` (DNS-rebinding
+  protection): `Host`, and `Origin` when present, must be a loopback name,
+  any `127.0.0.0/8` literal (matching what the bind check accepts), or listed
+  in `MCP_ALLOWED_HOSTS`, else 421/403. Values with control characters are
+  rejected before parsing. It is deliberately NOT
+  installed with OAuth on — a rebinding page can't obtain a bearer token, and
+  Render forwards the public hostname as `Host`.
 
 See [DISCLAIMER.md](DISCLAIMER.md) for the full risk disclosure. The
 safety controls reduce blast radius but don't eliminate it.
@@ -304,10 +331,15 @@ safety controls reduce blast radius but don't eliminate it.
 `GitHubProvider` OAuth proxy when relevant env vars are set:
 
 - `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_BASE_URL` — required
-  to enable the proxy
-- `MCP_ALLOWED_GITHUB_LOGINS` — required for HTTP transport (defense in
-  depth — the proxy lets anyone authenticate; the middleware rejects
-  tool calls from logins outside this list)
+  to enable the proxy (all three or none; a partial set refuses to start
+  on HTTP)
+- `MCP_ALLOWED_GITHUB_IDS` and/or `MCP_ALLOWED_GITHUB_LOGINS` — at least one
+  required for HTTP transport. The proxy lets anyone with a GitHub account
+  authenticate; `RestrictGitHubUsersMiddleware` refuses every MCP request
+  from a caller whose numeric id (token `sub` claim, set by FastMCP's
+  `GitHubTokenVerifier` from GitHub's `/user`) is not in the id list AND
+  whose `login` is not in the login list. Prefer ids: a login can be renamed
+  and the freed name re-registered by someone else.
 - `MCP_JWT_SIGNING_KEY` — stable key for proxy-issued JWTs (generated
   per-process if unset, invalidating tokens on restart; **required** when
   `MCP_REDIS_URL` is set, and also the material the storage-encryption key
@@ -323,9 +355,20 @@ safety controls reduce blast radius but don't eliminate it.
   startup `ConfigError` unless this is `1`. It exists for private-network
   Redis (Render Key Value's internal URL), not for the internet.
 
-Stdio transport ignores all of these. Local stdio clients (Claude
-Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
-itself is the operator.
+Stdio transport ignores all of these (a partial OAuth set only logs a
+warning there). Local stdio clients (Claude Desktop, Claude Code,
+Cursor) authenticate trivially — the MCP client itself is the operator.
+
+**The allowlist hooks `on_request`, not `on_call_tool` — don't narrow it.**
+The original tool-only hook let any GitHub user who completed the OAuth flow
+`resources/read` `kalshi://balance` / `positions` / `orders` / `environment`
+and list the whole surface. `on_request` wraps every request FastMCP routes
+through middleware (`initialize`, `tools/*`, `resources/*`, `prompts/*`), so
+new resources are covered by default. Refused tool calls raise `ToolError`
+(the model sees a normal failed call); everything else raises `McpError`
+(code `-32003`). It is installed **only on HTTP + OAuth**: on stdio
+`get_access_token()` is always `None`, so it would refuse every local
+request whenever the env file happens to carry `MCP_ALLOWED_GITHUB_*`.
 
 **Both Redis consumers share `redis_client.py`.** `build_redis_client`
 (resilience kwargs below), `validate_redis_url` (scheme policy) and
@@ -414,8 +457,8 @@ The store is `FernetEncryptionWrapper(PrefixCollectionsWrapper(RedisStore))`:
   is the point, since `MCP_JWT_SIGNING_KEY` is an operator-supplied string
   and a single-hash derivation would let anyone with Redis read access
   brute-force a weak one offline. It also keeps us off FastMCP's unexported
-  `jwt_issuer.derive_jwt_key`, which could move under our wide
-  `fastmcp>=2.0.0` floor. (FastMCP's own refresh tokens were never the
+  `jwt_issuer.derive_jwt_key`, which could move on any minor release
+  above our `fastmcp>=3.2.4` floor. (FastMCP's own refresh tokens were never the
   exposure: only their SHA-256 is stored, as a key.)
   The wrapper is subclassed via `_strict_encryption_wrapper_class()` to
   **reject values lacking the `__encrypted_data__` marker.** The stock one
@@ -942,8 +985,8 @@ bypassed locally — discipline is the actual safeguard.
   registration line — nothing else depends on it.
 - **Multi-user tenant isolation.** The server's identity is the
   operator's Kalshi key — there is one trading account per running
-  process. `MCP_ALLOWED_GITHUB_LOGINS` controls *who can invoke tools*,
-  not *which Kalshi account they hit*. Adding multi-user support
+  process. `MCP_ALLOWED_GITHUB_IDS` / `MCP_ALLOWED_GITHUB_LOGINS` control
+  *who can use the server*, not *which Kalshi account they hit*. Adding multi-user support
   (different Kalshi keys per logged-in GitHub user) would require a
   significant architectural change.
 

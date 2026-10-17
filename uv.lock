@@ -842,6 +842,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "mcp" },
     { name = "pydantic" },
     { name = "pyjwt" },
     { name = "python-dotenv" },
@@ -868,8 +869,9 @@ oauth = [
 requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.5.0" },
-    { name = "fastmcp", specifier = ">=2.0.0" },
+    { name = "fastmcp", specifier = ">=3.2.4" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "mcp", specifier = ">=1.30.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "py-key-value-aio", extras = ["redis"], marker = "extra == 'dev'", specifier = ">=0.4.4" },
     { name = "py-key-value-aio", extras = ["redis"], marker = "extra == 'oauth'", specifier = ">=0.4.4" },
