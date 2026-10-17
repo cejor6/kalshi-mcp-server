@@ -238,28 +238,23 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("\nfastmcp is not installed. Run `uv sync` to install dependencies.\n\n")
         return 1
 
-    # Build the OAuth proxy if env vars are present. Stdio doesn't need
-    # auth (the MCP client *is* the operator). HTTP transport without
-    # OAuth is allowed locally but refused on a non-localhost bind — see
-    # _enforce_http_auth_policy below.
-    from kalshi_mcp_server.oauth import (
-        build_auth_provider,
-        build_user_restriction_middleware,
-    )
-
-    # `build_auth_provider` raises ConfigError for a broken storage config
-    # (e.g. MCP_REDIS_URL without MCP_JWT_SIGNING_KEY). Catch it here so it
-    # prints the same clean startup-failure line as every other config
-    # problem instead of a raw traceback.
+    # Build the OAuth proxy if env vars are present, then apply the
+    # transport's security policy. Stdio doesn't need auth (the MCP client
+    # *is* the operator). HTTP needs OAuth + an identity allowlist, or an
+    # explicit MCP_ALLOW_INSECURE_HTTP=1 opt-out — which in turn is confined
+    # to a loopback bind and gets DNS-rebinding protection. Every refusal
+    # below is a ConfigError, caught here so it prints the same clean
+    # startup-failure line as every other config problem instead of a raw
+    # traceback.
     try:
-        auth_provider, storage_desc = build_auth_provider()
+        auth_provider, storage_desc, user_restrict, http_middleware = _build_transport_security(
+            transport, args.host
+        )
     except KalshiMCPError as exc:
         sys.stderr.write(f"\nStartup failed: {exc}\n\n")
         return 2
     if auth_provider is not None:
         logger.info("OAuth: GitHub proxy enabled — DCR client storage: %s", storage_desc)
-    if transport == "http":
-        _enforce_http_auth_policy(auth_provider)
 
     server = FastMCP(
         name="kalshi-mcp-server",
@@ -272,10 +267,12 @@ def main(argv: list[str] | None = None) -> int:
         lifespan=_kalshi_lifespan,
     )
 
-    user_restrict = build_user_restriction_middleware()
     if user_restrict is not None:
         server.add_middleware(user_restrict)
-        logger.info("OAuth: tool calls restricted to GitHub logins in MCP_ALLOWED_GITHUB_LOGINS")
+        logger.info(
+            "OAuth: all MCP requests restricted to MCP_ALLOWED_GITHUB_IDS / "
+            "MCP_ALLOWED_GITHUB_LOGINS"
+        )
 
     # Hold references so they aren't GC'd, and so tool modules can import them.
     server._kalshi_signer = signer  # type: ignore[attr-defined]
@@ -295,50 +292,170 @@ def main(argv: list[str] | None = None) -> int:
         server.run(transport="stdio")
     else:
         logger.info("HTTP bind: %s:%s", args.host, port)
-        server.run(transport="http", host=args.host, port=port)
+        server.run(
+            transport="http",
+            host=args.host,
+            port=port,
+            middleware=http_middleware or None,
+        )
     return 0
 
 
-def _enforce_http_auth_policy(auth_provider) -> None:
-    """Fail closed when --transport http is used without OAuth configured.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY
+
+
+def _build_transport_security(transport: str, bind_host: str):
+    """Resolve everything auth-related for this transport, or raise ConfigError.
+
+    Returns `(auth_provider, storage_desc, user_restriction_middleware,
+    http_asgi_middleware)`:
+
+    - On HTTP a partial OAuth config refuses to start. On stdio (which never
+      uses OAuth) it only warns: `GITHUB_CLIENT_ID` is a generic name and the
+      CLI auto-loads `./.env`, so an unrelated value must not break stdio.
+    - The GitHub allowlist middleware is installed **only for HTTP + OAuth**.
+      On stdio `get_access_token()` is always None, so installing it there
+      would refuse every local request whenever the env file happened to
+      carry `MCP_ALLOWED_GITHUB_*`.
+    - The Host/Origin (DNS-rebinding) guard is installed only for HTTP
+      *without* OAuth — see `http_guard.py` for why it's scoped that way.
+    """
+    from kalshi_mcp_server.oauth import (
+        build_auth_provider,
+        build_user_restriction_middleware,
+    )
+
+    if transport == "stdio":
+        auth_provider, storage_desc = build_auth_provider(strict=False)
+        return auth_provider, storage_desc, None, []
+
+    auth_provider, storage_desc = build_auth_provider()
+
+    _enforce_http_auth_policy(auth_provider, bind_host=bind_host)
+
+    if auth_provider is not None:
+        user_restrict = build_user_restriction_middleware()
+        if user_restrict is None:  # pragma: no cover — policy guarantees a list
+            raise ConfigError("OAuth is configured but no GitHub allowlist is set.")
+        return auth_provider, storage_desc, user_restrict, []
+
+    from starlette.middleware import Middleware as ASGIMiddleware
+
+    from kalshi_mcp_server.http_guard import HostOriginGuard, parse_allowed_hosts_env
+
+    extra_hosts = parse_allowed_hosts_env()
+    logger.info(
+        "Insecure HTTP: Host/Origin restricted to loopback%s",
+        f" + {', '.join(sorted(extra_hosts))}" if extra_hosts else "",
+    )
+    return (
+        None,
+        storage_desc,
+        None,
+        [ASGIMiddleware(HostOriginGuard, allowed_hosts=extra_hosts)],
+    )
+
+
+def _enforce_http_auth_policy(auth_provider, bind_host: str = "127.0.0.1") -> None:
+    """Fail closed when --transport http isn't safely configured.
 
     HTTP exposes the server's tool surface over a network — without OAuth
-    + an allowlist, anyone who can reach the port can place trades. This
-    check refuses to start the server unless either:
+    + an allowlist, anyone who can reach the port can read the account and
+    place trades. This check refuses to start the server unless either:
 
-    - OAuth is configured (GITHUB_CLIENT_ID/SECRET + MCP_BASE_URL +
-      MCP_ALLOWED_GITHUB_LOGINS), OR
-    - The operator explicitly opts out via MCP_ALLOW_INSECURE_HTTP=1
-      (use case: local dev where you're hitting localhost yourself).
+    - OAuth is configured (GITHUB_CLIENT_ID/SECRET + MCP_BASE_URL) AND at
+      least one of MCP_ALLOWED_GITHUB_IDS / MCP_ALLOWED_GITHUB_LOGINS is set
+      (malformed ids also refuse — parsed here so the error is at boot), OR
+    - The operator explicitly opts out via MCP_ALLOW_INSECURE_HTTP=1 with no
+      core OAuth var set, on a loopback bind — or a non-loopback bind with
+      the second opt-in MCP_ALLOW_INSECURE_PUBLIC_BIND=1.
+
+    A fully configured OAuth deploy that still carries the insecure flag
+    (left over from DEPLOY.md's Phase A) is NOT refused — refusing would turn
+    the next redeploy of a working prod service into an outage. OAuth wins,
+    the flag is ignored, and a warning says so. A *partial* OAuth set plus
+    the flag still refuses (`build_auth_provider` raises before we get here;
+    the check below covers direct callers).
     """
+    from kalshi_mcp_server.http_guard import is_loopback_bind
+    from kalshi_mcp_server.oauth import (
+        ALLOWLIST_ENV_VARS,
+        OAUTH_CORE_ENV_VARS,
+        _parse_allowed_ids,
+        _parse_allowed_logins,
+    )
+
+    insecure = _env_flag("MCP_ALLOW_INSECURE_HTTP")
+
     if auth_provider is not None:
-        # If OAuth is enabled, the allowlist is also required (otherwise
-        # any GitHub user could call tools — see RestrictGitHubUsersMiddleware).
-        if not os.environ.get("MCP_ALLOWED_GITHUB_LOGINS", "").strip():
+        if insecure:
+            logger.warning(
+                "MCP_ALLOW_INSECURE_HTTP=1 is IGNORED because OAuth is configured — "
+                "the server runs with OAuth + the GitHub allowlist. Delete the "
+                "variable (DEPLOY.md Phase B) so this config isn't misread later."
+            )
+        # If OAuth is enabled, an allowlist is also required (otherwise any
+        # GitHub user could use the server — see RestrictGitHubUsersMiddleware).
+        if not _parse_allowed_ids() and not _parse_allowed_logins():
             raise ConfigError(
-                "OAuth is configured but MCP_ALLOWED_GITHUB_LOGINS is empty. "
-                "Set it to your GitHub login (comma-separated for multiple) "
-                "to lock tool calls to specific users."
+                "OAuth is configured but no GitHub allowlist is set. Set "
+                "MCP_ALLOWED_GITHUB_IDS (preferred — numeric ids never change; "
+                "find yours with `gh api user --jq .id`) and/or "
+                "MCP_ALLOWED_GITHUB_LOGINS (comma-separated) to lock the server "
+                "to specific users."
             )
         return
 
-    if os.environ.get("MCP_ALLOW_INSECURE_HTTP", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not insecure:
+        raise ConfigError(
+            "HTTP transport requires OAuth configuration. Set GITHUB_CLIENT_ID, "
+            "GITHUB_CLIENT_SECRET, MCP_BASE_URL, and MCP_ALLOWED_GITHUB_IDS or "
+            "MCP_ALLOWED_GITHUB_LOGINS — or set MCP_ALLOW_INSECURE_HTTP=1 if this "
+            "is local dev only. See DEPLOY.md for the production deployment guide."
+        )
+
+    core_set = [n for n in OAUTH_CORE_ENV_VARS if os.environ.get(n, "").strip()]
+    if core_set:
+        raise ConfigError(
+            "MCP_ALLOW_INSECURE_HTTP=1 is set alongside a partial OAuth "
+            f"configuration ({', '.join(core_set)}). Set all of "
+            f"{', '.join(OAUTH_CORE_ENV_VARS)} to run with OAuth, or unset "
+            "them for a no-auth local/private-network server."
+        )
+    allowlists_set = [n for n in ALLOWLIST_ENV_VARS if os.environ.get(n, "").strip()]
+    if allowlists_set:
         logger.warning(
-            "HTTP transport without OAuth — MCP_ALLOW_INSECURE_HTTP is set. "
-            "DO NOT use this configuration for any non-localhost deployment."
+            "%s set but NOT enforced: OAuth is off (MCP_ALLOW_INSECURE_HTTP=1), "
+            "so there is no GitHub identity to check.",
+            " / ".join(allowlists_set),
+        )
+
+    if not is_loopback_bind(bind_host):
+        if not _env_flag("MCP_ALLOW_INSECURE_PUBLIC_BIND"):
+            raise ConfigError(
+                f"Refusing to serve unauthenticated HTTP on non-loopback host "
+                f"{bind_host!r}: anyone who can reach that interface could read "
+                "the account and place trades. Bind to 127.0.0.1, configure "
+                "OAuth, or — only if something in front of this server (VPN, "
+                "authenticating reverse proxy, cloud IAM) controls access — also "
+                "set MCP_ALLOW_INSECURE_PUBLIC_BIND=1."
+            )
+        logger.warning(
+            "UNAUTHENTICATED HTTP on non-loopback host %s "
+            "(MCP_ALLOW_INSECURE_HTTP=1 + MCP_ALLOW_INSECURE_PUBLIC_BIND=1). "
+            "Access control is entirely up to whatever sits in front of this "
+            "server.",
+            bind_host,
         )
         return
 
-    raise ConfigError(
-        "HTTP transport requires OAuth configuration. Set GITHUB_CLIENT_ID, "
-        "GITHUB_CLIENT_SECRET, MCP_BASE_URL, and MCP_ALLOWED_GITHUB_LOGINS — "
-        "or set MCP_ALLOW_INSECURE_HTTP=1 if this is local dev only. "
-        "See DEPLOY.md for the production deployment guide."
+    logger.warning(
+        "HTTP transport without OAuth — MCP_ALLOW_INSECURE_HTTP is set. "
+        "DO NOT use this configuration for any non-localhost deployment."
     )
 
 

@@ -48,8 +48,10 @@ A single Render web service running the published Docker image, with:
 - **OAuth proxy** (GitHub provider) in front of the MCP endpoint —
   required for any MCP client that can't speak stdio and needs
   OAuth-protected HTTP (claude.ai is the primary one today).
-- **`MCP_ALLOWED_GITHUB_LOGINS` allowlist** — only specific GitHub
-  accounts can invoke tools, even after a successful OAuth.
+- **GitHub identity allowlist** (`MCP_ALLOWED_GITHUB_IDS` and/or
+  `MCP_ALLOWED_GITHUB_LOGINS`) — only specific GitHub accounts can use
+  the server at all (tools, resource reads like `kalshi://balance`, and
+  listings), even after a successful OAuth.
 - **Upstash Redis** (free tier) for Dynamic Client Registration
   persistence, so redeploys don't boot connected clients out.
 - **Image-deploy** (Pattern A) — Render pulls a tagged image from GHCR;
@@ -242,9 +244,13 @@ then adding OAuth once we know the URL.
 > **Is insecure-HTTP mode safe for a few minutes?** Yes, for a demo
 > deployment with `$0` balance and `KALSHI_TRADING_ENABLED=0`. The
 > only thing exposed is rate-limit consumption and the existence of
-> the URL. For a prod deployment with funds, use a placeholder Render
-> URL pattern guess (described in [Pre-known URL trick](#pre-known-url-trick)
-> below) to skip this phase.
+> the URL. Insecure mode also turns on a Host/Origin check that only
+> answers requests addressed to a loopback name (or a host you list in
+> `MCP_ALLOWED_HOSTS`), so MCP requests arriving through Render's
+> public hostname get `421` rather than reaching the tools — treat
+> that as a seatbelt, not as authentication. For a prod deployment
+> with funds, use a placeholder Render URL pattern guess (described in
+> [Pre-known URL trick](#pre-known-url-trick) below) to skip this phase.
 
 On Render:
 
@@ -268,7 +274,7 @@ On Render:
    as unhealthy and refuses to deploy.
 8. **Advanced** → **Docker Command:** leave blank. The image's `CMD`
    already passes `--host 0.0.0.0` to bind on all interfaces.
-9. **Environment Variables** (just these five for Phase A):
+9. **Environment Variables** (just these six for Phase A):
 
    | Key | Value |
    |---|---|
@@ -277,6 +283,12 @@ On Render:
    | `KALSHI_ENV` | `demo` |
    | `MCP_TRANSPORT` | `http` |
    | `MCP_ALLOW_INSECURE_HTTP` | `1` *(temporary — we delete this in Phase B)* |
+   | `MCP_ALLOW_INSECURE_PUBLIC_BIND` | `1` *(temporary — also deleted in Phase B)* |
+
+   The second flag is required because the image binds `0.0.0.0` (step
+   8): without OAuth, the server refuses a non-loopback bind unless you
+   opt in twice. Don't set `MCP_BASE_URL` yet — setting it without the
+   other OAuth vars is a partial OAuth config, which refuses to start.
 
 10. **Deploy.** First boot takes ~2 min (image pull + container start).
 
@@ -288,9 +300,9 @@ Smoke test from your terminal:
 
 ```bash
 curl -i https://kalshi-mcp-XXXX.onrender.com/mcp
-# Expected: HTTP/1.1 200 OK or 406 Not Acceptable
-#   (this is the MCP endpoint responding to a bare HTTP GET; we want
-#    anything other than 502)
+# Expected: HTTP/1.1 421 Misdirected Request ("Invalid Host header")
+#   (the server is up; insecure mode refuses the public hostname — see
+#    the note above. We want anything other than 502)
 ```
 
 If you get 502, jump to [Troubleshooting → 502 Bad Gateway](#502-bad-gateway).
@@ -357,7 +369,8 @@ Back in Render → service → **Environment** tab → add these:
 | `GITHUB_CLIENT_ID` | from step 5 |
 | `GITHUB_CLIENT_SECRET` | from step 5 |
 | `MCP_BASE_URL` | `https://kalshi-mcp-XXXX.onrender.com` (no trailing slash) |
-| `MCP_ALLOWED_GITHUB_LOGINS` | your GitHub username (comma-separated for multiple users) |
+| `MCP_ALLOWED_GITHUB_IDS` | your numeric GitHub user id — `gh api user --jq .id`, or the `id` field of `https://api.github.com/users/<login>` (comma-separated for multiple users). **Preferred**: ids never change, while a login can be renamed and then re-registered by someone else |
+| `MCP_ALLOWED_GITHUB_LOGINS` | *(alternative or addition to the ids)* your GitHub username, comma-separated for multiple. A caller is let in if their id **or** their login matches. At least one of the two lists is required |
 | `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above — **required if you set `MCP_REDIS_URL`** (the server refuses to start otherwise; it's also what the storage-encryption key is derived from) |
 | `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* — also persists runtime safety-limit overrides (see "Tuning safety limits" below) |
 | `MCP_REDIS_COLLECTION_PREFIX` | *(optional, default `kalshi`)* namespace for this deployment's OAuth collections **and** its safety-limit override key. Set it if another server (including a second deployment of this image) shares this Redis — see below |
@@ -429,9 +442,13 @@ Expect **one reconnect** regardless: the new keyspace plus encryption
 makes existing state unreadable. That degrades to a cache miss, so
 clients re-register cleanly — you'll just see a single reconnect prompt.
 
-**Delete** the `MCP_ALLOW_INSECURE_HTTP` variable — it's no longer
-needed and the server's fail-closed check will refuse to start with it
-alongside OAuth on.
+**Delete** the `MCP_ALLOW_INSECURE_HTTP` and
+`MCP_ALLOW_INSECURE_PUBLIC_BIND` variables. Once all three OAuth vars are
+set, OAuth wins and both flags are ignored — the server still boots, so a
+forgotten flag won't take a working deploy down — but it logs a
+`MCP_ALLOW_INSECURE_HTTP=1 is IGNORED` warning on every start, and a
+leftover flag is one deleted OAuth var away from an unauthenticated
+server. (If only *some* OAuth vars are set, the server refuses to start.)
 
 **Save** with the **"Save, rebuild, and deploy"** option (the dropdown
 next to "Save only"). Render rebuilds + redeploys. Watch the logs for:
@@ -439,7 +456,7 @@ next to "Save only"). Render rebuilds + redeploys. Watch the logs for:
 ```
 INFO:kalshi_mcp_server:Starting kalshi-mcp-server X.Y.Z (env=demo, trading_enabled=False)
 INFO:kalshi_mcp_server:OAuth: GitHub proxy enabled — DCR client storage: redis (persistent, encrypted, prefixed)
-INFO:kalshi_mcp_server:OAuth: tool calls restricted to GitHub logins in MCP_ALLOWED_GITHUB_LOGINS
+INFO:kalshi_mcp_server:OAuth: all MCP requests restricted to MCP_ALLOWED_GITHUB_IDS / MCP_ALLOWED_GITHUB_LOGINS
 INFO:kalshi_mcp_server:Transport: http
 INFO:kalshi_mcp_server:HTTP bind: 0.0.0.0:10000
 INFO:     Uvicorn running on http://0.0.0.0:10000
@@ -612,8 +629,9 @@ Disconnecting from claude.ai doesn't revoke the OAuth grant on GitHub
 — do that separately at https://github.com/settings/applications if
 you want to fully revoke.
 
-**Multiple Claude users.** Add their GitHub logins to
-`MCP_ALLOWED_GITHUB_LOGINS` (comma-separated). Each connects via their
+**Multiple Claude users.** Add their numeric GitHub ids to
+`MCP_ALLOWED_GITHUB_IDS` (or their logins to `MCP_ALLOWED_GITHUB_LOGINS`),
+comma-separated. Each connects via their
 own claude.ai → GitHub OAuth flow.
 
 ---
@@ -708,6 +726,24 @@ and any other modern OAuth-MCP client expects. But there are legitimate
 - **Cloud-IAM-protected service** — Cloud Run with IAM, ECS behind an
   ALB with Cognito, etc. Same idea: cloud provider handles auth; the
   MCP server is unauthenticated behind it.
+
+Two guards apply to every no-auth HTTP setup:
+
+- **Loopback bind by default.** With `MCP_ALLOW_INSECURE_HTTP=1` the
+  server refuses any `--host` other than `127.0.0.1` / `localhost` /
+  `::1` unless you *also* set `MCP_ALLOW_INSECURE_PUBLIC_BIND=1`. The
+  published image binds `0.0.0.0`, so containerized setups (Cloud Run,
+  ECS, a VPN sidecar) need both flags. A reverse proxy on the same host
+  forwarding to `127.0.0.1` needs only the first.
+- **DNS-rebinding protection.** Requests whose `Host` header (and
+  `Origin`, when a browser sends one) isn't a loopback name get `421` /
+  `403`. That stops a malicious web page from driving a server on your
+  laptop through the browser. If clients reach the server by another
+  name — a tailnet hostname, or a reverse proxy that forwards the
+  public `Host` (Caddy does by default) — list those names in
+  `MCP_ALLOWED_HOSTS` (comma-separated; ports are ignored).
+  `MCP_BASE_URL` can't be used for this: on its own it's a partial
+  OAuth config and refuses to start.
 
 > ⚠️ **Don't combine `MCP_ALLOW_INSECURE_HTTP=1` with a directly
 > public URL.** The fail-closed startup check exists exactly to
@@ -857,9 +893,15 @@ gets a generic error. Fix the URLs to match and click "Connect" again.
 
 ### Tools return "Unauthorized" after OAuth completes
 
-`MCP_ALLOWED_GITHUB_LOGINS` doesn't include your GitHub login. The
-comparison is case-insensitive but exact-match — `cejor` won't match if
-you registered as `cejor6`. Check the spelling, save, redeploy.
+Neither `MCP_ALLOWED_GITHUB_IDS` contains your numeric GitHub id nor
+`MCP_ALLOWED_GITHUB_LOGINS` your login. The error names the login and id
+the server saw (`GitHub user cejor (id 12345) is not authorized`) — copy
+the id into `MCP_ALLOWED_GITHUB_IDS`. Login comparison is
+case-insensitive but exact-match — `cejor` won't match if you registered
+as `cejor6`. Save, redeploy. The allowlist covers every request, so an
+unlisted user can't list tools or read resources either — usually the
+connector just fails to connect, and the reason is in the server log
+(`Refused MCP initialize: GitHub user …`).
 
 ### "Trading is disabled" on every order attempt
 
@@ -1021,9 +1063,43 @@ beyond just typing the env var. Set both and redeploy.
 
 You set `MCP_TRANSPORT=http` without configuring OAuth (or without
 setting `MCP_ALLOW_INSECURE_HTTP=1`). For Phase A of the quick start,
-add `MCP_ALLOW_INSECURE_HTTP=1`. For production, finish setting all
-OAuth env vars (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`,
-`MCP_BASE_URL`, `MCP_ALLOWED_GITHUB_LOGINS`).
+add `MCP_ALLOW_INSECURE_HTTP=1` and `MCP_ALLOW_INSECURE_PUBLIC_BIND=1`.
+For production, finish setting all OAuth env vars (`GITHUB_CLIENT_ID`,
+`GITHUB_CLIENT_SECRET`, `MCP_BASE_URL`, and `MCP_ALLOWED_GITHUB_IDS`
+and/or `MCP_ALLOWED_GITHUB_LOGINS`).
+
+### "Partial OAuth configuration: … set but … missing"
+
+One or two of `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` /
+`MCP_BASE_URL` are set. All three enable OAuth; none disables it;
+anything in between is refused on HTTP rather than silently running
+without authentication. Set the missing ones (or remove the stray one).
+On stdio this is only a warning, since stdio never uses OAuth.
+
+### "MCP_ALLOW_INSECURE_HTTP=1 is set alongside a partial OAuth configuration"
+
+You're midway through Phase B: some OAuth vars are set, the insecure flag
+is still on. Finish setting `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` and
+`MCP_BASE_URL` (then delete the flag), or remove the stray OAuth var.
+
+### Warning: "MCP_ALLOW_INSECURE_HTTP=1 is IGNORED because OAuth is configured"
+
+Not an error — the server is running with OAuth. Delete the leftover
+`MCP_ALLOW_INSECURE_HTTP` (and `MCP_ALLOW_INSECURE_PUBLIC_BIND`) to
+silence it.
+
+### "Refusing to serve unauthenticated HTTP on non-loopback host"
+
+Insecure mode is bound to `0.0.0.0` (the image default) without
+`MCP_ALLOW_INSECURE_PUBLIC_BIND=1`. Add it for Phase A, or finish the
+OAuth setup instead.
+
+### `421 Invalid Host header` / `403 Invalid Origin header`
+
+Insecure mode's DNS-rebinding guard. Expected on Render during Phase A.
+For a private-network or reverse-proxy setup, add the hostname clients
+use to `MCP_ALLOWED_HOSTS` (see
+[Remote hosting without OAuth](#remote-hosting-without-oauth-advanced)).
 
 ---
 

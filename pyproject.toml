@@ -27,7 +27,24 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp>=2.0.0",
+    # Floor = 3.2.4: the lowest release on which the full test suite passes,
+    # bisected against mcp 1.30.0. What forces each step up:
+    # - APIs we import: fastmcp.server.middleware (2.9+), GitHubProvider
+    #   (2.12+), OAuthProxy `client_storage` as a py-key-value store +
+    #   `jwt_signing_key` (2.13+, which also carries the OAuth-proxy
+    #   consent-screen / confused-deputy fixes), get_http_headers(include=).
+    # - >=3.0: every 2.13.x/2.14.x pins py-key-value-aio<0.4, but the [oauth]
+    #   extra needs >=0.4.4 (RedisStore(client=), PrefixCollectionsWrapper,
+    #   FernetEncryptionWrapper(source_material=)); 2.13.x also caps mcp<1.23.
+    # - >=3.2.4: earlier 3.x emit the whole docstring (incl. the Args: block)
+    #   as the tool description, pushing 19 tools past OpenAI's 1024-char cap
+    #   (tests/test_tool_schemas.py). The auth perimeter itself
+    #   (RestrictGitHubUsersMiddleware.on_request) already passes on 3.0.0.
+    "fastmcp>=3.2.4",
+    # Direct dependency: oauth.py raises mcp.shared.exceptions.McpError for
+    # refused non-tool requests. Floor fixes CVE-2026-59951 (unbounded
+    # stateful Streamable-HTTP sessions → memory exhaustion), fixed in 1.30.0.
+    "mcp>=1.30.0",
     "cryptography>=42.0.0",
     "httpx>=0.27.0",
     "websockets>=12.0",

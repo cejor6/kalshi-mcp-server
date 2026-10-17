@@ -22,10 +22,13 @@ def _clean_oauth_env(monkeypatch):
         "GITHUB_CLIENT_SECRET",
         "MCP_BASE_URL",
         "MCP_ALLOWED_GITHUB_LOGINS",
+        "MCP_ALLOWED_GITHUB_IDS",
         "MCP_JWT_SIGNING_KEY",
         "MCP_REDIS_URL",
         "MCP_REDIS_COLLECTION_PREFIX",
         "MCP_ALLOW_INSECURE_HTTP",
+        "MCP_ALLOW_INSECURE_PUBLIC_BIND",
+        "MCP_ALLOWED_HOSTS",
     ]:
         monkeypatch.delenv(var, raising=False)
 
@@ -524,7 +527,7 @@ def test_http_policy_refuses_oauth_without_allowlist(monkeypatch):
     assert provider is not None
     with pytest.raises(ConfigError) as exc:
         _enforce_http_auth_policy(auth_provider=provider)
-    assert "MCP_ALLOWED_GITHUB_LOGINS is empty" in str(exc.value)
+    assert "no GitHub allowlist is set" in str(exc.value)
 
 
 def test_http_policy_passes_with_oauth_and_allowlist(monkeypatch):
