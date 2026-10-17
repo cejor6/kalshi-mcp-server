@@ -99,6 +99,15 @@ class Config:
     # safety envelope). Has a default so existing constructors stay valid.
     runtime_limit_tuning_enabled: bool = True
 
+    # When False (the default), kalshi_set_safety_limits may only TIGHTEN a
+    # limit relative to its CURRENT effective value — a runtime caller (incl.
+    # the trading model itself) can shrink the risk envelope but never widen
+    # it, even back toward the env ceiling. Set
+    # MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1 to let the tool also relax a limit,
+    # still never past its env ceiling. Has a default so existing constructors
+    # stay valid.
+    runtime_limit_loosening_enabled: bool = False
+
     # Combo (parlay) creation. `POST /multivariate_event_collections/{ticker}`
     # materializes a combo market ticker so it can be looked up and traded. It
     # commits NO money, so it gets its own gate rather than riding on
@@ -173,6 +182,9 @@ class Config:
             port=_get_int("PORT", 8000),
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
             runtime_limit_tuning_enabled=_get_bool("MCP_ALLOW_RUNTIME_LIMIT_TUNING", default=True),
+            runtime_limit_loosening_enabled=_get_bool(
+                "MCP_ALLOW_RUNTIME_LIMIT_LOOSENING", default=False
+            ),
             combo_creation_enabled=_get_bool("MCP_ALLOW_COMBO_CREATION", default=False),
             max_combo_creations_per_day=_get_int("MCP_MAX_COMBO_CREATIONS_PER_DAY", 100),
             jev_scoring_enabled=_get_bool("MCP_ALLOW_JEV_SCORING", default=False),

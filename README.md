@@ -530,10 +530,12 @@ ATM is — small mistakes shouldn't cost large amounts.
   before the request reaches Kalshi.
 - **Tighten limits at runtime, no redeploy.** Those env vars are the hard
   *ceiling*. The `kalshi_set_safety_limits` tool can tighten any limit
-  on a running server (e.g. a fast clamp-down) but can **never loosen one
-  past its env ceiling** — the three caps only go down, the cash reserve
-  only goes up. Raising a ceiling still requires changing the env var and
-  redeploying. The limits in force vs. their ceilings show up in
+  on a running server (e.g. a fast clamp-down). By default it can **only
+  tighten relative to the current value** — the three caps only go down, the
+  cash reserve only goes up — so a runtime caller can't undo a clamp-down.
+  Relaxing a limit needs `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`, and even then
+  never past its env ceiling. Raising a ceiling still requires changing the
+  env var and redeploying (see AGENTS.md for undoing a persisted tighten). The limits in force vs. their ceilings show up in
   `kalshi_get_environment` and `kalshi://environment`. Set `MCP_REDIS_URL`
   to make runtime changes survive a restart (otherwise they reset to the
   env ceilings on reboot).

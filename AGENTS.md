@@ -132,17 +132,30 @@ fork-and-adjust to your risk tolerance.
 
 **Runtime adjustment (without a redeploy).** The env vars set the *hard
 ceiling*. The `kalshi_set_safety_limits` operator tool can tighten any of
-the four limits at runtime — but **never loosen one past its env ceiling**
-(`SafetyController` validates direction-aware: the three caps may only go
-down, `cash_reserve_usd` may only go up; the env value is the absolute
-loosest setting). This is the fail-closed property: a runtime actor or bug
-can shrink the risk envelope but never widen it. To raise a ceiling you
-must change the env var and redeploy. The limits in force vs. their
-ceilings are visible via `kalshi_get_environment` and the
-`kalshi://environment` resource. Non-finite values (`NaN`/`inf`) are
+the four limits at runtime. By default it can **only tighten relative to the
+limit's CURRENT effective value** (`SafetyController.set_limits`,
+direction-aware: the three caps may only go down, `cash_reserve_usd` may only
+go up). This is the fail-closed property: a runtime actor or bug — including
+the trading model itself, which can call the tool — can shrink the risk
+envelope but never widen it, not even back toward the env ceiling. Relaxing a
+runtime-tightened limit requires the operator opt-in
+`MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1` (default `0`); even then a limit can
+**never be loosened past its env ceiling** — the env value is the absolute
+loosest setting, and raising it means changing the env var and redeploying.
+The limits in force vs. their ceilings (and `safety_limits_loosening_allowed`)
+are visible via `kalshi_get_environment` and the `kalshi://environment`
+resource. Non-finite values (`NaN`/`inf`) are
 rejected on every path — on a write, on load from the store, and on the
 env ceilings themselves — since they would otherwise slip past the
 `<`/`>` comparisons and silently disable a cap.
+
+**Undoing a tighten with loosening off.** Either set
+`MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`, redeploy, and call the tool (setting a
+limit back to its ceiling clears the override; unset the flag again
+afterwards), or restart the server without the override: with the default
+in-memory store a restart alone reverts to the env ceilings; with
+`MCP_REDIS_URL` the override is reloaded on boot, so first delete the Redis key
+`kalshi-mcp:safety-limits` (`safety_store._REDIS_KEY`) and then restart.
 
 The tool is gated by `MCP_ALLOW_RUNTIME_LIMIT_TUNING` (default on). Set it
 to `0` to not register `kalshi_set_safety_limits` at all — useful on a

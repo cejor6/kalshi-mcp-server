@@ -41,6 +41,10 @@ _ALL_LIMIT_FIELDS = (
 # conservative, so its override may only go >= the env value. The env var is
 # the absolute loosest setting either way.
 _ASCENDING_LIMITS = frozenset({"cash_reserve_usd"})
+# The Redis key `safety_store.RedisLimitsStore` persists overrides under, named
+# in operator-facing errors. Duplicated (safety_store imports this module, so
+# importing it back would be circular); a test pins the two together.
+_PERSISTED_OVERRIDE_KEY = "kalshi-mcp:safety-limits"
 
 
 @dataclass(frozen=True)
@@ -228,13 +232,15 @@ class _DailyCounter:
 class SafetyController:
     """Enforces trading-enabled + size + daily caps. Lives for the server's lifetime.
 
-    The four numeric limits are *runtime-adjustable* (see `set_limits`), but
-    only ever to a value at least as tight as the env-configured ceiling —
-    the env vars in `Config` are the absolute maximum and can never be
-    loosened past at runtime. Adjustments persist via the injected
-    `LimitsStore` (in-memory by default; Redis-backed when configured) and
-    are re-clamped to the env ceiling on load, so a stale or hostile stored
-    value can never widen a limit.
+    The four numeric limits are *runtime-adjustable* (see `set_limits`). By
+    default a runtime change may only TIGHTEN a limit relative to its current
+    effective value — the risk envelope can shrink but never widen at runtime.
+    With `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1` a change may also relax a limit,
+    but never past the env-configured ceiling: the env vars in `Config` are the
+    absolute maximum either way. Adjustments persist via the injected
+    `LimitsStore` (in-memory by default; Redis-backed when configured) and are
+    re-clamped to the env ceiling on load, so a stale or hostile stored value
+    can never widen a limit past it.
     """
 
     def __init__(self, config: Config, *, store: LimitsStore | None = None) -> None:
@@ -277,13 +283,16 @@ class SafetyController:
         """The safety fields for `kalshi_get_environment` / `kalshi://environment`.
 
         Centralized here so the two callers can't drift: `safety_limits` are
-        the limits in force, `safety_ceilings` the env hard maximums, and
-        `safety_limits_persist` whether a runtime change survives a restart.
+        the limits in force, `safety_ceilings` the env hard maximums,
+        `safety_limits_persist` whether a runtime change survives a restart, and
+        `safety_limits_loosening_allowed` whether a runtime change may relax a
+        limit (MCP_ALLOW_RUNTIME_LIMIT_LOOSENING) or only tighten it.
         """
         return {
             "safety_limits": self._effective.as_dict(),
             "safety_ceilings": self._ceilings.as_dict(),
             "safety_limits_persist": self._store.durable,
+            "safety_limits_loosening_allowed": self._config.runtime_limit_loosening_enabled,
         }
 
     @property
@@ -299,13 +308,18 @@ class SafetyController:
         max_contracts_per_order: int | None = None,
         cash_reserve_usd: float | None = None,
     ) -> tuple[SafetyLimits, bool]:
-        """Tighten (or relax, up to the env ceiling) one or more limits at runtime.
+        """Tighten one or more limits at runtime (relax only when explicitly allowed).
 
         Only the fields you pass are changed; `None` leaves a field as-is.
-        Each new value is validated against the env ceiling in the correct
-        direction (the three caps may only go <= their env value; the cash
-        reserve may only go >= its env value). A value that would loosen
-        past the ceiling raises `SafetyError` and nothing changes.
+        Each new value is validated in the correct direction (the three caps
+        tighten downward; the cash reserve tightens upward):
+
+        - Always: never looser than the env ceiling.
+        - By default: never looser than the CURRENT effective value either, so
+          a runtime caller can only shrink the envelope. Relaxing a limit back
+          toward its ceiling needs `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`.
+
+        Any violating value raises `SafetyError` and nothing changes.
 
         Returns `(new_effective_limits, durably_persisted)`. Persistence is
         best-effort: the in-memory update always succeeds (so an emergency
@@ -334,6 +348,11 @@ class SafetyController:
         # leave Redis reflecting a stale subset of the overrides.
         async with self._limits_lock:
             previous = self._effective
+            # Judged against the current value INSIDE the lock, so a concurrent
+            # tighten can't be undone by a stale read.
+            if not self._config.runtime_limit_loosening_enabled:
+                for name, value in provided.items():
+                    self._validate_not_looser_than_current(name, value, getattr(previous, name))
             merged = previous.as_dict()
             for name, value in provided.items():
                 merged[name] = int(value) if name == "max_contracts_per_order" else float(value)
@@ -390,6 +409,21 @@ class SafetyController:
                 f"({ceiling}). A runtime change may only tighten (<= the env "
                 f"setting). The env var is the absolute maximum; raise it and "
                 f"redeploy to lift the ceiling."
+            )
+
+    @staticmethod
+    def _validate_not_looser_than_current(name: str, value: float, current: float) -> None:
+        looser = value < current if name in _ASCENDING_LIMITS else value > current
+        if looser:
+            direction = "lower" if name in _ASCENDING_LIMITS else "raise"
+            raise SafetyError(
+                f"Refusing to set {name}={value}: that would {direction} it from its "
+                f"current value ({current}), i.e. LOOSEN it. At runtime limits may "
+                f"only be tightened. To relax a runtime-tightened limit an operator "
+                f"must either set MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1 and redeploy "
+                f"(still capped at the env ceiling), or restart the server — after "
+                f"deleting the Redis key {_PERSISTED_OVERRIDE_KEY!r} if overrides "
+                f"persist via MCP_REDIS_URL."
             )
 
     def _overrides_of(self, effective: SafetyLimits) -> dict[str, float | int]:
