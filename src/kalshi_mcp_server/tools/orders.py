@@ -32,13 +32,16 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import Field
 
 from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError, SafetyError
-from kalshi_mcp_server.safety import OrderIntent
+from kalshi_mcp_server.safety import OrderIntent, OrderReservation
 from kalshi_mcp_server.tools._validation import _validate_path_segment, _validate_ticker
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 _PENDING_TTL_S = 300  # 5 minutes
+# 4xx statuses that do NOT prove the order was refused: 408 Request Timeout
+# and 425 Too Early can be returned after (or while) the server processed it.
+_AMBIGUOUS_4XX = frozenset({408, 425})
 # Live prepared-but-unconfirmed orders. Each holds no money, but an unbounded
 # map is a memory leak an agent loop can drive; 100 is far more than any sane
 # workflow keeps open within the 5-minute TTL.
@@ -62,7 +65,9 @@ class _PendingOrder:
     # a retry resends the identical body (same client_order_id) without
     # re-reserving.
     possibly_sent: bool = False
-    reserved_cost_usd: float | None = None
+    # The daily-budget debit for this order (amount + the UTC day it was
+    # charged to). Set by reserve_order; cleared only by an unambiguous release.
+    reservation: OrderReservation | None = None
 
 
 def _gc_expired(pending: dict[str, _PendingOrder]) -> None:
@@ -345,7 +350,7 @@ def register(server: FastMCP) -> None:
         """
         guidance = (
             f"An active cash reserve (${reserve_usd:.2f}) can't be enforced without "
-            "it, so the order was NOT sent and nothing was reserved. Retry "
+            "it, so the order was NOT sent by this call. Retry "
             "kalshi_confirm_order with the same confirmation_id."
         )
         try:
@@ -410,13 +415,31 @@ def register(server: FastMCP) -> None:
         # (theoretical) build failure can't strand a reservation.
         body = _build_v2_order_body(prepared)
         is_retry = prepared.possibly_sent
+        # Fresh cash, net of OTHER orders whose outcome is unknown (they may
+        # land later without showing in the balance yet). Read for both paths:
+        # a retry must not breach the floor either. Over-counts an ambiguous
+        # order that did land — the safe direction.
+        reserve_usd = safety.effective_limits().cash_reserve_usd
+        cash_usd = (
+            await _read_cash_usd(reserve_usd) - _outstanding_ambiguous_usd(confirmation_id)
+            if reserve_usd > 0
+            else None
+        )
 
         if is_retry:
-            # The cost is already reserved and the order may already exist —
-            # resend the identical request. Per-order caps still apply as they
-            # stand now; the daily/cash checks would double-count.
+            # The order may already exist — resend the identical request.
             try:
-                safety.recheck_reserved_order(intent)
+                reservation = prepared.reservation
+                if reservation is None or reservation.day != safety.daily_spend_day():
+                    # The reservation was charged to an earlier UTC day (or is
+                    # missing), so today's counter doesn't carry this order.
+                    # Charge it to today — full checks incl. the daily cap. The
+                    # old day's debit stays where it is (over-reserve, safe).
+                    prepared.reservation = safety.reserve_order(intent, current_cash_usd=cash_usd)
+                else:
+                    # Already counted today; re-run everything except the daily
+                    # check (which would double-count it), incl. the cash floor.
+                    safety.recheck_reserved_order(intent, current_cash_usd=cash_usd)
             except SafetyError as exc:
                 raise SafetyError(
                     f"{exc} This confirmation_id's earlier send had an UNKNOWN "
@@ -425,12 +448,10 @@ def register(server: FastMCP) -> None:
                     f"{prepared.idempotency_key!r}."
                 ) from exc
         else:
-            reserve_usd = safety.effective_limits().cash_reserve_usd
-            cash_usd = await _read_cash_usd(reserve_usd) if reserve_usd > 0 else None
             try:
                 # Atomic: re-check against the limits in force now + debit the
                 # daily counter, with no await in between.
-                prepared.reserved_cost_usd = safety.reserve_order(intent, current_cash_usd=cash_usd)
+                prepared.reservation = safety.reserve_order(intent, current_cash_usd=cash_usd)
             except SafetyError:
                 # A policy refusal is final for this token — same as prepare's
                 # "no rejected-but-here's-a-token state". Re-prepare if needed.
@@ -440,10 +461,12 @@ def register(server: FastMCP) -> None:
         try:
             response = await client.post("/portfolio/events/orders", json=body)
         except KalshiAPIError as exc:
-            refused = isinstance(exc, RateLimitError) or 400 <= exc.status < 500
+            refused = (
+                isinstance(exc, RateLimitError) or 400 <= exc.status < 500
+            ) and exc.status not in _AMBIGUOUS_4XX
             if not refused:
-                # Timeout / transport error (status 0), 3xx or 5xx: Kalshi may
-                # have accepted it. Keep the reservation and the token.
+                # Timeout / transport error (status 0), 3xx, 408/425 or 5xx:
+                # Kalshi may have accepted it. Keep the reservation and token.
                 _mark_ambiguous(confirmation_id, prepared)
                 raise KalshiAPIError(
                     status=exc.status,
@@ -489,9 +512,17 @@ def register(server: FastMCP) -> None:
         return response
 
     def _release(prepared: _PendingOrder) -> None:
-        if prepared.reserved_cost_usd is not None:
-            safety.release_order(prepared.reserved_cost_usd)
-            prepared.reserved_cost_usd = None
+        if prepared.reservation is not None:
+            safety.release_order(prepared.reservation)
+            prepared.reservation = None
+
+    def _outstanding_ambiguous_usd(confirmation_id: str) -> float:
+        """Reserved cost of OTHER pending orders whose send outcome is unknown."""
+        return sum(
+            p.reservation.cost_usd
+            for token, p in pending.items()
+            if token != confirmation_id and p.possibly_sent and p.reservation is not None
+        )
 
     def _mark_ambiguous(confirmation_id: str, prepared: _PendingOrder) -> None:
         prepared.possibly_sent = True
@@ -501,7 +532,7 @@ def register(server: FastMCP) -> None:
         pending[confirmation_id] = prepared
 
     def _ambiguous_message(detail: str, confirmation_id: str, prepared: _PendingOrder) -> str:
-        cost = prepared.reserved_cost_usd
+        cost = prepared.reservation.cost_usd if prepared.reservation else None
         cost_note = f"${cost:.2f}" if cost is not None else "Its worst-case cost"
         return (
             f"{detail} — OUTCOME UNKNOWN: Kalshi may have accepted this order. "

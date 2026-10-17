@@ -129,17 +129,22 @@ locally before any request goes to Kalshi:
 - `MCP_DAILY_LIMIT_USD` — refuse if projected daily spend would exceed it.
 - `MCP_MAX_CONTRACTS_PER_ORDER` — refuse orders with more contracts than this.
 - `MCP_CASH_RESERVE_USD` — refuse if the order would leave less than this
-  in cash. Checked at confirm against a fresh `GET /portfolio/balance`
-  (`balance`, available cash in cents); if that read fails while a non-zero
-  reserve is active, the order is refused (fail closed). With a `0` reserve
-  the balance isn't read.
+  in cash. Checked at confirm — on the first send AND on every retry —
+  against a fresh `GET /portfolio/balance` (`balance`, available cash in
+  cents) minus the reserved cost of every OTHER pending order whose send
+  outcome is unknown (it may land later without showing in the balance yet;
+  if it already landed it is counted twice, the safe direction). If the read
+  fails while a non-zero reserve is active, the order is refused (fail
+  closed). With a `0` reserve the balance isn't read.
 
 **Worst-case cost has ONE formula:** `OrderIntent.worst_case_cost_cents()` —
 notional at the limit price (a sell counts as the complementary buy,
-`100 - price`) plus a conservative fee bound, Kalshi's general taker fee
-`ceil_to_cent(0.07 x C x P x (1-P))`. It's an *estimate that errs high*: maker
-fees and some markets' multipliers are lower (per-fill rounding across many
-partial fills is the one way to exceed it, by a cent per fill). The size cap,
+`100 - price`) plus a conservative fee bound based on Kalshi's general taker
+fee `ceil_to_cent(0.07 x C x P x (1-P))` but rounded up **per contract**:
+`C x ceil(0.07 x P x (1-P))`. Kalshi rounds each *fill* up, so a whole-order
+ceiling can be beaten by partial fills; `ceil(c x a) <= c x ceil(a)` makes the
+per-contract form cover any split. It's an *estimate that errs high*: maker
+fees and some markets' multipliers are lower. The size cap,
 the daily counter, the cash check and prepare's `estimated_cost_usd` all use
 it — don't reintroduce an inline `count * price / 100` anywhere.
 
@@ -160,7 +165,13 @@ retry). On a timeout, transport error, 3xx/5xx or cancellation the order may
 exist, so the reservation **and the pending entry** are kept: retrying the
 same `confirmation_id` resends the identical body with the same
 `client_order_id` and does not reserve again, and the error tells the agent to
-check `kalshi_get_orders` first. A *refused retry* also keeps the reservation —
+check `kalshi_get_orders` first. A first-send 408 or 425 counts as ambiguous
+too. Reservations carry the **UTC day** they were charged to
+(`OrderReservation`): a retry after midnight is reserved again against the new
+day's counter (full daily check — otherwise day 2 could place its cap plus the
+retried order), and `release_order` never credits a previous day's reservation
+to today. A retry also re-runs the per-order caps and the cash floor against
+the limits and balance in force now. A *refused retry* also keeps the reservation —
 Kalshi rejects a duplicate `client_order_id` when the first send landed, so a
 4xx there proves nothing. Over-reserving is the acceptable failure here;
 under-reserving is not. The pending map is capped at 100 live entries.
@@ -492,9 +503,10 @@ Order-placing tools (anything that puts money at risk) MUST:
 - Call `safety.reserve_order(intent, current_cash_usd=...)` immediately
   before the wire call — passing a fresh cash balance whenever the active
   `cash_reserve_usd` is non-zero — and `safety.release_order(...)` only when
-  Kalshi unambiguously placed nothing. NOT `record_order_committed` after
-  success: that is check-then-await-then-record, which concurrent or
-  pre-prepared orders slip past. See "Safety model".
+  Kalshi unambiguously placed nothing. Never record spend after success
+  instead: that is check-then-await-then-record, which concurrent or
+  pre-prepared orders slip past (the old `record_order_committed` was removed
+  for that reason). See "Safety model".
 
 **The order write family is on Kalshi's V2 `/portfolio/events/orders` path,
 and the request shape is YES-centric (issue #83).** Kalshi retired the old

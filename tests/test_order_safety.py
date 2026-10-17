@@ -11,13 +11,17 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import math
+import threading
 import time
 from collections.abc import Awaitable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 from fastmcp import FastMCP
 
+from kalshi_mcp_server import safety as safety_module
 from kalshi_mcp_server.auth import KalshiSigner
 from kalshi_mcp_server.client import KalshiClient
 from kalshi_mcp_server.config import DEMO_REST_BASE, DEMO_WS_URL, Config
@@ -60,26 +64,44 @@ def _intent(count: int = 10, price: int = 50, action: str = "buy", side: str = "
 @pytest.mark.parametrize(
     "count,price,expected_fee_cents",
     [
-        # Kalshi's documented example: 100 contracts @ 50c → 0.07*100*.25 = $1.75.
-        (100, 50, 175),
-        # 10 @ 25c → 0.07*10*.25*.75 = 13.125c → rounded UP to 14c.
-        (10, 25, 14),
-        # 1 @ 1c → 0.07*.01*.99 = 0.0693c → still a whole cent.
+        # Kalshi's documented example is 100 @ 50c → $1.75 for ONE fill; the
+        # per-contract bound is 100 x ceil(1.75c) = $2.00, which also covers
+        # 100 separate one-contract fills (each rounded up to 2c).
+        (100, 50, 200),
+        # 10 @ 25c → 10 x ceil(1.3125c) = 20c.
+        (10, 25, 20),
+        # 1 @ 1c → ceil(0.0693c) → still a whole cent.
         (1, 1, 1),
         # Symmetric in P: 1 @ 99c is the same as 1 @ 1c.
         (1, 99, 1),
     ],
 )
-def test_fee_upper_bound_matches_kalshi_taker_formula(count, price, expected_fee_cents):
+def test_fee_upper_bound_is_per_contract_ceiling(count, price, expected_fee_cents):
     assert _intent(count=count, price=price).fee_upper_bound_cents() == expected_fee_cents
 
 
+@pytest.mark.parametrize("price", range(1, 100))
+def test_fee_bound_covers_any_split_into_partial_fills(price):
+    """S2: Kalshi rounds each FILL's fee up, so a whole-order ceiling can be
+    beaten by partial fills. The per-contract bound is >= every split."""
+    count = 7
+    intent = _intent(count=count, price=price)
+
+    def fill_fee(c: int) -> int:  # Kalshi: ceil_to_cent(0.07 x c x P x (1-P))
+        return -(-(7 * c * price * (100 - price)) // 10_000)
+
+    worst_split = count * fill_fee(1)  # all one-contract fills
+    assert intent.fee_upper_bound_cents() >= worst_split
+    assert intent.fee_upper_bound_cents() >= fill_fee(count)
+    assert intent.fee_upper_bound_cents() >= fill_fee(3) + fill_fee(4)
+
+
 def test_worst_case_cost_buy_and_sell_include_fee():
-    # Buy 10 YES @ 30c: notional $3.00 + fee ceil(0.07*10*.3*.7 = 14.7c) = 15c.
-    assert _intent(count=10, price=30, action="buy").worst_case_cost_cents() == 315
-    # Sell 10 YES @ 30c is buying NO @ 70c: notional $7.00 + the same 15c fee.
-    assert _intent(count=10, price=30, action="sell").worst_case_cost_cents() == 715
-    assert _intent(count=10, price=30, action="sell").worst_case_cost_usd() == 7.15
+    # Buy 10 YES @ 30c: notional $3.00 + fee 10 x ceil(1.47c) = 20c.
+    assert _intent(count=10, price=30, action="buy").worst_case_cost_cents() == 320
+    # Sell 10 YES @ 30c is buying NO @ 70c: notional $7.00 + the same 20c fee.
+    assert _intent(count=10, price=30, action="sell").worst_case_cost_cents() == 720
+    assert _intent(count=10, price=30, action="sell").worst_case_cost_usd() == 7.20
 
 
 def test_size_cap_counts_the_fee():
@@ -90,11 +112,15 @@ def test_size_cap_counts_the_fee():
         ctrl.check_order(_intent(count=50, price=50))  # $25 + $0.88 fee
 
 
-def test_daily_counter_records_the_same_cost_the_check_uses():
-    ctrl = SafetyController(_config())
-    intent = _intent(count=10, price=30)
-    ctrl.record_order_committed(intent)
-    assert ctrl._daily.peek()[1] == pytest.approx(intent.worst_case_cost_usd())
+async def test_daily_counter_records_the_same_cost_the_check_uses(rsa_private_key):
+    """The live path: what confirm reserves is exactly what prepare displayed."""
+    kalshi = _Kalshi()
+    server = _server(rsa_private_key, kalshi)
+    prepare, confirm = await _tools(server)
+    prepared = await prepare(**{**_ORDER, "count": 10, "limit_price_cents": 30})
+    await confirm(confirmation_id=prepared["confirmation_id"])
+    assert _spent(server) == pytest.approx(prepared["estimated_cost_usd"])
+    assert _spent(server) == pytest.approx(_intent(count=10, price=30).worst_case_cost_usd())
 
 
 # ── confirm-time wiring: re-check, reserve, cash floor, ambiguity ──────────
@@ -166,9 +192,9 @@ def _spent(server: FastMCP) -> float:
     return server._kalshi_safety._daily.peek()[1]  # type: ignore[attr-defined]
 
 
-# 40 contracts @ 50c = $20.00 notional + $0.70 fee bound = $20.70 worst case.
+# 40 contracts @ 50c = $20.00 notional + 40 x 2c fee bound = $20.80 worst case.
 _ORDER = {"ticker": "KX-TEST", "action": "buy", "side": "yes", "count": 40, "limit_price_cents": 50}
-_ORDER_COST = 20.70
+_ORDER_COST = 20.80
 
 
 async def test_many_prepares_then_confirms_respect_the_daily_cap(rsa_private_key):
@@ -213,16 +239,34 @@ async def test_concurrent_confirms_cannot_jointly_exceed_the_cap(rsa_private_key
 
 
 def test_reserve_order_is_atomic_check_and_debit():
-    ctrl = SafetyController(_config(daily_limit_usd=50.0))
-    intent = _intent(count=40, price=50)
-    assert ctrl.reserve_order(intent, current_cash_usd=None) == pytest.approx(_ORDER_COST)
-    ctrl.reserve_order(intent, current_cash_usd=None)
-    with pytest.raises(SafetyError):
-        ctrl.reserve_order(intent, current_cash_usd=None)
-    # The refused attempt debited nothing.
-    assert ctrl._daily.peek()[1] == pytest.approx(2 * _ORDER_COST)
-    ctrl.release_order(_ORDER_COST)
-    assert ctrl._daily.peek()[1] == pytest.approx(_ORDER_COST)
+    """Hammer reserve_order from many threads at once: exactly as many
+    reservations as fit under the cap succeed, never one more."""
+    ctrl = SafetyController(_config(daily_limit_usd=200.0))
+    intent = _intent(count=40, price=50)  # $20.80 each → 9 fit under $200
+    barrier = threading.Barrier(32)
+
+    def attempt() -> bool:
+        barrier.wait()
+        try:
+            ctrl.reserve_order(intent, current_cash_usd=None)
+            return True
+        except SafetyError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        results = list(pool.map(lambda _: attempt(), range(32)))
+
+    assert sum(results) == 9
+    assert ctrl._daily.peek()[1] == pytest.approx(9 * _ORDER_COST)
+    assert ctrl._daily.peek()[1] <= 200.0
+
+
+def test_release_order_gives_the_reservation_back():
+    ctrl = SafetyController(_config())
+    reservation = ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
+    assert reservation.cost_usd == pytest.approx(_ORDER_COST)
+    assert ctrl.release_order(reservation) is True
+    assert ctrl._daily.peek()[1] == 0.0
 
 
 @pytest.mark.parametrize(
@@ -260,7 +304,7 @@ async def test_cash_reserve_refuses_an_order_that_would_breach_the_floor(rsa_pri
 
     token = (await prepare(**_ORDER))["confirmation_id"]
     with pytest.raises(SafetyError, match="reserve floor"):
-        await confirm(confirmation_id=token)  # $25 - $20.70 = $4.30 < $10
+        await confirm(confirmation_id=token)  # $25 - $20.80 = $4.20 < $10
     assert kalshi.balance_reads == 1
     assert kalshi.posts == []
     assert _spent(server) == 0.0
@@ -272,17 +316,17 @@ async def test_cash_reserve_allows_an_order_that_keeps_the_floor(rsa_private_key
     prepare, confirm = await _tools(server)
 
     token = (await prepare(**_ORDER))["confirmation_id"]
-    await confirm(confirmation_id=token)  # $50 - $20.70 = $29.30 >= $10
+    await confirm(confirmation_id=token)  # $50 - $20.80 = $29.20 >= $10
     assert kalshi.balance_reads == 1
     assert len(kalshi.posts) == 1
 
 
 async def test_concurrent_confirms_cannot_jointly_breach_the_cash_reserve(rsa_private_key):
     """The reserve check is read-balance-then-act. Two confirms reading the same
-    $50 concurrently would each leave $29.30 >= $10 and both go out, leaving
-    $8.60. Confirms are serialized so the second sees the first's debit."""
+    $50 concurrently would each leave $29.20 >= $10 and both go out, leaving
+    $8.40. Confirms are serialized so the second sees the first's debit."""
     kalshi = _Kalshi(balance_cents=5_000)
-    kalshi.debit_cents_per_order = 2_070
+    kalshi.debit_cents_per_order = 2_080
     kalshi.post_delay_s = 0.01
     server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
     prepare, confirm = await _tools(server)
@@ -618,3 +662,146 @@ async def test_cancel_and_decrease_run_with_trading_disabled(rsa_private_key):
         await prepare(**_ORDER)
     with pytest.raises(TradingDisabledError):
         await confirm(confirmation_id="anything")
+
+
+# ── review follow-ups: cash floor on retry, UTC-midnight reservations ──────
+
+
+class _Clock:
+    """Stand-in for `safety.datetime` so a test can cross UTC midnight."""
+
+    def __init__(self, when: datetime) -> None:
+        self.when = when
+
+    def now(self, tz=None) -> datetime:
+        return self.when
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = _Clock(datetime(2026, 10, 17, 23, 59, 59, tzinfo=UTC))
+    monkeypatch.setattr(safety_module, "datetime", fake)
+    return fake
+
+
+async def test_retry_rechecks_the_cash_floor(rsa_private_key):
+    """B1: an ambiguous first send of A that never landed, then cash drops
+    (another order, a withdrawal) — retrying A must not breach the floor."""
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError, match="OUTCOME UNKNOWN"):
+        await confirm(confirmation_id=token)
+    kalshi.balance_cents = 2_900  # $29.00 - $20.80 = $8.20 < $10
+
+    with pytest.raises(SafetyError, match="reserve floor") as exc:
+        await confirm(confirmation_id=token)
+    assert "UNKNOWN" in str(exc.value)
+    assert len(kalshi.posts) == 1  # the retry was not sent
+    assert kalshi.balance_reads == 2
+
+
+async def test_retry_fails_closed_when_balance_unreadable(rsa_private_key):
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token)
+    kalshi.balance_response = httpx.Response(500, json={})
+    with pytest.raises(SafetyError, match="could not read the cash balance"):
+        await confirm(confirmation_id=token)
+    assert len(kalshi.posts) == 1
+
+
+async def test_outstanding_ambiguous_orders_count_against_cash(rsa_private_key):
+    """B1 (related): A timed out and may land later without showing in the
+    balance yet. B must be judged as if A's cost were already gone."""
+    kalshi = _Kalshi(balance_cents=5_000)
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, cash_reserve_usd=10.0)
+    prepare, confirm = await _tools(server)
+
+    token_a = (await prepare(**_ORDER))["confirmation_id"]
+    token_b = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token_a)
+
+    # $50 - $20.80 (A, outstanding) - $20.80 (B) = $8.40 < $10.
+    with pytest.raises(SafetyError, match="reserve floor"):
+        await confirm(confirmation_id=token_b)
+    assert len(kalshi.posts) == 1
+    # A's own retry doesn't count A twice: $50 - $20.80 = $29.20 >= $10.
+    await confirm(confirmation_id=token_a)
+    assert len(kalshi.posts) == 2
+
+
+async def test_retry_after_utc_midnight_is_charged_to_the_new_day(rsa_private_key, clock):
+    """B2: an ambiguous send reserved on day 1 and retried (and placed) on day
+    2 must count against day 2's cap, or day 2 can place cap + that order."""
+    kalshi = _Kalshi()
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, daily_limit_usd=25.0)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token)  # day 1: $20.80 reserved
+
+    clock.when = datetime(2026, 10, 18, 0, 0, 30, tzinfo=UTC)
+    assert _spent(server) == 0.0  # day 2 starts empty
+    await confirm(confirmation_id=token)  # retry places it on day 2
+    assert _spent(server) == pytest.approx(_ORDER_COST)
+
+    with pytest.raises(SafetyError, match="daily limit"):
+        await prepare(**_ORDER)  # a second $20.80 no longer fits on day 2
+    assert len(kalshi.posts) == 2
+
+
+async def test_retry_after_midnight_respects_the_new_days_cap(rsa_private_key, clock):
+    kalshi = _Kalshi()
+    kalshi.post_outcomes = [httpx.ReadTimeout("slow")]
+    server = _server(rsa_private_key, kalshi, daily_limit_usd=25.0)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError):
+        await confirm(confirmation_id=token)
+
+    clock.when = datetime(2026, 10, 18, 0, 0, 30, tzinfo=UTC)
+    await confirm(confirmation_id=(await prepare(**_ORDER))["confirmation_id"])  # fills day 2
+    with pytest.raises(SafetyError, match="daily limit") as exc:
+        await confirm(confirmation_id=token)
+    assert "UNKNOWN" in str(exc.value)
+    assert len(kalshi.posts) == 2  # first ambiguous send + the day-2 order only
+
+
+def test_release_after_midnight_does_not_credit_the_new_day(clock):
+    """S1: a day-1 reservation released on day 2 must not shrink day 2's spend."""
+    ctrl = SafetyController(_config())
+    day1 = ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
+
+    clock.when = datetime(2026, 10, 18, 0, 0, 1, tzinfo=UTC)
+    ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
+    assert ctrl.release_order(day1) is False
+    assert ctrl._daily.peek() == ("2026-10-18", pytest.approx(_ORDER_COST))
+
+
+@pytest.mark.parametrize("status", [408, 425])
+async def test_first_send_408_425_are_ambiguous(rsa_private_key, status):
+    kalshi = _Kalshi()
+    kalshi.post_outcomes = [status]
+    server = _server(rsa_private_key, kalshi)
+    prepare, confirm = await _tools(server)
+
+    token = (await prepare(**_ORDER))["confirmation_id"]
+    with pytest.raises(KalshiAPIError, match="OUTCOME UNKNOWN"):
+        await confirm(confirmation_id=token)
+    assert _spent(server) == pytest.approx(_ORDER_COST)  # kept, not released
+    await confirm(confirmation_id=token)  # token still valid
+    assert _spent(server) == pytest.approx(_ORDER_COST)

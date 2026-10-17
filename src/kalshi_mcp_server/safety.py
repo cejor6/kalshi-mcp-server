@@ -4,8 +4,9 @@ These checks run BEFORE we hit Kalshi. The point is to fail locally with a
 clear message rather than relying on Kalshi to reject something — and to
 enforce policies the API doesn't enforce (e.g. "no more than $250/day").
 
-Every order-placing tool MUST call `SafetyController.check_order(...)`
-before sending. The controller raises `SafetyError` on policy violations.
+Every order-placing tool MUST call `SafetyController.reserve_order(...)`
+immediately before sending (it re-runs `check_order` and debits the daily
+budget atomically). The controller raises `SafetyError` on policy violations.
 """
 
 from __future__ import annotations
@@ -139,19 +140,21 @@ class OrderIntent:
     def fee_upper_bound_cents(self) -> int:
         """Conservative upper bound on Kalshi's trading fee for this order, in cents.
 
-        Uses Kalshi's GENERAL TAKER fee, `ceil_to_cent(0.07 x C x P x (1-P))`,
-        evaluated at the limit price. It is an ESTIMATE meant to err high:
-        maker fees and some markets' fee multipliers are lower, so the real fee
-        is usually at or below this. Evaluating at the limit price is safe even
-        though fills can happen at better prices: per contract, price + fee =
-        `x + 0.07 x (1-x)` is strictly increasing in the price paid, so the
-        limit price bounds the total. Caveat: the fee is rounded up per fill,
-        so an order split across many partial fills can exceed this by up to a
-        cent per extra fill.
+        Based on Kalshi's GENERAL TAKER fee, `ceil_to_cent(0.07 x C x P x (1-P))`
+        per fill, but rounded up PER CONTRACT: `C x ceil(0.07 x P x (1-P))`.
+        Kalshi rounds each fill's fee up separately, so an order split across
+        many partial fills pays `sum(ceil(c_i x a))`, which can exceed
+        `ceil(C x a)` by a cent per extra fill — but never `C x ceil(a)`, since
+        `ceil(c x a) <= c x ceil(a)` for every whole fill size c. It is an
+        ESTIMATE that errs high: maker fees and some markets' multipliers are
+        lower. Evaluating at the limit price is safe even though fills can
+        happen at better prices: per contract, price + this fee bound is
+        non-decreasing in whole-cent prices, so the limit price bounds it.
         """
         p = self.limit_price_cents
-        numerator = _TAKER_FEE_RATE_NUMERATOR * self.count * p * (100 - p)
-        return -(-numerator // _TAKER_FEE_DENOMINATOR_CENTS)  # ceil division
+        per_contract_numerator = _TAKER_FEE_RATE_NUMERATOR * p * (100 - p)
+        per_contract = -(-per_contract_numerator // _TAKER_FEE_DENOMINATOR_CENTS)  # ceil
+        return self.count * per_contract
 
     def worst_case_cost_cents(self) -> int:
         """Worst-case cash at risk in cents: notional at the limit + fee bound.
@@ -171,6 +174,18 @@ class OrderIntent:
     def worst_case_cost_usd(self) -> float:
         """`worst_case_cost_cents()` in dollars."""
         return self.worst_case_cost_cents() / 100.0
+
+
+@dataclass(frozen=True)
+class OrderReservation:
+    """A debit against one UTC day's spend counter, made by `reserve_order`.
+
+    The `day` matters: a release, or a retry's "is this still reserved?"
+    question, only makes sense against the day the money was charged to.
+    """
+
+    cost_usd: float
+    day: str
 
 
 @dataclass
@@ -207,6 +222,29 @@ class _DailyCounter:
             self._maybe_roll()
             self.cost_usd += cost_usd
             return self.cost_usd
+
+    def add_on_today(self, cost_usd: float) -> str:
+        """`add`, returning the UTC day the amount was charged to (same lock)."""
+        if cost_usd < 0:
+            raise ValueError(f"add_on_today takes a non-negative amount, got {cost_usd}.")
+        with self._lock:
+            self._maybe_roll()
+            self.cost_usd += cost_usd
+            return self.day
+
+    def subtract_if_day(self, amount: float, day: str) -> bool:
+        """Give back `amount` only if the counter is still on `day`.
+
+        A reservation made before UTC midnight belongs to the OLD day; the
+        counter has since reset, so crediting it to the new day would widen
+        the new day's budget. Returns whether anything was subtracted.
+        """
+        with self._lock:
+            self._maybe_roll()
+            if self.day != day:
+                return False
+            self.cost_usd = max(0.0, self.cost_usd - amount)
+            return True
 
     def subtract(self, amount: float) -> float:
         """Give back `amount`, clamped at zero, atomically with the day roll.
@@ -574,7 +612,9 @@ class SafetyController:
     # have placed the order, so only an unambiguous refusal may give the
     # budget back. Over-reserving is the safe failure; under-reserving is not.
 
-    def reserve_order(self, intent: OrderIntent, *, current_cash_usd: float | None) -> float:
+    def reserve_order(
+        self, intent: OrderIntent, *, current_cash_usd: float | None
+    ) -> OrderReservation:
         """Re-run every check against the limits in force NOW and debit the cost.
 
         Call immediately before the order POST. The check and the debit happen
@@ -582,48 +622,63 @@ class SafetyController:
         never jointly exceed the daily cap, and an order prepared before an
         operator tightened a limit is judged by the tightened limit.
 
-        `current_cash_usd` must come from a fresh balance read whenever the
-        active cash reserve is non-zero; passing None then refuses the order
-        (fail closed) rather than silently skipping the floor.
+        `current_cash_usd` must come from a fresh balance read — net of any
+        outstanding ambiguous reservations — whenever the active cash reserve
+        is non-zero; passing None then refuses the order (fail closed) rather
+        than silently skipping the floor.
 
-        Returns the reserved amount (USD); hand it to `release_order` only if
-        Kalshi certainly placed nothing.
+        Returns the reservation (amount + UTC day charged); hand it to
+        `release_order` only if Kalshi certainly placed nothing.
         """
         with self._order_lock:
             limits = self.effective_limits()
-            if current_cash_usd is None and limits.cash_reserve_usd > 0:
-                raise SafetyError(
-                    f"Refusing the order: a cash reserve of "
-                    f"${limits.cash_reserve_usd:.2f} is active but no current cash "
-                    f"balance was supplied to check it against."
-                )
+            self._require_cash_if_reserve(limits, current_cash_usd)
             self._check_order(intent, limits, current_cash_usd=current_cash_usd, include_daily=True)
             cost_usd = intent.worst_case_cost_usd()
-            self._daily.add(cost_usd)
-            return cost_usd
+            day = self._daily.add_on_today(cost_usd)
+            return OrderReservation(cost_usd=cost_usd, day=day)
 
-    def recheck_reserved_order(self, intent: OrderIntent) -> None:
-        """Per-order checks for RESENDING an order whose cost is already reserved.
+    def recheck_reserved_order(
+        self, intent: OrderIntent, *, current_cash_usd: float | None
+    ) -> None:
+        """Checks for RESENDING an order whose cost is already reserved TODAY.
 
         Used when retrying a confirm whose earlier attempt had an ambiguous
-        outcome: the daily budget already carries this order (so the daily
-        check would double-count it) and the cash balance may already reflect
-        it. The per-order caps still apply against the limits in force now.
+        outcome. The daily check is skipped (today's counter already carries
+        this order — the caller must re-reserve via `reserve_order` if the
+        reservation is from an earlier UTC day). Everything else runs against
+        the limits in force now, INCLUDING the cash floor: the balance may have
+        dropped since the first attempt, and resending must not breach it. If
+        the first send did land, the balance already reflects it and the floor
+        check counts it twice — over-strict, the safe direction.
         """
-        self._check_order(
-            intent, self.effective_limits(), current_cash_usd=None, include_daily=False
-        )
+        limits = self.effective_limits()
+        self._require_cash_if_reserve(limits, current_cash_usd)
+        self._check_order(intent, limits, current_cash_usd=current_cash_usd, include_daily=False)
 
-    def release_order(self, cost_usd: float) -> None:
+    @staticmethod
+    def _require_cash_if_reserve(limits: SafetyLimits, current_cash_usd: float | None) -> None:
+        if current_cash_usd is None and limits.cash_reserve_usd > 0:
+            raise SafetyError(
+                f"Refusing the order: a cash reserve of "
+                f"${limits.cash_reserve_usd:.2f} is active but no current cash "
+                f"balance was supplied to check it against."
+            )
+
+    def daily_spend_day(self) -> str:
+        """The UTC day the spend counter is on now (rolling it if needed)."""
+        return self._daily.peek()[0]
+
+    def release_order(self, reservation: OrderReservation) -> bool:
         """Give back a reservation when Kalshi CERTAINLY placed nothing.
 
         Only for an unambiguous refusal (a 4xx/429 on the first send) or a
         failure before the request was dispatched — never after a timeout,
         transport error, 5xx or cancellation once the POST may be in flight.
-        Shares `release_combo_creation`'s known imprecision: a release that
-        lands just after UTC midnight credits the new day.
+        A reservation from an earlier UTC day is NOT credited to today's
+        counter (that would widen today's budget); returns False then.
         """
-        self._daily.subtract(cost_usd)
+        return self._daily.subtract_if_day(reservation.cost_usd, reservation.day)
 
     # ── Combo (parlay) creation ────────────────────────────────────────────
     #
@@ -711,13 +766,3 @@ class SafetyController:
             "max_combo_creations_per_day": self._config.max_combo_creations_per_day,
             "combo_creation_day_utc": day,
         }
-
-    def record_order_committed(self, intent: OrderIntent) -> None:
-        """Record spend for an order that did NOT go through `reserve_order`.
-
-        The order tools reserve BEFORE the POST instead (see `reserve_order`);
-        calling this as well would double-count — which over-reserves, the safe
-        direction, but is still wrong. Kept for callers that only learn about
-        spend after the fact.
-        """
-        self._daily.add(intent.worst_case_cost_usd())

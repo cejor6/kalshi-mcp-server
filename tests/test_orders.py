@@ -124,10 +124,10 @@ async def test_prepare_returns_confirmation_id(rsa_private_key):
     )
     assert "confirmation_id" in result
     assert result["safety_status"] == "PASS"
-    # $2.50 notional + the conservative taker-fee bound:
-    # ceil(0.07 x 10 x 0.25 x 0.75 dollars) = ceil(13.125c) = 14c.
-    assert result["estimated_cost_usd"] == 2.64
-    assert result["estimated_fee_usd"] == 0.14
+    # $2.50 notional + the conservative taker-fee bound, rounded up PER
+    # CONTRACT: 10 x ceil(0.07 x 0.25 x 0.75 dollars = 1.3125c) = 10 x 2c.
+    assert result["estimated_cost_usd"] == 2.70
+    assert result["estimated_fee_usd"] == 0.20
     assert result["intent"]["ticker"] == "KX-TEST"
     assert result["intent"]["action"] == "buy"
     assert result["intent"]["count"] == 10

@@ -383,7 +383,7 @@ async def test_concurrent_set_limits_do_not_lose_an_override():
 async def test_tightening_daily_below_already_spent_blocks_further_orders():
     ctrl = SafetyController(_config(daily_limit_usd=250.0))
     # Spend $20 today.
-    ctrl.record_order_committed(_intent(count=40, price=50))
+    ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
     # Tighten the daily cap below what's already spent.
     await ctrl.set_limits(daily_limit_usd=10.0)
     # Any further order is now refused for the rest of the UTC day.
