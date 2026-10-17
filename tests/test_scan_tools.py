@@ -642,6 +642,111 @@ async def test_forecast_history_reraises_non_400_untouched(rsa_private_key):
     assert "does not publish" not in exc.value.message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("period_interval", "span_s"),
+    [
+        (0, 7 * 86_400),  # a week of 5-SECOND bars: ~121k periods
+        (0, 5_000 * 5 + 1),  # one second over the cap at 5s (ceil -> 5001)
+        (1, 5_000 * 60 + 1),  # one second over the cap at 1m
+        (60, 5_001 * 3_600),
+    ],
+)
+async def test_forecast_history_rejects_oversized_window_before_the_wire(
+    rsa_private_key, period_interval, span_s
+):
+    """Without a cap, an oversized window (notably period_interval=0) reached
+    Kalshi, 400'd, and was misdiagnosed as 'no forecast data'. It must now fail
+    locally with a window message and make NO request."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"forecast_history": []})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_000_000 + span_s,
+            period_interval=period_interval,
+        )
+    assert calls == []
+    assert exc.value.status == 0
+    assert "5000-period cap" in exc.value.message
+    assert "does not publish" not in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("period_interval", "span_s"), [(0, 5_000 * 5), (1, 5_000 * 60)])
+async def test_forecast_history_allows_window_at_the_cap(rsa_private_key, period_interval, span_s):
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"forecast_history": []})
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+    await fn(
+        event_ticker="KXHIGHNY-26AUG14",
+        series_ticker="KXHIGHNY",
+        start_ts=1_000_000,
+        end_ts=1_000_000 + span_s,
+        period_interval=period_interval,
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_forecast_history_passes_through_a_specific_400(rsa_private_key):
+    """A 400 that SAYS what's wrong must not be rewritten into the
+    'doesn't publish forecasts' guess — Kalshi's own message is better."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"code": "invalid_parameters", "message": "percentiles invalid"}}
+        )
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert exc.value.status == 400
+    assert exc.value.message == "percentiles invalid"
+    assert "does not publish" not in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opaque", ["bad request", "Bad Request.", "bad_request", ""])
+async def test_forecast_history_reshapes_every_opaque_400_spelling(rsa_private_key, opaque):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = {"error": {"message": opaque}} if opaque else {}
+        return httpx.Response(400, json=body)
+
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_event_forecast_history")
+
+    with pytest.raises(KalshiAPIError) as exc:
+        await fn(
+            event_ticker="KXHIGHNY-26AUG14",
+            series_ticker="KXHIGHNY",
+            start_ts=1_000_000,
+            end_ts=1_086_400,
+        )
+    assert "does not publish percentile-forecast data" in exc.value.message
+
+
 # ── read-path ticker injection (security hardening) ────────────────────────
 
 
