@@ -968,8 +968,8 @@ def register(server: FastMCP) -> None:
     async def kalshi_get_event(
         event_ticker: str,
         with_nested_markets: bool = True,
-        compact: bool = False,
-        minimal: bool = True,
+        compact: bool = True,
+        minimal: bool = False,
         fields: str | None = None,
     ) -> dict[str, Any]:
         """Fetch an event and (optionally) all markets nested under it.
@@ -981,17 +981,19 @@ def register(server: FastMCP) -> None:
                 the `markets` array is stripped client-side — Kalshi
                 returns nested markets regardless of this parameter, so
                 we drop them locally to honor the requested contract.
-            compact: When True, drop verbose fields from the event object
-                (and from each nested market, when `minimal=False`).
-                Default False.
+            compact: Drop verbose fields (the `_VERBOSE_MARKET_FIELDS`
+                blacklist: rules text, previous prices, timestamps such as
+                `expected_expiration_time`, …) from the event object and each
+                nested market. Default True — an event nests every market by
+                default, so the trimmed view is the default. (Changed: earlier
+                versions defaulted to False.) Strike fields (`floor_strike`,
+                `cap_strike`, `strike_type`) and `result` are kept. Pass
+                `compact=False` for FULL objects.
             minimal: Project each NESTED MARKET to the triage-field whitelist
-                (see `kalshi_get_markets`). Default True — an event can nest
-                dozens of markets and the full objects run ~2KB each (far
-                more for combo markets), so the bounded view is the default.
-                (Changed: earlier versions defaulted to False.) Pass
-                `minimal=False` for FULL nested markets, or `minimal=False,
-                compact=True` for the blacklist view. The event object itself
-                is unaffected.
+                (see `kalshi_get_markets`) instead — much smaller, but drops
+                strikes/rules. Default False. Recommended for multivariate
+                events whose nested combo markets are large (compact barely
+                shrinks those). The event object is unaffected.
             fields: Comma-separated whitelist applied to each nested market,
                 overriding `minimal`'s default set. Unknown field names are
                 silently ignored; a blank list is rejected before any request.

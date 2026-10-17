@@ -520,8 +520,10 @@ tools encode these; don't regress them.
   lives outside the blacklist (`custom_strike`, `mve_selected_legs`, long
   `*_sub_title`s). Prefer `minimal` for listing/scanning. The same
   projection applies to nested markets on the event tools, and
-  `kalshi_get_event` defaults `minimal=True` (like `kalshi_get_combo_events`)
-  because it nests markets by default. Precedence:
+  `kalshi_get_event` defaults `compact=True` because it nests markets by
+  default. NOT `minimal`: the whitelist drops `floor_strike` / `cap_strike` /
+  `strike_type` / `result`, which consumers read off bucket markets, so it
+  stays opt-in there. Precedence:
   `fields` > `minimal` > `compact` > full. `fields` is validated once, up
   front (`_validate_fields`): a blank whitelist raises before any request in
   every tool — never silently ignored, never after a scan.

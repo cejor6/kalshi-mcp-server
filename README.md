@@ -369,8 +369,10 @@ shrinks multivariate (`KXMVE…`) combo markets, whose bulk lives in
 View precedence is `fields` > `minimal` > `compact` > full. `kalshi_get_event`
 / `kalshi_get_events` accept the same `minimal` / `fields` for their nested
 markets (the event objects themselves only have the `compact` view).
-`kalshi_get_event` defaults to `minimal=true` for its nested markets (it used
-to return them in full); pass `minimal=false` to get the full objects. A
+`kalshi_get_event` defaults to `compact=true` (it used to return the event and
+its nested markets in full): the verbose blacklist (rules text, previous
+prices, extra timestamps) is dropped, strikes and `result` are kept. Pass
+`compact=false` for the full objects, or `minimal=true` for the whitelist. A
 blank `fields` (`""`, `" , "`) is rejected by every tool before any request
 is made.
 

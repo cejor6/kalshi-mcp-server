@@ -898,29 +898,38 @@ async def test_blank_fields_rejected_before_any_request(rsa_private_key, tool_na
     assert calls == []
 
 
-# ── kalshi_get_event: nested markets projected by default ──────────────────
+# ── kalshi_get_event: nested markets compacted by default ──────────────────
 
 
 def _event_handler(calls: list[httpx.Request]):
     full_market = {
         "ticker": "KXFED-26MAR19-B5.25",
         "yes_bid_dollars": "0.4500",
+        "floor_strike": 5.25,
+        "cap_strike": 5.5,
+        "strike_type": "between",
+        "result": "",
         "rules_primary": "x" * 2_000,
-        "custom_strike": {"big": "y" * 1_000},
+        "previous_price_dollars": "0.4000",
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
         return httpx.Response(
             200,
-            json={"event": {"event_ticker": "KXFED-26MAR19"}, "markets": [full_market] * 3},
+            json={
+                "event": {"event_ticker": "KXFED-26MAR19"},
+                "markets": [dict(full_market) for _ in range(3)],
+            },
         )
 
     return handler
 
 
 @pytest.mark.asyncio
-async def test_get_event_projects_nested_markets_by_default(rsa_private_key):
+async def test_get_event_compacts_nested_markets_by_default_keeping_strikes(rsa_private_key):
+    """The default view must trim the verbose blacklist but keep what trading
+    consumers read off bucket markets (strikes, strike_type, result)."""
     calls: list[httpx.Request] = []
     server = _make_server(rsa_private_key, _event_handler(calls))
     fn = await _tool_fn(server, "kalshi_get_event")
@@ -929,18 +938,23 @@ async def test_get_event_projects_nested_markets_by_default(rsa_private_key):
 
     assert len(out["markets"]) == 3
     for market in out["markets"]:
-        assert market["ticker"] == "KXFED-26MAR19-B5.25"
+        assert market["floor_strike"] == 5.25
+        assert market["cap_strike"] == 5.5
+        assert market["strike_type"] == "between"
+        assert "result" in market
         assert "rules_primary" not in market
-        assert "custom_strike" not in market
+        assert "previous_price_dollars" not in market
 
 
 @pytest.mark.asyncio
-async def test_get_event_full_nested_markets_still_available(rsa_private_key):
+async def test_get_event_full_and_minimal_views_still_available(rsa_private_key):
     calls: list[httpx.Request] = []
     server = _make_server(rsa_private_key, _event_handler(calls))
     fn = await _tool_fn(server, "kalshi_get_event")
 
-    out = await fn(event_ticker="KXFED-26MAR19", minimal=False)
+    full = await fn(event_ticker="KXFED-26MAR19", compact=False)
+    assert full["markets"][0]["rules_primary"] == "x" * 2_000
 
-    assert out["markets"][0]["rules_primary"] == "x" * 2_000
-    assert "custom_strike" in out["markets"][0]
+    minimal = await fn(event_ticker="KXFED-26MAR19", minimal=True)
+    assert "floor_strike" not in minimal["markets"][0]
+    assert minimal["markets"][0]["ticker"] == "KXFED-26MAR19-B5.25"
