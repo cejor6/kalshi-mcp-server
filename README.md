@@ -424,7 +424,10 @@ scan/anomaly workloads that would otherwise cost one call per market.
   Kalshi published no leg breakdown, it returns a structured
   `resolvable: false` rather than guessing. The `legs` it returns feed
   straight back into the create tool, so you can round-trip an existing combo
-  and vary one leg.
+  and vary one leg. With `include_collection=true` the parent collection is
+  attached with its eligible-event universe replaced by
+  `associated_event_count` (pass `include_collection_event_tickers=true` for
+  the full ~800-entry arrays — the old default).
 - `kalshi_create_combo_market` — **write.** Materializes a combo market
   ticker for a chosen leg set. It places no order and commits no money, so it
   has its own gate rather than riding on `KALSHI_TRADING_ENABLED`: set

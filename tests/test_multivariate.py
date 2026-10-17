@@ -567,8 +567,86 @@ async def test_combo_legs_include_collection_attaches_context(rsa_private_key):
 
     out = await fn(ticker="KXMVECROSS-S1-ABC", with_titles=False, include_collection=True)
 
-    assert out["collection"] == {"size_min": 2, "size_max": 9}
+    # Projected by default: the universe arrays become a count.
+    assert out["collection"] == {"size_min": 2, "size_max": 9, "associated_event_count": 0}
     assert any("multivariate_event_collections" in c.url.path for c in calls)
+
+
+def _universe_handler(market: dict):
+    """Combo handler whose collection carries a big eligible-event universe."""
+    base, calls = _combo_handler(market)
+    universe = [f"KXEV-{i}" for i in range(800)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/multivariate_event_collections/" in request.url.path:
+            calls.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "multivariate_contract": {
+                        "size_min": 2,
+                        "size_max": 9,
+                        "associated_event_tickers": universe,
+                        "associated_events": [{"event_ticker": t} for t in universe],
+                    }
+                },
+            )
+        return base(request)
+
+    return handler, calls
+
+
+@pytest.mark.asyncio
+async def test_combo_legs_collection_drops_universe_by_default(rsa_private_key):
+    """Every list/fetch needs a projection: the collection's ~800-entry
+    universe must not ride along unless explicitly requested."""
+    handler, _ = _universe_handler(_COMBO)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_legs")
+
+    out = await fn(ticker="KXMVECROSS-S1-ABC", with_titles=False, include_collection=True)
+
+    coll = out["collection"]
+    assert "associated_event_tickers" not in coll
+    assert "associated_events" not in coll
+    assert coll["associated_event_count"] == 800
+    assert coll["size_max"] == 9
+
+
+@pytest.mark.asyncio
+async def test_combo_legs_collection_universe_is_opt_in(rsa_private_key):
+    handler, _ = _universe_handler(_COMBO)
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_legs")
+
+    out = await fn(
+        ticker="KXMVECROSS-S1-ABC",
+        with_titles=False,
+        include_collection=True,
+        include_collection_event_tickers=True,
+    )
+    assert len(out["collection"]["associated_event_tickers"]) == 800
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["../../portfolio/balance", "KXMVE-R?x=1", "..", "A/B"])
+async def test_combo_legs_validates_response_collection_ticker(rsa_private_key, bad):
+    """`mve_collection_ticker` comes from Kalshi's response but is interpolated
+    into a signed path — a hostile value must not steer the GET; it fails open
+    into `collection_error` with the legs intact."""
+    handler, calls = _combo_handler({**_COMBO, "mve_collection_ticker": bad})
+    server = _make_server(rsa_private_key, handler)
+    fn = await _tool_fn(server, "kalshi_get_combo_legs")
+
+    out = await fn(ticker="KXMVECROSS-S1-ABC", with_titles=False, include_collection=True)
+
+    assert out["resolvable"] is True
+    assert out["leg_count"] == 2
+    assert "collection" not in out
+    assert "collection_error" in out
+    # Only the market fetch went out — nothing reached any other path.
+    assert len(calls) == 1
+    assert calls[0].url.path.endswith("/markets/KXMVECROSS-S1-ABC")
 
 
 @pytest.mark.asyncio
