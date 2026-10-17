@@ -1,7 +1,5 @@
-# Release — builds and publishes the Docker image to GHCR.
-#
-# This workflow fires ONLY on tag pushes matching v*. Branch protection
-# on `main` prevents non-maintainers from pushing tags via PR.
+# Release — builds and publishes the Docker image to GHCR, publishes the
+# package to PyPI, and fires the Render deploy hook.
 #
 # That decoupling is the heart of Pattern A: production deploys never
 # depend on what's on `main`. To ship a new image:
@@ -10,6 +8,31 @@
 #   git push origin v0.1.0
 #
 # Render (or any image-deploy target) pulls the resulting tagged image.
+#
+# Who can trigger a release — read this before trusting it:
+#
+#   - Branch protection on `main` does NOT restrict tags. Anyone with write
+#     access can push a `v*` tag pointing at ANY commit (including one on an
+#     unmerged branch), and that push publishes to GHCR `:latest`, PyPI and
+#     Render. Restricting that needs a repository TAG RULESET (Settings →
+#     Rules → Rulesets → new tag ruleset targeting `v*`, restricting
+#     creations/updates/deletions to maintainers). That is a repo setting —
+#     nothing in this file can enforce it.
+#   - The publishing jobs run in the `release` GitHub environment. Its
+#     protection rules (required reviewers, and deployment branches/tags
+#     limited to `v*` tags + the default branch) are configured in
+#     Settings → Environments → release, not here. Until reviewers are
+#     added there, the environment is just a label and gates nothing.
+#   - The PyPI Trusted Publisher for this project should be bound to the
+#     `release` environment (pypi.org → project → Publishing → Environment
+#     name `release`), so an OIDC token minted outside that gated
+#     environment can't publish.
+#   - `workflow_dispatch` (re-running a release) only accepts an EXISTING
+#     tag of the exact form vMAJOR.MINOR.PATCH, and must be dispatched from
+#     the default branch. A branch name, SHA or anything else is rejected
+#     before any job that can publish starts. The `resolve` job pins the
+#     tag to a commit SHA once, and every later job checks out that SHA, so
+#     a tag moved mid-run can't swap the code between the image and PyPI.
 
 name: Release
 
@@ -19,36 +42,93 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.1.0)"
+        description: "Existing release tag to (re)publish, e.g. v0.1.0"
         required: true
 
+# Least privilege by default; jobs that need more ask for it.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: Resolve and validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version_no_v: ${{ steps.validate.outputs.version_no_v }}
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      # Untrusted input (the dispatch `tag`, the pushed ref) is passed via
+      # env and only ever expanded as a quoted shell variable — never
+      # interpolated into the script with ${{ }}, which would let a crafted
+      # input inject shell.
+      - name: Validate tag
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+              echo "::error::Dispatch releases from the default branch ($DEFAULT_BRANCH), not $GITHUB_REF."
+              exit 1
+            fi
+            TAG="$INPUT_TAG"
+          else
+            if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+              echo "::error::Release must be triggered by a tag push, got $GITHUB_REF."
+              exit 1
+            fi
+            TAG="$GITHUB_REF_NAME"
+          fi
+          # Bash `=~` anchors against the WHOLE string. (`grep` would match
+          # per line, so "v1.2.3<newline>anything" would slip through.)
+          SEMVER_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if ! [[ "$TAG" =~ $SEMVER_TAG ]]; then
+            echo "::error::Release tag must look like vMAJOR.MINOR.PATCH (got: '$TAG')."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # `refs/tags/` is spelled out so only a TAG can resolve — a branch
+      # with the same name can't. Checkout fails if the tag doesn't exist.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.validate.outputs.tag }}
+          persist-credentials: false
+
+      - name: Pin tag to commit
+        id: pin
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          echo "Releasing ${TAG} at ${SHA}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Build and push image
+    needs: resolve
     runs-on: ubuntu-latest
+    # Protection rules (required reviewers, allowed tags) live in repo
+    # Settings → Environments → release. See the header comment.
+    environment: release
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
-      - name: Resolve version
-        id: version
-        run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "version_no_v=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
@@ -67,13 +147,13 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository_owner }}/kalshi-mcp-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/kalshi-mcp-server:${{ steps.version.outputs.version_no_v }}
+            ghcr.io/${{ github.repository_owner }}/kalshi-mcp-server:${{ needs.resolve.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/kalshi-mcp-server:${{ needs.resolve.outputs.version_no_v }}
             ghcr.io/${{ github.repository_owner }}/kalshi-mcp-server:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
             org.opencontainers.image.licenses=MIT
 
       # Trigger Render to pull the newly-published `:latest` image.
@@ -103,7 +183,11 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
+    needs: resolve
     runs-on: ubuntu-latest
+    # Bind the PyPI Trusted Publisher to this environment name on pypi.org
+    # so only this gated job can mint a publishing token.
+    environment: release
     # PyPI Trusted Publishing (configured at
     # https://pypi.org/manage/project/kalshi-mcp-server/settings/publishing/)
     # uses OIDC to authenticate this workflow — no token secret needed.
@@ -116,7 +200,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:

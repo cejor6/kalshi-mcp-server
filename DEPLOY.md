@@ -90,7 +90,18 @@ real secrets.
 - **CI** runs tests on every PR. CI never touches your deployment.
 - **`release.yml`** builds and pushes a versioned image to GHCR. It
   runs **only on tag push** (`git tag v0.1.0 && git push origin v0.1.0`).
-- **Tag protection** on `v*` means only repo admins can publish tags.
+- **A tag ruleset** on `v*` (Settings → Rules → Rulesets → new *tag*
+  ruleset; restrict creations, updates and deletions to maintainers) means
+  only maintainers can cut a release tag. This is a repo setting you must
+  add — branch protection on `main` does **not** cover tags, and without
+  the ruleset anyone with write access can tag any commit (even one on an
+  unmerged branch) and ship it.
+- **The `release` environment** gates the publishing jobs. Add yourself as
+  a required reviewer under Settings → Environments → release (and limit
+  its deployment tags to `v*`), and bind the PyPI Trusted Publisher to the
+  environment name `release`. Until reviewers are added the environment
+  is just a label. `workflow_dispatch` re-runs only accept an existing
+  `vX.Y.Z` tag, dispatched from the default branch.
 - **Render** is configured to pull the image, NOT to build from source.
 
 Net effect: PRs flow through `main` normally; production deploys only
@@ -649,9 +660,12 @@ already designed to handle a missing hook gracefully.
   interpolated into a shell command line. GitHub Actions also
   auto-masks any string matching a known secret value with `***` in
   workflow logs.
-- The `release.yml` workflow triggers only on `push: tags: ['v*']`,
-  which requires repo write access. Fork PRs cannot trigger it and
-  therefore cannot access this secret.
+- The `release.yml` workflow triggers only on `push: tags: ['v*']`
+  (or a maintainer's manual re-run of an existing `vX.Y.Z` tag), which
+  requires repo write access. Fork PRs cannot trigger it and therefore
+  cannot access this secret. For a tighter boundary, store the hook URL
+  as a secret of the `release` **environment** rather than the repo, so
+  only the reviewer-gated job can read it.
 - If the URL leaks anyway: regenerate it in Render's UI (the old one
   immediately stops working). Update the GitHub secret with the new
   value.

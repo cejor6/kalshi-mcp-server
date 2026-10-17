@@ -5,7 +5,9 @@
 #     code from fork PRs is checked out but secrets are NOT exposed.
 #   - GITHUB_TOKEN is scoped to read-only. PRs cannot escalate.
 #   - No deployment step lives here. Deploys are in release.yml and fire
-#     only on tag pushes (which only maintainers can produce).
+#     only on `v*` tag pushes. Limiting who can push those tags takes a
+#     repo tag ruleset (a setting, see release.yml's header) — branch
+#     protection on `main` does not cover tags.
 
 name: CI
 
