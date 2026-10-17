@@ -114,6 +114,14 @@ class InMemoryLimitsStore:
         self._value = None
 
 
+# Kalshi's general TAKER fee is `ceil_to_cent(0.07 x C x P x (1 - P))` for C
+# contracts at price P (in dollars). Expressed in integer cents to avoid float
+# drift: 0.07 x C x (p/100) x ((100-p)/100) dollars == 7 x C x p x (100-p) / 10_000
+# cents. 7 is the numerator of the 0.07 multiplier.
+_TAKER_FEE_RATE_NUMERATOR = 7
+_TAKER_FEE_DENOMINATOR_CENTS = 10_000
+
+
 @dataclass
 class OrderIntent:
     """Compact description of an order for the safety check."""
@@ -123,6 +131,42 @@ class OrderIntent:
     action: str  # "buy" or "sell"
     count: int
     limit_price_cents: int  # 1..99 for Kalshi binary contracts
+
+    def fee_upper_bound_cents(self) -> int:
+        """Conservative upper bound on Kalshi's trading fee for this order, in cents.
+
+        Uses Kalshi's GENERAL TAKER fee, `ceil_to_cent(0.07 x C x P x (1-P))`,
+        evaluated at the limit price. It is an ESTIMATE meant to err high:
+        maker fees and some markets' fee multipliers are lower, so the real fee
+        is usually at or below this. Evaluating at the limit price is safe even
+        though fills can happen at better prices: per contract, price + fee =
+        `x + 0.07 x (1-x)` is strictly increasing in the price paid, so the
+        limit price bounds the total. Caveat: the fee is rounded up per fill,
+        so an order split across many partial fills can exceed this by up to a
+        cent per extra fill.
+        """
+        p = self.limit_price_cents
+        numerator = _TAKER_FEE_RATE_NUMERATOR * self.count * p * (100 - p)
+        return -(-numerator // _TAKER_FEE_DENOMINATOR_CENTS)  # ceil division
+
+    def worst_case_cost_cents(self) -> int:
+        """Worst-case cash at risk in cents: notional at the limit + fee bound.
+
+        For a buy the notional is `count x price`. A sell is treated
+        symmetrically as the complementary buy (selling YES at 30c is buying NO
+        at 70c), so its notional is `count x (100 - price)`. The P x (1-P) fee
+        term is the same either way. This is THE cost formula: the size cap,
+        the daily counter, the cash-reserve check and prepare's displayed
+        estimate all use it, so they can never disagree.
+        """
+        max_price_cents = (
+            self.limit_price_cents if self.action == "buy" else 100 - self.limit_price_cents
+        )
+        return self.count * max_price_cents + self.fee_upper_bound_cents()
+
+    def worst_case_cost_usd(self) -> float:
+        """`worst_case_cost_cents()` in dollars."""
+        return self.worst_case_cost_cents() / 100.0
 
 
 @dataclass
@@ -424,13 +468,9 @@ class SafetyController:
                 f"({limits.max_contracts_per_order})."
             )
 
-        # Cost in USD = (count * price_cents) / 100. For sells, cost is risk
-        # to the position (selling YES at 30c is buying NO at 70c), so we
-        # treat both sides symmetrically for the size cap.
-        max_price_cents = (
-            intent.limit_price_cents if intent.action == "buy" else 100 - intent.limit_price_cents
-        )
-        cost_usd = (intent.count * max_price_cents) / 100.0
+        # Worst-case notional + a conservative fee bound — see
+        # OrderIntent.worst_case_cost_cents, the single source of the formula.
+        cost_usd = intent.worst_case_cost_usd()
 
         if cost_usd > limits.max_order_size_usd:
             raise SafetyError(
@@ -544,8 +584,4 @@ class SafetyController:
 
     def record_order_committed(self, intent: OrderIntent) -> None:
         """Call AFTER the order is successfully accepted by Kalshi."""
-        max_price_cents = (
-            intent.limit_price_cents if intent.action == "buy" else 100 - intent.limit_price_cents
-        )
-        cost_usd = (intent.count * max_price_cents) / 100.0
-        self._daily.add(cost_usd)
+        self._daily.add(intent.worst_case_cost_usd())

@@ -247,8 +247,10 @@ def register(server: FastMCP) -> None:
             expires_at=expires_at,
         )
 
-        max_price = limit_price_cents if action_lc == "buy" else 100 - limit_price_cents
-        cost_usd = round(count * max_price / 100.0, 2)
+        # The SAME number the safety checks use (notional + fee bound), so the
+        # displayed estimate can never understate what is checked/reserved.
+        cost_usd = round(intent.worst_case_cost_usd(), 2)
+        fee_usd = round(intent.fee_upper_bound_cents() / 100.0, 2)
         return {
             "confirmation_id": token,
             "expires_at_unix": int(expires_at),
@@ -263,6 +265,7 @@ def register(server: FastMCP) -> None:
                 "expiration_ts": expiration_ts,
             },
             "estimated_cost_usd": cost_usd,
+            "estimated_fee_usd": fee_usd,
             "idempotency_key": idempotency_key,
             "safety_status": "PASS",
             "instructions": (
