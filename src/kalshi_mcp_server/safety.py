@@ -252,6 +252,11 @@ class SafetyController:
         # Separate counter: combo creations draw on Kalshi's weekly creation
         # quota, not on the USD spend budget, so they must not share a bucket.
         self._combo_creations = _DailyCounter()
+        # Makes reserve_order's check + debit one atomic step. The callers are
+        # all on the event loop and reserve_order never awaits, so this is
+        # belt-and-braces there — but it also keeps the guarantee if a caller
+        # ever runs on another thread.
+        self._order_lock = threading.Lock()
 
     @property
     def ceilings(self) -> SafetyLimits:
@@ -446,15 +451,35 @@ class SafetyController:
     def check_order(self, intent: OrderIntent, *, current_cash_usd: float | None = None) -> None:
         """Raise SafetyError if the order violates any configured policy.
 
+        A pure CHECK — it reserves nothing. `kalshi_prepare_order` uses it as
+        an early fast-fail; the authoritative gate is `reserve_order`, which
+        re-runs this against the limits in force at confirm time and debits
+        the daily budget in the same atomic step.
+
         Pass `current_cash_usd` (from a fresh balance read) to enforce the
-        cash-reserve floor. Omit to skip that check (e.g. dry-run mode).
+        cash-reserve floor. Omit to skip that check (prepare's fast-fail).
         """
+        self._check_order(
+            intent,
+            self.effective_limits(),
+            current_cash_usd=current_cash_usd,
+            include_daily=True,
+        )
+
+    def _check_order(
+        self,
+        intent: OrderIntent,
+        limits: SafetyLimits,
+        *,
+        current_cash_usd: float | None,
+        include_daily: bool,
+    ) -> None:
         self.assert_trading_enabled()
 
-        # Snapshot the limits in force once. These are the env ceilings unless
-        # an operator has tightened them at runtime via `set_limits`.
-        limits = self.effective_limits()
-
+        if intent.action not in {"buy", "sell"}:
+            raise SafetyError(f"action must be 'buy' or 'sell', got {intent.action!r}.")
+        if intent.side not in {"yes", "no"}:
+            raise SafetyError(f"side must be 'yes' or 'no', got {intent.side!r}.")
         if intent.count <= 0:
             raise SafetyError(f"Order count must be positive, got {intent.count}.")
         if not 1 <= intent.limit_price_cents <= 99:
@@ -478,22 +503,92 @@ class SafetyController:
                 f"(${limits.max_order_size_usd:.2f}). Reduce count or price."
             )
 
-        _, today_so_far = self._daily.peek()
-        projected = today_so_far + cost_usd
-        if projected > limits.daily_limit_usd:
-            raise SafetyError(
-                f"Projected daily cost ${projected:.2f} would exceed the active "
-                f"daily limit (${limits.daily_limit_usd:.2f}). Already spent "
-                f"${today_so_far:.2f} today. Resets at UTC midnight."
-            )
+        if include_daily:
+            _, today_so_far = self._daily.peek()
+            projected = today_so_far + cost_usd
+            if projected > limits.daily_limit_usd:
+                raise SafetyError(
+                    f"Projected daily cost ${projected:.2f} would exceed the active "
+                    f"daily limit (${limits.daily_limit_usd:.2f}). Already committed "
+                    f"${today_so_far:.2f} today (confirmed orders, incl. any whose "
+                    f"outcome was ambiguous). Resets at UTC midnight."
+                )
 
         if current_cash_usd is not None:
+            if not math.isfinite(current_cash_usd):
+                # NaN would make the `<` below False and silently pass the floor.
+                raise SafetyError(
+                    f"Refusing the order: the cash balance read back as "
+                    f"{current_cash_usd!r}, which is not a finite number."
+                )
             remaining_after = current_cash_usd - cost_usd
             if remaining_after < limits.cash_reserve_usd:
                 raise SafetyError(
                     f"Order would leave ${remaining_after:.2f} in cash, below the "
-                    f"active reserve floor (${limits.cash_reserve_usd:.2f})."
+                    f"active reserve floor (${limits.cash_reserve_usd:.2f}). Cash "
+                    f"now ${current_cash_usd:.2f}; worst-case order cost "
+                    f"${cost_usd:.2f}."
                 )
+
+    # ── Order reservation (the authoritative gate, run at confirm) ─────────
+    #
+    # Same reserve-then-release shape as combo creation, for the same two
+    # reasons. (1) Concurrency: check-then-await-then-record leaves the whole
+    # POST between the check and the increment, so N confirms in flight all
+    # pass a daily cap only one should. (2) Ambiguity: a timeout/5xx may still
+    # have placed the order, so only an unambiguous refusal may give the
+    # budget back. Over-reserving is the safe failure; under-reserving is not.
+
+    def reserve_order(self, intent: OrderIntent, *, current_cash_usd: float | None) -> float:
+        """Re-run every check against the limits in force NOW and debit the cost.
+
+        Call immediately before the order POST. The check and the debit happen
+        under one lock with no `await` in between, so concurrent confirms can
+        never jointly exceed the daily cap, and an order prepared before an
+        operator tightened a limit is judged by the tightened limit.
+
+        `current_cash_usd` must come from a fresh balance read whenever the
+        active cash reserve is non-zero; passing None then refuses the order
+        (fail closed) rather than silently skipping the floor.
+
+        Returns the reserved amount (USD); hand it to `release_order` only if
+        Kalshi certainly placed nothing.
+        """
+        with self._order_lock:
+            limits = self.effective_limits()
+            if current_cash_usd is None and limits.cash_reserve_usd > 0:
+                raise SafetyError(
+                    f"Refusing the order: a cash reserve of "
+                    f"${limits.cash_reserve_usd:.2f} is active but no current cash "
+                    f"balance was supplied to check it against."
+                )
+            self._check_order(intent, limits, current_cash_usd=current_cash_usd, include_daily=True)
+            cost_usd = intent.worst_case_cost_usd()
+            self._daily.add(cost_usd)
+            return cost_usd
+
+    def recheck_reserved_order(self, intent: OrderIntent) -> None:
+        """Per-order checks for RESENDING an order whose cost is already reserved.
+
+        Used when retrying a confirm whose earlier attempt had an ambiguous
+        outcome: the daily budget already carries this order (so the daily
+        check would double-count it) and the cash balance may already reflect
+        it. The per-order caps still apply against the limits in force now.
+        """
+        self._check_order(
+            intent, self.effective_limits(), current_cash_usd=None, include_daily=False
+        )
+
+    def release_order(self, cost_usd: float) -> None:
+        """Give back a reservation when Kalshi CERTAINLY placed nothing.
+
+        Only for an unambiguous refusal (a 4xx/429 on the first send) or a
+        failure before the request was dispatched — never after a timeout,
+        transport error, 5xx or cancellation once the POST may be in flight.
+        Shares `release_combo_creation`'s known imprecision: a release that
+        lands just after UTC midnight credits the new day.
+        """
+        self._daily.subtract(cost_usd)
 
     # ── Combo (parlay) creation ────────────────────────────────────────────
     #
@@ -583,5 +678,11 @@ class SafetyController:
         }
 
     def record_order_committed(self, intent: OrderIntent) -> None:
-        """Call AFTER the order is successfully accepted by Kalshi."""
+        """Record spend for an order that did NOT go through `reserve_order`.
+
+        The order tools reserve BEFORE the POST instead (see `reserve_order`);
+        calling this as well would double-count — which over-reserves, the safe
+        direction, but is still wrong. Kept for callers that only learn about
+        spend after the fact.
+        """
         self._daily.add(intent.worst_case_cost_usd())
