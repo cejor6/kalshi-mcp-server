@@ -30,7 +30,9 @@ Two independent gates (both fail safe):
   429 rate-limited, other), network error, timeout, malformed/missing
   answer, or confidence below the configured threshold. The whole fan-out is
   also bounded by an aggregate wall-clock budget, so a slow/drip-feeding host
-  degrades to the heuristic instead of blocking. The tool never crashes;
+  degrades to the heuristic instead of blocking. A 429 short-circuits the
+  rest of the batch (queued calls fall back unsent), and a response body is
+  size-capped before it is parsed. The tool never crashes;
   genuine Jev failures are logged ONCE per scan and returned as an aggregate
   ``fallback_reasons`` count.
 
@@ -51,6 +53,7 @@ sent only to the operator-configured Jev host.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -63,6 +66,11 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import Field
 
+from kalshi_mcp_server.tools._bounded_read import (
+    IDENTITY_ENCODING_HEADERS,
+    ContentEncodingError,
+    read_capped,
+)
 from kalshi_mcp_server.tools.discovery import (
     _MINIMAL_MARKET_FIELDS,
     _minimal_market,
@@ -107,6 +115,12 @@ _WALL_CLOCK_SECONDS = 30.0
 # multiply into N x this against a single upstream.
 _MAX_CONCURRENCY = 4
 _jev_semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
+
+# Ceiling on one Jev response body. A real answer (two questions, a handful of
+# floats) is well under 2KB; anything near this is a misbehaving host, and
+# reading it unbounded into `resp.json()` would let that host balloon memory
+# (or decompress a bomb). Over the cap → "oversize" fallback, never parsed.
+_MAX_JEV_RESPONSE_BYTES = 64_000
 
 # The only sides Jev may return; anything else is dropped to None. The response
 # is UNTRUSTED (a hostile/misconfigured host could plant arbitrary text into a
@@ -476,25 +490,32 @@ async def _score_one(
         "questions": _jev_questions(),
     }
     try:
-        resp = await jev_client.post(settings.base_url, json=body)
+        # Streamed so the body is size-bounded BEFORE parsing (see
+        # _MAX_JEV_RESPONSE_BYTES); status checks never read the body at all.
+        async with jev_client.stream("POST", settings.base_url, json=body) as resp:
+            if resp.status_code == 402:
+                return None, "credits"
+            if resp.status_code == 429:
+                return None, "rate"
+            # Anything non-2xx is a failure. Redirects aren't followed (the
+            # Bearer must not walk to another host), so a 3xx has no body to
+            # parse — bucket it as an http_error rather than letting it fall
+            # through to a misleading "malformed".
+            if resp.status_code >= 300:
+                return None, "http_error"
+            raw, truncated = await read_capped(resp, _MAX_JEV_RESPONSE_BYTES)
     except httpx.TimeoutException:
         return None, "timeout"
     except httpx.RequestError:
         return None, "network"
+    except ContentEncodingError:
+        return None, "malformed"
 
-    if resp.status_code == 402:
-        return None, "credits"
-    if resp.status_code == 429:
-        return None, "rate"
-    # Anything non-2xx is a failure. Redirects aren't followed (the Bearer must
-    # not walk to another host), so a 3xx has no body to parse — bucket it as an
-    # http_error rather than letting it fall through to a misleading "malformed".
-    if resp.status_code >= 300:
-        return None, "http_error"
-
+    if truncated:
+        return None, "oversize"
     try:
-        payload = resp.json()
-    except (ValueError, httpx.DecodingError):
+        payload = json.loads(raw)
+    except ValueError:  # includes JSONDecodeError and UnicodeDecodeError
         return None, "malformed"
 
     parsed = _parse_answers(payload)
@@ -649,11 +670,26 @@ async def _score_all(
     to crash or indefinitely block the tool.
     """
 
+    # Set by the first 429 in this batch. Calls still QUEUED on the semaphore
+    # check it (and the process-global cooldown, which a concurrent scan may
+    # have tripped) once they get a slot, and fall back without sending — so a
+    # rate-limited upstream sees at most the calls already in flight, not the
+    # rest of the batch.
+    rate_limited = asyncio.Event()
+
     async def run(
         market: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
         async with _jev_semaphore:
+            if rate_limited.is_set() or _in_rate_cooldown():
+                return market, None, "rate_cooldown"
             answer, reason = await _score_one(jev_client, market, settings)
+        if reason == "rate":
+            rate_limited.set()
+            # Trip the global back-off NOW (not after the batch), so concurrent
+            # scans stop too.
+            if settings.cooldown > 0:
+                _trip_rate_cooldown(settings.cooldown)
         return market, answer, reason
 
     try:
@@ -666,6 +702,9 @@ async def _score_all(
                 "Authorization": f"Bearer {settings.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                # identity: httpx would otherwise advertise gzip/deflate and
+                # inflate the body in full before any size check.
+                **IDENTITY_ENCODING_HEADERS,
             },
         ) as jev_client:
             async with asyncio.timeout(_WALL_CLOCK_SECONDS):
@@ -695,11 +734,9 @@ async def _score_all(
         else:
             rows.append(_scored_market(market, answer))
 
-    # A 429 anywhere in the batch trips a global back-off so the NEXT scan
-    # skips Jev entirely for a cooldown window (house rule: don't hammer a
-    # rate-limited upstream from every caller).
-    if reasons.get("rate") and settings.cooldown > 0:
-        _trip_rate_cooldown(settings.cooldown)
+    # A 429 anywhere in the batch has already tripped the global back-off (in
+    # `run`), so the NEXT scan skips Jev entirely for a cooldown window (house
+    # rule: don't hammer a rate-limited upstream from every caller).
     return rows
 
 
@@ -772,7 +809,7 @@ def register(server: FastMCP) -> None:
                 (some fell back), "fallback" (all Jev calls fell back), or
                 "disabled" (no key / not usable this scan).
             `fallback_reasons`: aggregate count of why markets fell back
-                (e.g. no_api_key, credits, rate, rate_cooldown, timeout,
+                (e.g. no_api_key, credits, rate, rate_cooldown, timeout, oversize,
                 deadline, network, http_error, malformed, lowconf).
             `confidence_threshold`: the threshold in force.
             `scanned`/`requests`/`complete`/`stopped_by`/`scan_all`/

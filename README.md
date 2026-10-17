@@ -351,7 +351,7 @@ the worked example.
 | Portfolio | `kalshi_get_balance`, `kalshi_get_positions`, `kalshi_get_orders`, `kalshi_get_fills`, `kalshi_get_settlements` |
 | Orders (write) | `kalshi_prepare_order`, `kalshi_confirm_order`, `kalshi_cancel_order`, `kalshi_decrease_order`, `kalshi_get_order` |
 | Live (WebSocket) | `kalshi_get_live_orderbook`, `kalshi_sample_trades` |
-| External data (read-only) | `kalshi_fetch_external_data` — host-allowlisted, GET-only, https-only fetch of public data feeds (Polymarket gamma/clob, NWS `api.weather.gov`, Open-Meteo incl. ensemble, Tennis Abstract, Deribit public). No credentials attached (`trust_env=False`), redirects not followed, body size- and wall-clock-capped and returned wrapped in UNTRUSTED-EXTERNAL-DATA delimiters. Exists so clients whose own egress is restricted (e.g. claude.ai cloud routines) can reach the public feeds their read-only research needs; the allowlist is enforced at runtime, additions are a code change, and the boundary rationale lives in AGENTS.md. |
+| External data (read-only) | `kalshi_fetch_external_data` — host-allowlisted, GET-only, https-only fetch of public data feeds (Polymarket gamma/clob, NWS `api.weather.gov`, Open-Meteo incl. ensemble, Tennis Abstract, Deribit public). No credentials attached (`trust_env=False`), redirects not followed, body size- and wall-clock-capped (the cap applies to decoded bytes; `Accept-Encoding: identity` is sent) and returned wrapped in UNTRUSTED-EXTERNAL-DATA delimiters stamped with a per-call random nonce (`<<<UNTRUSTED-EXTERNAL-DATA id=<nonce> …>>>` … `<<<END-UNTRUSTED-EXTERNAL-DATA id=<nonce>>>`); the block ends only at the END marker whose id matches. Inside the body (matched after NFKC normalization with Unicode format characters removed), `untrusted`/`external`/`data` separated only by non-alphanumerics — any case — becomes `[delimiter-removed]`, and any run of 3+ `<` or `>` becomes `[angle-brackets-removed]`. Cross-script homoglyphs are not covered; the nonce is the primary defence. Exists so clients whose own egress is restricted (e.g. claude.ai cloud routines) can reach the public feeds their read-only research needs; the allowlist is enforced at runtime, additions are a code change, and the boundary rationale lives in AGENTS.md. |
 | Scoring (read-only, optional) | `kalshi_score_markets` — ranks liquid markets by apparent edge using [Jev](https://typesafe.ai) (a fast typed-decision model), for a trading loop that scores many markets cheaply and escalates only the top few. Places no orders. Registered only when `MCP_ALLOW_JEV_SCORING=1` (default off). Jev is optional: with no `TYPESAFE_API_KEY`, or on any Jev failure, markets fall back to a deterministic liquidity/spread heuristic (`jev_scored=false`). See "Optional Jev scoring" below. |
 
 Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
@@ -369,6 +369,12 @@ shrinks multivariate (`KXMVE…`) combo markets, whose bulk lives in
 View precedence is `fields` > `minimal` > `compact` > full. `kalshi_get_event`
 / `kalshi_get_events` accept the same `minimal` / `fields` for their nested
 markets (the event objects themselves only have the `compact` view).
+`kalshi_get_event` defaults to `compact=true` (it used to return the event and
+its nested markets in full): the verbose blacklist (rules text, previous
+prices, extra timestamps) is dropped, strikes and `result` are kept. Pass
+`compact=false` for the full objects, or `minimal=true` for the whitelist. A
+blank `fields` (`""`, `" , "`) is rejected by every tool before any request
+is made.
 
 **Don't gate on `liquidity_dollars`:** Kalshi currently returns it as
 `0.0000` on every market, even deep books — measure liquidity from the
@@ -424,7 +430,10 @@ scan/anomaly workloads that would otherwise cost one call per market.
   Kalshi published no leg breakdown, it returns a structured
   `resolvable: false` rather than guessing. The `legs` it returns feed
   straight back into the create tool, so you can round-trip an existing combo
-  and vary one leg.
+  and vary one leg. With `include_collection=true` the parent collection is
+  attached with its eligible-event universe replaced by
+  `associated_event_count` (pass `include_collection_event_tickers=true` for
+  the full ~800-entry arrays — the old default).
 - `kalshi_create_combo_market` — **write.** Materializes a combo market
   ticker for a chosen leg set. It places no order and commits no money, so it
   has its own gate rather than riding on `KALSHI_TRADING_ENABLED`: set
