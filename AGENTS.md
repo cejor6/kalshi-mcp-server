@@ -160,6 +160,15 @@ ceiling** — so a stale/corrupt stored value can only ever tighten, never
 loosen, and raising an env ceiling takes effect for any field not actively
 tightened; (2) the in-memory update always succeeds even if the store
 write fails (the emergency clamp-down is never blocked by a Redis blip).
+The key is namespaced by `MCP_REDIS_COLLECTION_PREFIX`, except that the
+default prefix keeps the legacy name `kalshi-mcp:safety-limits` — renaming
+it would drop every live clamp on upgrade, and a lost tightening is a
+loosening. A non-default prefix reads the legacy key as a tighten-only
+fallback while it has no record of its own, and copies what it finds into
+its own key (best-effort, `SET NX`) so another deployment resetting the
+legacy key can't later drop the inherited clamp; `clear` writes `{}` (not a
+delete) there so a reset isn't resurrected by that fallback. Don't
+"simplify" any of these.
 Caveat: persistence is single-replica-coherent (write-through + load-on-
 boot); if you scale past one instance, a mid-life change won't reach other
 replicas until they restart.
@@ -232,13 +241,23 @@ safety controls reduce blast radius but don't eliminate it.
 - `MCP_REDIS_URL` — persistent DCR client storage (optional; in-memory
   if unset, requires reconnect after each redeploy)
 - `MCP_REDIS_COLLECTION_PREFIX` — collection namespace for this
-  deployment (default `kalshi`). Give every server sharing a Redis DB a
-  distinct value; changing it is a keyspace move, so treat it like a key
-  rotation
+  deployment (default `kalshi`), also applied to the safety-limit override
+  key. Give every server sharing a Redis DB a distinct value; changing it
+  is a keyspace move, so treat it like a key rotation
+- `MCP_ALLOW_PLAINTEXT_REDIS` — `MCP_REDIS_URL` must be `rediss://` (or
+  `redis://` to loopback, or `unix://`); any other cleartext URL is a
+  startup `ConfigError` unless this is `1`. It exists for private-network
+  Redis (Render Key Value's internal URL), not for the internet.
 
 Stdio transport ignores all of these. Local stdio clients (Claude
 Desktop, Claude Code, Cursor) authenticate trivially — the MCP client
 itself is the operator.
+
+**Both Redis consumers share `redis_client.py`.** `build_redis_client`
+(resilience kwargs below), `validate_redis_url` (scheme policy) and
+`collection_prefix` are used by the OAuth store *and* `safety_store.py`. The
+safety store used to call bare `Redis.from_url` and so ran without any of the
+settings below; don't give either consumer its own client again.
 
 **The session-token expiry (`kalshi_get_environment`, issue #80) comes from the
 raw incoming bearer JWT — NOT from `get_access_token()`.** Under `GitHubProvider`
@@ -360,8 +379,16 @@ of these in a refactor, check that they still hold.
   override via `CMD ["--host", "0.0.0.0"]`**. Without this, hosted
   deploys return 502 — the gateway can't reach a localhost-only bind.
 - **The published image must include `[oauth]` extras.** The Dockerfile
-  installs with `uv pip install ".[oauth]"`, not `.`. Without the
+  installs with `uv sync --locked --no-dev --extra oauth`. Without the
   extras, the OAuth proxy crashes on import when `MCP_REDIS_URL` is set.
+- **The image installs from `uv.lock`, never a fresh resolve.** `--locked`
+  installs the exact hash-checked set CI tested and fails the build if the
+  lock is stale. Don't go back to `uv pip install ".[oauth]"` — it ignores
+  the lock, so every release silently shipped whatever was newest on PyPI
+  that day. The project itself is installed `--no-editable` (an editable
+  `.pth` would point at `/app/src`, absent from the runtime stage). Base
+  images and the `uv` image are pinned by tag **and** digest; bump both
+  together (`docker buildx imagetools inspect <image>:<tag>`, index digest).
 - **The Dockerfile's `ENTRYPOINT` runs as a non-root user** (uid 10001).
   Don't add steps that require root after the `USER app` directive.
 - **The release workflow tags both `:vX.Y.Z` and `:latest`** so image-
