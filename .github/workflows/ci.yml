@@ -37,6 +37,25 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
+  # Runs the same hooks contributors run locally (.pre-commit-config.yaml):
+  # hygiene checks, detect-secrets against .secrets.baseline, and ruff. The
+  # local hook is opt-in and bypassable (`--no-verify`), so without this job
+  # nothing actually enforced detect-secrets on what reaches `main`.
+  pre-commit:
+    name: Pre-commit hooks (incl. detect-secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          enable-cache: true
+      # --locked: also fail fast here if uv.lock is stale vs pyproject.toml,
+      # since the release image build (`uv sync --locked`) would refuse it.
+      - run: uv sync --all-extras --dev --locked
+      - run: uv run pre-commit run --all-files --show-diff-on-failure
+
   test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
