@@ -164,8 +164,11 @@ The key is namespaced by `MCP_REDIS_COLLECTION_PREFIX`, except that the
 default prefix keeps the legacy name `kalshi-mcp:safety-limits` — renaming
 it would drop every live clamp on upgrade, and a lost tightening is a
 loosening. A non-default prefix reads the legacy key as a tighten-only
-fallback until it writes its own record; `clear` writes `{}` (not a delete)
-there so a reset isn't resurrected by that fallback. Don't "simplify" either.
+fallback while it has no record of its own, and copies what it finds into
+its own key (best-effort, `SET NX`) so another deployment resetting the
+legacy key can't later drop the inherited clamp; `clear` writes `{}` (not a
+delete) there so a reset isn't resurrected by that fallback. Don't
+"simplify" any of these.
 Caveat: persistence is single-replica-coherent (write-through + load-on-
 boot); if you scale past one instance, a mid-life change won't reach other
 replicas until they restart.

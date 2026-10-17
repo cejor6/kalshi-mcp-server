@@ -27,6 +27,10 @@
 #     `release` environment (pypi.org → project → Publishing → Environment
 #     name `release`), so an OIDC token minted outside that gated
 #     environment can't publish.
+#   - Recommended: store RENDER_DEPLOY_HOOK_URL as a secret of the
+#     `release` environment (Settings → Environments → release →
+#     Environment secrets) instead of a repository secret, so only the
+#     reviewer-gated job can read it. The workflow needs no change for that.
 #   - `workflow_dispatch` (re-running a release) only accepts an EXISTING
 #     tag of the exact form vMAJOR.MINOR.PATCH, and must be dispatched from
 #     the default branch. A branch name, SHA or anything else is rejected
@@ -50,7 +54,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
+  # ref_name (not ref) so a tag push and a dispatch of the same tag share
+  # one group (`release-v1.2.3`) and serialize.
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:

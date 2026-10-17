@@ -57,9 +57,11 @@ logger = logging.getLogger(__name__)
 # prefix, `load` falls back to the legacy key while the namespaced key has
 # never been written, so a clamp persisted before upgrade still applies. That
 # fallback can only tighten (everything loaded is re-clamped to the env
-# ceilings in `safety.py`), and it ends the first time this deployment saves
-# or resets its limits — `clear` writes an empty `{}` record rather than
-# deleting, precisely so a reset isn't undone by the fallback on next boot.
+# ceilings in `safety.py`), and it is one-shot: the first load that uses it
+# copies the record into this deployment's own key (best-effort, see
+# `_adopt_legacy`), so another deployment later resetting the legacy key
+# can't drop the inherited clamp. `clear` writes an empty `{}` record rather
+# than deleting, so a reset isn't undone by the fallback on next boot.
 # The legacy key itself is never written or deleted from a namespaced store:
 # with a default-prefix deployment on the same Redis, it's that deployment's
 # live record.
@@ -94,17 +96,46 @@ class RedisLimitsStore:
 
     async def load(self) -> dict[str, float] | None:
         raw = await self._client.get(self.key)  # type: ignore[attr-defined]
+        from_legacy = False
         if raw is None and self._legacy_key is not None:
             # Never written under the namespaced key: honor a clamp persisted
             # before upgrade. Tighten-only — `safety.py` re-clamps on load.
             raw = await self._client.get(self._legacy_key)  # type: ignore[attr-defined]
             if raw:
+                from_legacy = True
                 logger.info(
-                    "No safety-limit record under %s yet; applying the legacy "
-                    "%s record (tighten-only) until this deployment saves its own.",
+                    "No safety-limit record under %s yet; adopting the legacy "
+                    "%s record (tighten-only) as this deployment's own.",
                     self.key,
                     self._legacy_key,
                 )
+        data = self._parse(raw)
+        if from_legacy and data is not None:
+            await self._adopt_legacy(data)
+        return data
+
+    async def _adopt_legacy(self, data: dict) -> None:
+        """Copy an inherited legacy record into this deployment's own key.
+
+        Otherwise the inherited clamp lives only in the shared legacy key, and
+        another deployment resetting it (its `clear` deletes that key) would
+        silently drop the clamp here on our next boot — a loosening nobody
+        asked for. `nx=True` so a record this deployment wrote concurrently
+        is never overwritten. Best-effort: a failure is logged and the
+        fallback simply repeats next boot; it must never block the load.
+        """
+        try:
+            await self._client.set(self.key, json.dumps(data), nx=True)  # type: ignore[attr-defined]
+        except Exception as exc:  # never block the load
+            logger.warning(
+                "Could not copy the legacy safety-limit record to %s (%s); "
+                "will retry from the legacy key on next boot.",
+                self.key,
+                exc,
+            )
+
+    @staticmethod
+    def _parse(raw: object) -> dict | None:
         if not raw:
             return None
         try:

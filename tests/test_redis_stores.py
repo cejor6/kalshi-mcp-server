@@ -201,8 +201,11 @@ class _FakeRedis:
     async def get(self, key):
         return self.data.get(key)
 
-    async def set(self, key, value):
+    async def set(self, key, value, nx=False):
+        if nx and key in self.data:
+            return None
         self.data[key] = value
+        return True
 
     async def delete(self, key):
         self.data.pop(key, None)
@@ -228,6 +231,45 @@ async def test_namespaced_store_falls_back_to_legacy_until_it_writes():
     assert await store.load() == {"max_order_size_usd": 7.0}
     # The legacy key may be another deployment's live record: never touched.
     assert redis.data[_LEGACY_REDIS_KEY] == '{"max_order_size_usd": 5.0}'
+
+
+async def test_inherited_legacy_clamp_survives_a_later_legacy_reset():
+    """Adopt-on-load: once inherited, the clamp is ours. A default-prefix
+    deployment resetting (deleting) the shared key must not loosen us."""
+    redis = _FakeRedis({_LEGACY_REDIS_KEY: '{"max_order_size_usd": 5.0}'})
+    store = RedisLimitsStore(redis, prefix="kalshi-demo")
+    assert await store.load() == {"max_order_size_usd": 5.0}
+    assert redis.data[store.key] == '{"max_order_size_usd": 5.0}'
+
+    await RedisLimitsStore(redis).clear()  # the other deployment resets
+    assert _LEGACY_REDIS_KEY not in redis.data
+    assert await store.load() == {"max_order_size_usd": 5.0}
+
+
+async def test_adoption_never_overwrites_an_existing_own_record():
+    redis = _FakeRedis({_LEGACY_REDIS_KEY: '{"max_order_size_usd": 5.0}'})
+    store = RedisLimitsStore(redis, prefix="kalshi-demo")
+    await store._adopt_legacy({"max_order_size_usd": 5.0})
+    redis.data[store.key] = '{"max_order_size_usd": 2.0}'
+    await store._adopt_legacy({"max_order_size_usd": 5.0})
+    assert redis.data[store.key] == '{"max_order_size_usd": 2.0}'
+
+
+async def test_corrupt_legacy_record_is_not_adopted():
+    redis = _FakeRedis({_LEGACY_REDIS_KEY: "not json"})
+    store = RedisLimitsStore(redis, prefix="kalshi-demo")
+    assert await store.load() is None
+    assert store.key not in redis.data
+
+
+async def test_adoption_failure_never_blocks_the_load():
+    class _ReadOnlyRedis(_FakeRedis):
+        async def set(self, key, value, nx=False):
+            raise ConnectionError("read-only replica")
+
+    redis = _ReadOnlyRedis({_LEGACY_REDIS_KEY: '{"max_order_size_usd": 5.0}'})
+    store = RedisLimitsStore(redis, prefix="kalshi-demo")
+    assert await store.load() == {"max_order_size_usd": 5.0}
 
 
 async def test_namespaced_reset_is_not_undone_by_the_legacy_fallback():

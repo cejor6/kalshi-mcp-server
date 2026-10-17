@@ -11,6 +11,12 @@
 # the top-level index `Digest:` (not a per-platform manifest digest — the
 # release builds linux/amd64 + linux/arm64).
 
+# uv, as its own named stage so Dependabot's docker ecosystem (which parses
+# FROM lines, not `COPY --from=<image>` refs) can propose bumps. Pinned to an
+# exact release + digest: a floating `0.x` tag would let a new uv change
+# lockfile handling under an unchanged commit.
+FROM ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c AS uv
+
 # Stage 1 — install the LOCKED dependency set into a venv with uv.
 FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS build
 
@@ -30,10 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv directly from the official image — avoids pip overhead. Pinned to
-# an exact release + digest: a floating `0.x` tag would let a new uv change
-# lockfile handling under an unchanged commit.
-COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /uvx /usr/local/bin/
+# Install uv from the pinned `uv` stage above — avoids pip overhead.
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 

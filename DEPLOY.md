@@ -392,14 +392,13 @@ Know the limits of that boundary before you rely on it:
   The default prefix keeps the original key, `kalshi-mcp:safety-limits`,
   so upgrading never drops a persisted clamp; any other prefix `<p>` uses
   `kalshi-mcp:<p>:safety-limits`. A deployment with a non-default prefix
-  falls back to reading the old shared `kalshi-mcp:safety-limits` record
-  until it first saves or resets its own limits with
-  `kalshi_set_safety_limits` (a reset writes an empty record, so the
-  fallback stays off). That fallback can only tighten — everything loaded
-  is re-clamped to the env ceilings — but if a namespaced deployment
-  should stop inheriting it without touching its limits (e.g. it runs
-  with `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0`), `SET
-  kalshi-mcp:<p>:safety-limits '{}'` by hand.
+  inherits the old shared `kalshi-mcp:safety-limits` record once: on its
+  first boot without a record of its own it applies that record and copies
+  it into its own key, so later changes to the shared key don't affect it.
+  That can only tighten — everything loaded is re-clamped to the env
+  ceilings. To drop an inherited clamp, reset the limits with
+  `kalshi_set_safety_limits` (or, with `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0`,
+  `SET kalshi-mcp:<p>:safety-limits '{}'` by hand).
 
 ### Upgrading an existing deployment to encrypted storage
 

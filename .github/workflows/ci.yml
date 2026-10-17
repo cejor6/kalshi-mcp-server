@@ -44,6 +44,10 @@ jobs:
   pre-commit:
     name: Pre-commit hooks (incl. detect-secrets)
     runs-on: ubuntu-latest
+    env:
+      # ruff already runs in the `lint` job; don't run it twice. (No hook-env
+      # cache: there's no pinned actions/cache SHA in this repo to reuse.)
+      SKIP: ruff,ruff-format
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
