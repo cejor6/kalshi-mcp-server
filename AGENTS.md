@@ -800,7 +800,13 @@ bypassed locally — discipline is the actual safeguard.
   either way, and N typed tools would 5× the surface to review); no
   wildcard content hosts are allowlisted (a raw.githubusercontent.com
   entry was removed in review); fetched bodies are delimiter-wrapped
-  UNTRUSTED data; DNS rebinding is an accepted, documented residual.
+  UNTRUSTED data, with a fresh random nonce in both markers per call and
+  delimiter-like text in the body neutralized, so a fetched body can't forge
+  the end of the block (don't go back to fixed marker strings); the size cap
+  applies to DECODED bytes via `Accept-Encoding: identity` plus the bounded
+  reader in `tools/_bounded_read.py` (httpx's default gzip decoding inflates a
+  whole chunk before any cap); the 45s wall clock also covers the wait for a
+  concurrency slot; DNS rebinding is an accepted, documented residual.
   Forks that don't want this surface can delete the module + its
   registration line — nothing else depends on it.
 - **Multi-user tenant isolation.** The server's identity is the
