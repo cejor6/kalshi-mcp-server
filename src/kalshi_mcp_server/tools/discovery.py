@@ -969,7 +969,7 @@ def register(server: FastMCP) -> None:
         event_ticker: str,
         with_nested_markets: bool = True,
         compact: bool = False,
-        minimal: bool = False,
+        minimal: bool = True,
         fields: str | None = None,
     ) -> dict[str, Any]:
         """Fetch an event and (optionally) all markets nested under it.
@@ -981,12 +981,17 @@ def register(server: FastMCP) -> None:
                 the `markets` array is stripped client-side — Kalshi
                 returns nested markets regardless of this parameter, so
                 we drop them locally to honor the requested contract.
-            compact: When True, drop verbose fields from the event and
-                from each nested market. Default False.
-            minimal: When True, project each NESTED MARKET to the triage-
-                field whitelist (see `kalshi_get_markets`). The event
-                object itself is unaffected. Strongly recommended for
-                multivariate events whose nested combo markets are large.
+            compact: When True, drop verbose fields from the event object
+                (and from each nested market, when `minimal=False`).
+                Default False.
+            minimal: Project each NESTED MARKET to the triage-field whitelist
+                (see `kalshi_get_markets`). Default True — an event can nest
+                dozens of markets and the full objects run ~2KB each (far
+                more for combo markets), so the bounded view is the default.
+                (Changed: earlier versions defaulted to False.) Pass
+                `minimal=False` for FULL nested markets, or `minimal=False,
+                compact=True` for the blacklist view. The event object itself
+                is unaffected.
             fields: Comma-separated whitelist applied to each nested market,
                 overriding `minimal`'s default set. Unknown field names are
                 silently ignored; a blank list is rejected before any request.

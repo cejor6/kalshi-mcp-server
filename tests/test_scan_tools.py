@@ -897,3 +897,50 @@ async def test_blank_fields_rejected_before_any_request(rsa_private_key, tool_na
     assert "`fields` must list at least one field name" in exc.value.message
     assert calls == []
 
+
+# ── kalshi_get_event: nested markets projected by default ──────────────────
+
+
+def _event_handler(calls: list[httpx.Request]):
+    full_market = {
+        "ticker": "KXFED-26MAR19-B5.25",
+        "yes_bid_dollars": "0.4500",
+        "rules_primary": "x" * 2_000,
+        "custom_strike": {"big": "y" * 1_000},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={"event": {"event_ticker": "KXFED-26MAR19"}, "markets": [full_market] * 3},
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_get_event_projects_nested_markets_by_default(rsa_private_key):
+    calls: list[httpx.Request] = []
+    server = _make_server(rsa_private_key, _event_handler(calls))
+    fn = await _tool_fn(server, "kalshi_get_event")
+
+    out = await fn(event_ticker="KXFED-26MAR19")
+
+    assert len(out["markets"]) == 3
+    for market in out["markets"]:
+        assert market["ticker"] == "KXFED-26MAR19-B5.25"
+        assert "rules_primary" not in market
+        assert "custom_strike" not in market
+
+
+@pytest.mark.asyncio
+async def test_get_event_full_nested_markets_still_available(rsa_private_key):
+    calls: list[httpx.Request] = []
+    server = _make_server(rsa_private_key, _event_handler(calls))
+    fn = await _tool_fn(server, "kalshi_get_event")
+
+    out = await fn(event_ticker="KXFED-26MAR19", minimal=False)
+
+    assert out["markets"][0]["rules_primary"] == "x" * 2_000
+    assert "custom_strike" in out["markets"][0]
