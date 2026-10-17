@@ -11,7 +11,9 @@ right `fallback_reason`. Async per the repo convention (asyncio_mode="auto").
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
+import tracemalloc
 
 import httpx
 import pytest
@@ -212,7 +214,8 @@ async def test_success_scores_and_ranks_by_confidence_times_edge(rsa_private_key
 
 @pytest.mark.parametrize(
     ("status_code", "reason"),
-    [(402, "credits"), (429, "rate"), (500, "http_error")],
+    # 429 has its own test below: the first one short-circuits the batch.
+    [(402, "credits"), (500, "http_error")],
 )
 async def test_non_2xx_falls_back(rsa_private_key, status_code, reason):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -339,7 +342,8 @@ async def test_429_trips_global_cooldown(rsa_private_key, monkeypatch):
         return httpx.Response(200, json=_jev_answer(score=4.0, edge_conf=1.0))
 
     first = await _run(rsa_private_key, rate_limited, api_key=None)
-    assert first["fallback_reasons"] == {"rate": 2}
+    # The first 429 stops the rest of the batch from going out at all.
+    assert first["fallback_reasons"] == {"rate": 1, "rate_cooldown": 1}
 
     # The cooldown is now armed: the next scan must skip Jev entirely even
     # though this handler would succeed.
@@ -347,6 +351,88 @@ async def test_429_trips_global_cooldown(rsa_private_key, monkeypatch):
     assert second["jev_enabled"] is False
     assert second["fallback_reasons"] == {"rate_cooldown": 2}
     assert ok_calls == []
+
+
+async def test_429_short_circuits_queued_calls_in_the_same_batch(rsa_private_key, monkeypatch):
+    """After one 429, calls still queued on the semaphore must fall back
+    without being sent — even with the cross-scan cooldown disabled."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", _API_KEY)
+    monkeypatch.setenv("MCP_JEV_RATE_COOLDOWN_SECONDS", "0")
+    monkeypatch.setattr(scoring, "_jev_semaphore", asyncio.Semaphore(1))
+    calls: list[httpx.Request] = []
+
+    def rate_limited(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(429, json={"error": "slow down"})
+
+    out = await _run(rsa_private_key, rate_limited, api_key=None)
+
+    assert len(calls) == 1
+    assert out["fallback_reasons"] == {"rate": 1, "rate_cooldown": 1}
+    assert out["jev_status"] == "fallback"
+    assert all(r["jev_scored"] is False for r in out["markets"])
+    # Cooldown 0 → no cross-scan back-off was armed.
+    assert not scoring._in_rate_cooldown()
+
+
+# ── Oversize responses are never parsed ──────────────────────────────────────
+
+
+class _RawStream(httpx.AsyncByteStream):
+    """Un-buffered response stream, like a real transport (a `content=`
+    Response is pre-read by httpx)."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def __aiter__(self):
+        for i in range(0, len(self._data), 4_096):
+            yield self._data[i : i + 4_096]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_oversize_jev_body_falls_back(rsa_private_key, streamed):
+    # Valid JSON, but padded far past the response cap.
+    payload = _jev_answer(score=4.0, edge_conf=1.0)
+    payload["padding"] = "x" * (scoring._MAX_JEV_RESPONSE_BYTES * 2)
+    raw = json.dumps(payload).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if streamed:
+            return httpx.Response(200, stream=_RawStream(raw))
+        return httpx.Response(200, content=raw)
+
+    out = await _run(rsa_private_key, handler)
+    assert out["fallback_reasons"] == {"oversize": 2}
+    assert all(r["fallback_reason"] == "oversize" for r in out["markets"])
+
+
+async def test_gzip_bomb_from_jev_falls_back_without_inflating(rsa_private_key):
+    bomb = gzip.compress(b" " * 20_000_000)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_RawStream(bomb), headers={"content-encoding": "gzip"})
+
+    tracemalloc.start()
+    try:
+        out = await _run(rsa_private_key, handler)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert out["fallback_reasons"] == {"oversize": 2}
+    # Inflating even one 4KB wire chunk whole would be ~4MB.
+    assert peak < 3_000_000, peak
+
+
+async def test_streamed_valid_answer_still_scores(rsa_private_key):
+    raw = json.dumps(_jev_answer(score=4.0, edge_conf=1.0)).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_RawStream(raw))
+
+    out = await _run(rsa_private_key, handler)
+    assert out["jev_status"] == "ok"
+    assert all(r["jev_scored"] for r in out["markets"])
 
 
 # ── State building: public data only, correct payload shape ────────────────────
@@ -382,6 +468,9 @@ async def test_request_shape_and_auth_header(rsa_private_key, monkeypatch):
     assert captured, "Jev was not called"
     req = captured[0]
     assert req.headers["authorization"] == f"Bearer {_API_KEY}"
+    # No compression negotiated: the body is size-capped before parsing, and an
+    # advertised gzip would be inflated in full before any cap could apply.
+    assert req.headers["accept-encoding"] == "identity"
     assert req.url.host == "api.typesafe.ai"  # key only ever sent to the Jev host
     body = json.loads(req.content)
     assert body["model"] == "jev-latest"

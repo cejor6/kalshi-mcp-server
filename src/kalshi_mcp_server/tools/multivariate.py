@@ -496,6 +496,7 @@ def register(server: FastMCP) -> None:
         ticker: str,
         with_titles: bool = True,
         include_collection: bool = False,
+        include_collection_event_tickers: bool = False,
     ) -> dict[str, Any]:
         """Resolve a multivariate (`KXMVE…`) combo market into its underlying legs.
 
@@ -526,10 +527,17 @@ def register(server: FastMCP) -> None:
                 `titles_resolved: false`.
             include_collection: Also fetch the parent multivariate event
                 collection (`size_min`/`size_max`, `is_all_yes`,
-                `associated_event_tickers`, `functional_description`) — the
-                rules governing how combos in this family are built. Costs one
-                more read and can be sizable, so it defaults False. Fails open.
-                `kalshi_get_combo_collection` is the standalone version.
+                `functional_description`, …) — the rules governing how combos
+                in this family are built. Costs one more read, so it defaults
+                False. Fails open (`collection_error` instead). The collection
+                is PROJECTED by default: its eligible-event universe arrays
+                (`associated_event_tickers` / `associated_events`, ~800+
+                entries on a broad collection) are replaced by
+                `associated_event_count`. `kalshi_get_combo_collection` is the
+                standalone version.
+            include_collection_event_tickers: With `include_collection`, keep
+                the full universe arrays instead of the count. Default False
+                (changed: earlier versions always returned them). Large.
 
         Returns:
             `resolvable`: True when legs were resolved; False otherwise.
@@ -650,15 +658,25 @@ def register(server: FastMCP) -> None:
 
         if include_collection and collection_ticker:
             try:
-                collection = await client.get(
-                    f"/multivariate_event_collections/{collection_ticker}"
+                # `mve_collection_ticker` comes from Kalshi's RESPONSE, not the
+                # caller — but it is still interpolated into a signed path, so
+                # it gets the same path-segment guard as any model input. A bad
+                # value lands in the fail-open `collection_error` branch.
+                safe_collection = _validate_path_ticker(
+                    collection_ticker, name="mve_collection_ticker"
                 )
+                collection = await client.get(f"/multivariate_event_collections/{safe_collection}")
             except KalshiAPIError:
                 result["collection_error"] = (
                     f"Could not fetch collection {collection_ticker!r}; legs above are unaffected."
                 )
             else:
-                result["collection"] = collection.get("multivariate_contract", collection)
+                contract = collection.get("multivariate_contract", collection)
+                if isinstance(contract, dict):
+                    contract = _project_collection(
+                        contract, include_event_tickers=include_collection_event_tickers
+                    )
+                result["collection"] = contract
 
         return result
 

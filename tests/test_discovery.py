@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from kalshi_mcp_server.errors import KalshiAPIError
+from kalshi_mcp_server.errors import KalshiAPIError, RateLimitError
 from kalshi_mcp_server.tools.discovery import (
     _EVENT_HINT_MISS_MAX,
     _MINIMAL_MARKET_FIELDS,
@@ -822,6 +822,41 @@ async def test_event_hint_negative_cache_skips_repeat_probe():
     assert await _event_hint(client, "REAL-MARKET-XYZ") is None
     # Only the first call hit the API; the second was cached.
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RateLimitError(status=429, message="rate limited"),
+        KalshiAPIError(status=503, message="unavailable"),
+        KalshiAPIError(status=0, message="Timeout calling Kalshi: read timed out"),
+    ],
+    ids=["rate_limit", "5xx", "timeout"],
+)
+async def test_event_hint_does_not_cache_transient_failures(error):
+    """A transient failure says nothing about whether the ticker is an event.
+    Caching it would suppress a real hint for the whole TTL — so the next
+    call must re-probe (and still fail open)."""
+    client = _FakeClient(error=error)
+    assert await _event_hint(client, "KXMLBGAME-26JUN042010PITHOU") is None
+    assert "KXMLBGAME-26JUN042010PITHOU" not in _event_hint_misses
+    assert await _event_hint(client, "KXMLBGAME-26JUN042010PITHOU") is None
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("body", [["not", "a", "dict"], "oops", {"markets": "junk"}])
+async def test_event_hint_does_not_cache_a_malformed_200(body):
+    client = _FakeClient(responses=[body, body])
+    assert await _event_hint(client, "KXEV-1") is None
+    assert "KXEV-1" not in _event_hint_misses
+    assert await _event_hint(client, "KXEV-1") is None
+    assert len(client.calls) == 2
+
+
+async def test_event_hint_caches_empty_market_list():
+    client = _FakeClient(responses=[{"event": {"event_ticker": "X"}, "markets": []}])
+    assert await _event_hint(client, "X") is None
+    assert "X" in _event_hint_misses
 
 
 def test_event_hint_miss_cache_is_hard_bounded():
