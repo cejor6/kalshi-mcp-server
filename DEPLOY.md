@@ -90,7 +90,18 @@ real secrets.
 - **CI** runs tests on every PR. CI never touches your deployment.
 - **`release.yml`** builds and pushes a versioned image to GHCR. It
   runs **only on tag push** (`git tag v0.1.0 && git push origin v0.1.0`).
-- **Tag protection** on `v*` means only repo admins can publish tags.
+- **A tag ruleset** on `v*` (Settings → Rules → Rulesets → new *tag*
+  ruleset; restrict creations, updates and deletions to maintainers) means
+  only maintainers can cut a release tag. This is a repo setting you must
+  add — branch protection on `main` does **not** cover tags, and without
+  the ruleset anyone with write access can tag any commit (even one on an
+  unmerged branch) and ship it.
+- **The `release` environment** gates the publishing jobs. Add yourself as
+  a required reviewer under Settings → Environments → release (and limit
+  its deployment tags to `v*`), and bind the PyPI Trusted Publisher to the
+  environment name `release`. Until reviewers are added the environment
+  is just a label. `workflow_dispatch` re-runs only accept an existing
+  `vX.Y.Z` tag, dispatched from the default branch.
 - **Render** is configured to pull the image, NOT to build from source.
 
 Net effect: PRs flow through `main` normally; production deploys only
@@ -319,8 +330,13 @@ In your browser:
 7. Create. On the database page, copy the **Endpoint** URL — it looks
    like `rediss://default:<password>@<host>.upstash.io:6379`.
 
-The `rediss://` prefix (double-s) is TLS Redis. Required — the OAuth
-proxy will reject `redis://` (cleartext) URLs.
+The `rediss://` prefix (double-s) is TLS Redis. Required — the server
+refuses to start with a cleartext `redis://` URL to anything but
+localhost. (The one exception: a Redis reachable only over a private
+network the host isolates, such as a Render Key Value instance's
+*internal* `redis://red-…:6379` URL. Set `MCP_ALLOW_PLAINTEXT_REDIS=1`
+to allow that — never for a URL that crosses the internet, since the
+Redis password and the safety-limit overrides travel unencrypted.)
 
 ### 7. Add OAuth env vars to Render, redeploy — Phase B
 
@@ -344,7 +360,8 @@ Back in Render → service → **Environment** tab → add these:
 | `MCP_ALLOWED_GITHUB_LOGINS` | your GitHub username (comma-separated for multiple users) |
 | `MCP_JWT_SIGNING_KEY` | output of `secrets.token_urlsafe(64)` above — **required if you set `MCP_REDIS_URL`** (the server refuses to start otherwise; it's also what the storage-encryption key is derived from) |
 | `MCP_REDIS_URL` | the `rediss://...` URL from step 6 *(skip if you skipped step 6)* — also persists runtime safety-limit overrides (see "Tuning safety limits" below) |
-| `MCP_REDIS_COLLECTION_PREFIX` | *(optional, default `kalshi`)* collection namespace. Set it only if another OAuth-proxy server shares this Redis — see below |
+| `MCP_REDIS_COLLECTION_PREFIX` | *(optional, default `kalshi`)* namespace for this deployment's OAuth collections **and** its safety-limit override key. Set it if another server (including a second deployment of this image) shares this Redis — see below |
+| `MCP_ALLOW_PLAINTEXT_REDIS` | *(optional, default off)* set to `1` only for a private-network `redis://` URL (see step 6) |
 
 **Sharing one Redis across several MCP servers works** — you don't need a
 paid instance per server. Stored *values* are encrypted at rest, and each
@@ -371,10 +388,17 @@ Know the limits of that boundary before you rely on it:
   overwriting entries is still possible, costing you a reconnect.
 - Collection and key names stay plaintext (client IDs, JTIs,
   refresh-token hashes). Only values are encrypted.
-- **Runtime safety-limit overrides are not namespaced** — `safety_store`
-  uses a fixed key, so two kalshi deployments on one DB share one
-  override record and a clamp applied on either is what both load at
-  boot. Give them separate Redis databases if that matters.
+- **Runtime safety-limit overrides are namespaced by the same prefix.**
+  The default prefix keeps the original key, `kalshi-mcp:safety-limits`,
+  so upgrading never drops a persisted clamp; any other prefix `<p>` uses
+  `kalshi-mcp:<p>:safety-limits`. A deployment with a non-default prefix
+  inherits the old shared `kalshi-mcp:safety-limits` record once: on its
+  first boot without a record of its own it applies that record and copies
+  it into its own key, so later changes to the shared key don't affect it.
+  That can only tighten — everything loaded is re-clamped to the env
+  ceilings. To drop an inherited clamp, reset the limits with
+  `kalshi_set_safety_limits` (or, with `MCP_ALLOW_RUNTIME_LIMIT_TUNING=0`,
+  `SET kalshi-mcp:<p>:safety-limits '{}'` by hand).
 
 ### Upgrading an existing deployment to encrypted storage
 
@@ -388,10 +412,10 @@ un-expose old ones.
 1. Deploy this version.
 2. Purge the old keys: delete the **un-prefixed `mcp-*` keys**. That glob
    matches exactly the stale OAuth entries — not the new
-   `<prefix>__mcp-*` ones, and not `kalshi-mcp:safety-limits`.
+   `<prefix>__mcp-*` ones, and not the `kalshi-mcp:…safety-limits` keys.
 
-   **Prefer that over `FLUSHDB`.** `FLUSHDB` also deletes
-   `kalshi-mcp:safety-limits`, so any runtime safety clamp you've applied
+   **Prefer that over `FLUSHDB`.** `FLUSHDB` also deletes the
+   `kalshi-mcp:…safety-limits` keys, so any runtime safety clamp you've applied
    reverts to the (wider) env ceilings on the next boot — a silent
    loosening of your risk envelope. If you do flush, re-apply the clamp
    with `kalshi_set_safety_limits` afterwards.
@@ -565,9 +589,10 @@ default; if your dashboard shows a `redis://` URL, click "Show TLS" or
 copy the TLS endpoint specifically.
 
 **Collection scoping.** Multiple MCP servers can share one Upstash
-instance. Each server scopes its writes under a distinct collection
-prefix (this server uses `kalshi-oauth-proxy`). No key collisions
-between e.g. a Kalshi server and an Alpaca server on the same Upstash.
+instance. Each server scopes its writes under its collection prefix
+(`MCP_REDIS_COLLECTION_PREFIX`, default `kalshi`). No key collisions
+between e.g. a Kalshi server and an Alpaca server on the same Upstash,
+as long as each deployment has a distinct prefix.
 
 **Free tier limits.** Upstash free tier (256MB, 500 commands/sec) is
 more than enough for the OAuth proxy workload — DCR entries are tiny
@@ -649,9 +674,12 @@ already designed to handle a missing hook gracefully.
   interpolated into a shell command line. GitHub Actions also
   auto-masks any string matching a known secret value with `***` in
   workflow logs.
-- The `release.yml` workflow triggers only on `push: tags: ['v*']`,
-  which requires repo write access. Fork PRs cannot trigger it and
-  therefore cannot access this secret.
+- The `release.yml` workflow triggers only on `push: tags: ['v*']`
+  (or a maintainer's manual re-run of an existing `vX.Y.Z` tag), which
+  requires repo write access. Fork PRs cannot trigger it and therefore
+  cannot access this secret. For a tighter boundary, store the hook URL
+  as a secret of the `release` **environment** rather than the repo, so
+  only the reviewer-gated job can read it.
 - If the URL leaks anyway: regenerate it in Render's UI (the old one
   immediately stops working). Update the GitHub secret with the new
   value.
@@ -812,8 +840,8 @@ Clear build cache & deploy.
 
 Image was built without the `[oauth]` extras. The fix is to use a
 **v0.1.2 or newer** image. If you've forked and built your own, your
-Dockerfile needs `RUN uv pip install --no-cache ".[oauth]"` (not just
-`.`).
+Dockerfile needs `--extra oauth` on its `uv sync --locked` install
+steps.
 
 ### Stuck "Connecting" / OAuth fails in claude.ai
 
