@@ -47,6 +47,7 @@ def register(server: FastMCP) -> None:
             "safety_limits": effective.as_dict(),
             "safety_ceilings": ceilings.as_dict(),
             "safety_limits_persist": safety.persistence_durable,
+            "safety_limits_loosening_allowed": config.runtime_limit_loosening_enabled,
             # The combo-creation gate is separate from `trading_enabled` and
             # draws on a different budget (Kalshi's weekly creation quota, not
             # dollars), so it is surfaced alongside rather than folded in.

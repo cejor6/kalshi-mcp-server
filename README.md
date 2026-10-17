@@ -364,9 +364,10 @@ the worked example.
 | External data (read-only) | `kalshi_fetch_external_data` — host-allowlisted, GET-only, https-only fetch of public data feeds (Polymarket gamma/clob, NWS `api.weather.gov`, Open-Meteo incl. ensemble, Tennis Abstract, Deribit public). No credentials attached (`trust_env=False`), redirects not followed, body size- and wall-clock-capped (the cap applies to decoded bytes; `Accept-Encoding: identity` is sent) and returned wrapped in UNTRUSTED-EXTERNAL-DATA delimiters stamped with a per-call random nonce (`<<<UNTRUSTED-EXTERNAL-DATA id=<nonce> …>>>` … `<<<END-UNTRUSTED-EXTERNAL-DATA id=<nonce>>>`); the block ends only at the END marker whose id matches. Inside the body (matched after NFKC normalization with Unicode format characters removed), `untrusted`/`external`/`data` separated only by non-alphanumerics — any case — becomes `[delimiter-removed]`, and any run of 3+ `<` or `>` becomes `[angle-brackets-removed]`. Cross-script homoglyphs are not covered; the nonce is the primary defence. Exists so clients whose own egress is restricted (e.g. claude.ai cloud routines) can reach the public feeds their read-only research needs; the allowlist is enforced at runtime, additions are a code change, and the boundary rationale lives in AGENTS.md. |
 | Scoring (read-only, optional) | `kalshi_score_markets` — ranks liquid markets by apparent edge using [Jev](https://typesafe.ai) (a fast typed-decision model), for a trading loop that scores many markets cheaply and escalates only the top few. Places no orders. Registered only when `MCP_ALLOW_JEV_SCORING=1` (default off). Jev is optional: with no `TYPESAFE_API_KEY`, or on any Jev failure, markets fall back to a deterministic liquidity/spread heuristic (`jev_scored=false`). See "Optional Jev scoring" below. |
 
-Write tools require `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
+Order placement requires `KALSHI_TRADING_ENABLED=1`. `kalshi_prepare_order` runs
 local safety checks and returns a `confirmation_id`; nothing is sent to
-Kalshi until you call `kalshi_confirm_order` with that token. Cancel and
+Kalshi until you call `kalshi_confirm_order` with that token, which re-runs
+the checks against the limits in force at that moment. Cancel and
 decrease bypass the trading-enabled flag — they only reduce exposure.
 
 **Listing markets for an LLM:** `kalshi_get_markets` / `kalshi_get_market`
@@ -542,17 +543,29 @@ ATM is — small mistakes shouldn't cost large amounts.
 
 - `KALSHI_ENV=prod` **requires** `KALSHI_ALLOW_PROD=1`. The server
   refuses to start without both.
-- All write tools require `KALSHI_TRADING_ENABLED=1`. The default is
-  read-only.
+- Placing orders requires `KALSHI_TRADING_ENABLED=1`. The default is
+  read-only. Cancel and decrease stay available either way — they only
+  reduce exposure, so an emergency cancel is never blocked.
 - Per-order caps (`MCP_MAX_ORDER_SIZE_USD`, `MCP_DAILY_LIMIT_USD`,
   `MCP_MAX_CONTRACTS_PER_ORDER`, `MCP_CASH_RESERVE_USD`) are checked
-  before the request reaches Kalshi.
+  before the request reaches Kalshi — at prepare as a fast-fail, and again
+  at confirm against the limits in force then, where the order's cost is
+  reserved against the daily cap *before* it is sent. Cost is worst-case:
+  notional plus a conservative estimate of Kalshi's taker fee. A non-zero
+  cash reserve is checked against a fresh balance read, and the order is
+  refused if the balance can't be read.
+- If a confirm times out or fails ambiguously, the order may have been
+  placed: its cost stays reserved and the same `confirmation_id` can be
+  retried (it resends the same `client_order_id`). Check
+  `kalshi_get_orders` before preparing a replacement.
 - **Tighten limits at runtime, no redeploy.** Those env vars are the hard
   *ceiling*. The `kalshi_set_safety_limits` tool can tighten any limit
-  on a running server (e.g. a fast clamp-down) but can **never loosen one
-  past its env ceiling** — the three caps only go down, the cash reserve
-  only goes up. Raising a ceiling still requires changing the env var and
-  redeploying. The limits in force vs. their ceilings show up in
+  on a running server (e.g. a fast clamp-down). By default it can **only
+  tighten relative to the current value** — the three caps only go down, the
+  cash reserve only goes up — so a runtime caller can't undo a clamp-down.
+  Relaxing a limit needs `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`, and even then
+  never past its env ceiling. Raising a ceiling still requires changing the
+  env var and redeploying (see AGENTS.md for undoing a persisted tighten). The limits in force vs. their ceilings show up in
   `kalshi_get_environment` and `kalshi://environment`. Set `MCP_REDIS_URL`
   to make runtime changes survive a restart (otherwise they reset to the
   env ceilings on reboot).

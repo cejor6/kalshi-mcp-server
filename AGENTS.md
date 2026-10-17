@@ -116,9 +116,13 @@ Two startup guards (`src/kalshi_mcp_server/config.py`):
 1. **`KALSHI_ENV=prod` requires `KALSHI_ALLOW_PROD=1`.** Refuses to start
    otherwise. This is intentional — a typo in a shell env shouldn't be
    enough to route real money.
-2. **`KALSHI_TRADING_ENABLED=0` is the default.** Order-placement,
-   cancellation, and amendment tools refuse to execute. Set the flag to
-   `1` to enable writes.
+2. **`KALSHI_TRADING_ENABLED=0` is the default.** Order placement
+   (`kalshi_prepare_order` / `kalshi_confirm_order`) refuses to execute. Set
+   the flag to `1` to enable it. **Cancel and decrease
+   (`kalshi_cancel_order`, `kalshi_decrease_order`) deliberately stay
+   available with the flag off** — they only ever reduce exposure, and
+   blocking them would prevent an emergency cancel on a server an operator
+   just flipped to read-only. `tests/test_order_safety.py` pins this.
 
 Four per-order checks (`src/kalshi_mcp_server/safety.py`), all enforced
 locally before any request goes to Kalshi:
@@ -127,24 +131,94 @@ locally before any request goes to Kalshi:
 - `MCP_DAILY_LIMIT_USD` — refuse if projected daily spend would exceed it.
 - `MCP_MAX_CONTRACTS_PER_ORDER` — refuse orders with more contracts than this.
 - `MCP_CASH_RESERVE_USD` — refuse if the order would leave less than this
-  in cash.
+  in cash. Checked at confirm — on the first send AND on every retry —
+  against a fresh `GET /portfolio/balance` (`balance`, available cash in
+  cents) minus the reserved cost of every OTHER pending order whose send
+  outcome is unknown (it may land later without showing in the balance yet;
+  if it already landed it is counted twice, the safe direction). If the read
+  fails while a non-zero reserve is active, the order is refused (fail
+  closed). With a `0` reserve the balance isn't read.
+
+**Worst-case cost has ONE formula:** `OrderIntent.worst_case_cost_cents()` —
+notional at the limit price (a sell counts as the complementary buy,
+`100 - price`) plus a conservative fee bound based on Kalshi's general taker
+fee `ceil_to_cent(0.07 x C x P x (1-P))` but rounded up **per contract**:
+`C x ceil(0.07 x P x (1-P))`. Kalshi rounds each *fill* up, so a whole-order
+ceiling can be beaten by partial fills; `ceil(c x a) <= c x ceil(a)` makes the
+per-contract form cover any split. It's an *estimate that errs high*: maker
+fees and some markets' multipliers are lower. The size cap,
+the daily counter, the cash check and prepare's `estimated_cost_usd` all use
+it — don't reintroduce an inline `count * price / 100` anywhere.
+
+**The checks run at CONFIRM, and the spend is reserved before the POST.**
+`kalshi_prepare_order` runs `check_order` as a fast-fail only. The
+authoritative gate is `SafetyController.reserve_order`, called by
+`kalshi_confirm_order` right before the POST: it re-runs every check against
+the limits in force *now* (so an order prepared before an operator tightened a
+limit is judged by the tighter limit) and debits the daily counter in the same
+atomic step (no `await` between check and debit). This is the same
+reserve-then-release shape as combo creation, for the same reasons: recording
+after success let N prepared orders all pass a daily cap only one fit under.
+Confirms are also serialized end to end (an `asyncio.Lock` across the balance
+read and the POST), because the cash-reserve check is read-remote-then-act;
+cancel/decrease don't take that lock. The reservation is released ONLY on an
+unambiguous refusal of the first send (a 4xx; a 429 also keeps the token for a
+retry). On a timeout, transport error, 3xx/5xx or cancellation the order may
+exist, so the reservation **and the pending entry** are kept: retrying the
+same `confirmation_id` resends the identical body with the same
+`client_order_id` and does not reserve again, and the error tells the agent to
+check `kalshi_get_orders` first. A first-send 408 or 425 counts as ambiguous
+too. Reservations carry the **UTC day** they were charged to
+(`OrderReservation`): a retry after midnight is reserved again against the new
+day's counter (full daily check — otherwise day 2 could place its cap plus the
+retried order), and `release_order` never credits a previous day's reservation
+to today. A retry also re-runs the per-order caps and the cash floor against
+the limits and balance in force now — including the daily cap: today's total
+(which already includes the order) must not exceed the cap in force, so an
+operator clamp-down after the first send stops the resend. An order checked
+just before UTC midnight is counted on the day it was checked even if its POST
+lands after midnight — every dollar is still counted against some day's cap.
+The day counter only rolls forward, so a clock stepping back across midnight
+can't reset it. For the cash floor, unknown-outcome orders are tracked in a
+ledger separate from the pending map, kept until the end of the following UTC
+day or until resolved, since one may hold cash after its token expires.
+A *refused retry* also keeps the reservation —
+Kalshi rejects a duplicate `client_order_id` when the first send landed, so a
+4xx there proves nothing. Over-reserving is the acceptable failure here;
+under-reserving is not. The pending map is capped at 100 live entries.
 
 All are operator-configurable. The defaults are conservative on purpose —
 fork-and-adjust to your risk tolerance.
 
 **Runtime adjustment (without a redeploy).** The env vars set the *hard
 ceiling*. The `kalshi_set_safety_limits` operator tool can tighten any of
-the four limits at runtime — but **never loosen one past its env ceiling**
-(`SafetyController` validates direction-aware: the three caps may only go
-down, `cash_reserve_usd` may only go up; the env value is the absolute
-loosest setting). This is the fail-closed property: a runtime actor or bug
-can shrink the risk envelope but never widen it. To raise a ceiling you
-must change the env var and redeploy. The limits in force vs. their
-ceilings are visible via `kalshi_get_environment` and the
-`kalshi://environment` resource. Non-finite values (`NaN`/`inf`) are
+the four limits at runtime. By default it can **only tighten relative to the
+limit's CURRENT effective value** (`SafetyController.set_limits`,
+direction-aware: the three caps may only go down, `cash_reserve_usd` may only
+go up). This is the fail-closed property: a runtime actor or bug — including
+the trading model itself, which can call the tool — can shrink the risk
+envelope but never widen it, not even back toward the env ceiling. Relaxing a
+runtime-tightened limit requires the operator opt-in
+`MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1` (default `0`); even then a limit can
+**never be loosened past its env ceiling** — the env value is the absolute
+loosest setting, and raising it means changing the env var and redeploying.
+The limits in force vs. their ceilings (and `safety_limits_loosening_allowed`)
+are visible via `kalshi_get_environment` and the `kalshi://environment`
+resource. Non-finite values (`NaN`/`inf`) are
 rejected on every path — on a write, on load from the store, and on the
 env ceilings themselves — since they would otherwise slip past the
 `<`/`>` comparisons and silently disable a cap.
+
+**Undoing a tighten with loosening off.** Either set
+`MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`, redeploy, and call the tool (setting a
+limit back to its ceiling clears the override; unset the flag again
+afterwards), or restart the server without the override: with the default
+in-memory store a restart alone reverts to the env ceilings; with
+`MCP_REDIS_URL` the override is reloaded on boot, so first reset its Redis key
+to an empty record — `SET kalshi-mcp:safety-limits '{}'` for the default
+`MCP_REDIS_COLLECTION_PREFIX` (`kalshi`), `SET kalshi-mcp:<prefix>:safety-limits
+'{}'` otherwise — and then restart. Write `{}` rather than deleting: a deleted
+namespaced key falls back to the legacy shared record on the next boot.
 
 The tool is gated by `MCP_ALLOW_RUNTIME_LIMIT_TUNING` (default on). Set it
 to `0` to not register `kalshi_set_safety_limits` at all — useful on a
@@ -207,8 +281,8 @@ ticker. Read the distinction carefully before "tidying" it:
   record-on-success.
 
 This is the one write tool that deliberately does NOT follow the
-"build an `OrderIntent`, call `safety.check_order`, generate an idempotency
-key, call `record_order_committed`" contract in "How to add a new tool" —
+"build an `OrderIntent`, call `safety.reserve_order` before the POST, generate
+an idempotency key" contract in "How to add a new tool" —
 there is no price, count, or cash flow to check. It follows the analogous
 shape (`safety.check_combo_creation()` before the wire call,
 `safety.record_combo_creation()` after success) and pre-flights the leg set
@@ -506,9 +580,15 @@ constraint; just the API's own accepted ranges.
 
 Order-placing tools (anything that puts money at risk) MUST:
 - Call `safety.assert_trading_enabled()` at the top
-- Build an `OrderIntent` and call `safety.check_order(...)`
-- Generate a client-side idempotency key
-- Call `safety.record_order_committed(...)` after the response succeeds
+- Build an `OrderIntent` (its `worst_case_cost_usd()` is the only cost formula)
+- Generate a client-side idempotency key, and reuse it on any retry
+- Call `safety.reserve_order(intent, current_cash_usd=...)` immediately
+  before the wire call — passing a fresh cash balance whenever the active
+  `cash_reserve_usd` is non-zero — and `safety.release_order(...)` only when
+  Kalshi unambiguously placed nothing. Never record spend after success
+  instead: that is check-then-await-then-record, which concurrent or
+  pre-prepared orders slip past (the old `record_order_committed` was removed
+  for that reason). See "Safety model".
 
 **The order write family is on Kalshi's V2 `/portfolio/events/orders` path,
 and the request shape is YES-centric (issue #83).** Kalshi retired the old

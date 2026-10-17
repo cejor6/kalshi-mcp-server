@@ -42,6 +42,7 @@ def _config(
     max_contracts_per_order: int = 100,
     cash_reserve_usd: float = 0.0,
     runtime_limit_tuning_enabled: bool = True,
+    runtime_limit_loosening_enabled: bool = False,
 ) -> Config:
     return Config(
         key_id="test-key",
@@ -59,6 +60,7 @@ def _config(
         port=8000,
         log_level="INFO",
         runtime_limit_tuning_enabled=runtime_limit_tuning_enabled,
+        runtime_limit_loosening_enabled=runtime_limit_loosening_enabled,
     )
 
 
@@ -215,8 +217,11 @@ async def test_partial_update_leaves_other_limits_untouched():
 
 
 async def test_reset_to_ceiling_clears_persisted_override():
+    # Resetting UP to the ceiling is a loosen, so it needs the opt-in flag.
     store = _RecordingStore()
-    ctrl = SafetyController(_config(max_order_size_usd=25.0), store=store)
+    ctrl = SafetyController(
+        _config(max_order_size_usd=25.0, runtime_limit_loosening_enabled=True), store=store
+    )
 
     _, persisted = await ctrl.set_limits(max_order_size_usd=10.0)
     assert persisted is True
@@ -378,7 +383,7 @@ async def test_concurrent_set_limits_do_not_lose_an_override():
 async def test_tightening_daily_below_already_spent_blocks_further_orders():
     ctrl = SafetyController(_config(daily_limit_usd=250.0))
     # Spend $20 today.
-    ctrl.record_order_committed(_intent(count=40, price=50))
+    ctrl.reserve_order(_intent(count=40, price=50), current_cash_usd=None)
     # Tighten the daily cap below what's already spent.
     await ctrl.set_limits(daily_limit_usd=10.0)
     # Any further order is now refused for the rest of the UTC day.
@@ -467,3 +472,95 @@ async def test_set_safety_limits_tool_reports_durable_persistence(rsa_private_ke
     result = await set_limits(daily_limit_usd=100.0)
     assert result["persisted"] is True
     assert result["safety_limits"]["daily_limit_usd"] == 100.0
+
+
+# --- tighten-only by default (MCP_ALLOW_RUNTIME_LIMIT_LOOSENING) -------------
+
+
+@pytest.mark.parametrize(
+    "field,tight,looser",
+    [
+        ("max_order_size_usd", 10.0, 20.0),
+        ("daily_limit_usd", 100.0, 200.0),
+        ("max_contracts_per_order", 5, 50),
+        # Ascending: a LOWER reserve is looser, even when still >= the env floor.
+        ("cash_reserve_usd", 30.0, 15.0),
+    ],
+)
+async def test_runtime_cannot_loosen_relative_to_current_by_default(field, tight, looser):
+    """AGENTS.md: a runtime actor or bug can shrink the risk envelope but never
+    widen it. Loosening back toward (not past) the env ceiling used to be
+    allowed, which let the trading model undo an operator's clamp-down."""
+    ctrl = SafetyController(_config(cash_reserve_usd=10.0))
+    await ctrl.set_limits(**{field: tight})
+    with pytest.raises(SafetyError, match="LOOSEN"):
+        await ctrl.set_limits(**{field: looser})
+    assert getattr(ctrl.effective_limits(), field) == tight
+    # Re-asserting the same value, or tightening further, is still fine.
+    await ctrl.set_limits(**{field: tight})
+
+
+async def test_loosening_rejection_leaves_other_fields_untouched():
+    ctrl = SafetyController(_config())
+    await ctrl.set_limits(max_order_size_usd=10.0)
+    with pytest.raises(SafetyError):
+        # One tighten + one loosen in a single call: all-or-nothing.
+        await ctrl.set_limits(daily_limit_usd=100.0, max_order_size_usd=20.0)
+    eff = ctrl.effective_limits()
+    assert eff.max_order_size_usd == 10.0
+    assert eff.daily_limit_usd == 250.0
+
+
+async def test_loosening_flag_allows_relaxing_up_to_but_not_past_ceiling():
+    ctrl = SafetyController(
+        _config(
+            max_order_size_usd=25.0, cash_reserve_usd=10.0, runtime_limit_loosening_enabled=True
+        )
+    )
+    await ctrl.set_limits(max_order_size_usd=10.0, cash_reserve_usd=30.0)
+    await ctrl.set_limits(max_order_size_usd=20.0, cash_reserve_usd=15.0)
+    assert ctrl.effective_limits().max_order_size_usd == 20.0
+    assert ctrl.effective_limits().cash_reserve_usd == 15.0
+    with pytest.raises(SafetyError):
+        await ctrl.set_limits(max_order_size_usd=30.0)  # past the env ceiling
+    with pytest.raises(SafetyError):
+        await ctrl.set_limits(cash_reserve_usd=5.0)  # below the env floor
+
+
+async def test_loosening_flag_reaches_environment_view():
+    assert (
+        SafetyController(_config()).environment_view()["safety_limits_loosening_allowed"] is False
+    )
+    on = SafetyController(_config(runtime_limit_loosening_enabled=True))
+    assert on.environment_view()["safety_limits_loosening_allowed"] is True
+
+
+def test_loosening_flag_env_parsing(monkeypatch):
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "k")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PEM", "pem")
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.setenv("KALSHI_ENV", "demo")
+    monkeypatch.delenv("MCP_ALLOW_RUNTIME_LIMIT_LOOSENING", raising=False)
+    assert Config.from_env().runtime_limit_loosening_enabled is False
+    monkeypatch.setenv("MCP_ALLOW_RUNTIME_LIMIT_LOOSENING", "1")
+    assert Config.from_env().runtime_limit_loosening_enabled is True
+
+
+def test_loosen_error_names_the_real_redis_key():
+    from kalshi_mcp_server import safety, safety_store
+
+    assert safety._PERSISTED_OVERRIDE_KEY == safety_store._LEGACY_REDIS_KEY
+    assert safety._PERSISTED_OVERRIDE_KEY == safety_store._limits_key(
+        safety_store.DEFAULT_REDIS_COLLECTION_PREFIX
+    )
+    assert safety._PERSISTED_OVERRIDE_KEY_TEMPLATE.replace(
+        "<prefix>", "demo"
+    ) == safety_store._limits_key("demo")
+
+
+async def test_set_safety_limits_tool_rejects_loosen_after_tighten(rsa_private_key):
+    server = _make_server(rsa_private_key)
+    set_limits = await _tool(server, "kalshi_set_safety_limits")
+    await set_limits(daily_limit_usd=50.0)
+    with pytest.raises(SafetyError, match="MCP_ALLOW_RUNTIME_LIMIT_LOOSENING"):
+        await set_limits(daily_limit_usd=200.0)  # still under the $250 ceiling

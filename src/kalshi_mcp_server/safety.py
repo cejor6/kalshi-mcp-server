@@ -4,8 +4,9 @@ These checks run BEFORE we hit Kalshi. The point is to fail locally with a
 clear message rather than relying on Kalshi to reject something — and to
 enforce policies the API doesn't enforce (e.g. "no more than $250/day").
 
-Every order-placing tool MUST call `SafetyController.check_order(...)`
-before sending. The controller raises `SafetyError` on policy violations.
+Every order-placing tool MUST call `SafetyController.reserve_order(...)`
+immediately before sending (it re-runs `check_order` and debits the daily
+budget atomically). The controller raises `SafetyError` on policy violations.
 """
 
 from __future__ import annotations
@@ -41,6 +42,13 @@ _ALL_LIMIT_FIELDS = (
 # conservative, so its override may only go >= the env value. The env var is
 # the absolute loosest setting either way.
 _ASCENDING_LIMITS = frozenset({"cash_reserve_usd"})
+# The Redis keys `safety_store.RedisLimitsStore` persists overrides under,
+# named in operator-facing errors: the legacy key for the default
+# MCP_REDIS_COLLECTION_PREFIX, a namespaced one otherwise. Duplicated
+# (safety_store imports this module, so importing it back would be circular);
+# a test pins them to safety_store.
+_PERSISTED_OVERRIDE_KEY = "kalshi-mcp:safety-limits"
+_PERSISTED_OVERRIDE_KEY_TEMPLATE = "kalshi-mcp:<prefix>:safety-limits"
 
 
 @dataclass(frozen=True)
@@ -114,6 +122,14 @@ class InMemoryLimitsStore:
         self._value = None
 
 
+# Kalshi's general TAKER fee is `ceil_to_cent(0.07 x C x P x (1 - P))` for C
+# contracts at price P (in dollars). Expressed in integer cents to avoid float
+# drift: 0.07 x C x (p/100) x ((100-p)/100) dollars == 7 x C x p x (100-p) / 10_000
+# cents. 7 is the numerator of the 0.07 multiplier.
+_TAKER_FEE_RATE_NUMERATOR = 7
+_TAKER_FEE_DENOMINATOR_CENTS = 10_000
+
+
 @dataclass
 class OrderIntent:
     """Compact description of an order for the safety check."""
@@ -123,6 +139,56 @@ class OrderIntent:
     action: str  # "buy" or "sell"
     count: int
     limit_price_cents: int  # 1..99 for Kalshi binary contracts
+
+    def fee_upper_bound_cents(self) -> int:
+        """Conservative upper bound on Kalshi's trading fee for this order, in cents.
+
+        Based on Kalshi's GENERAL TAKER fee, `ceil_to_cent(0.07 x C x P x (1-P))`
+        per fill, but rounded up PER CONTRACT: `C x ceil(0.07 x P x (1-P))`.
+        Kalshi rounds each fill's fee up separately, so an order split across
+        many partial fills pays `sum(ceil(c_i x a))`, which can exceed
+        `ceil(C x a)` by a cent per extra fill — but never `C x ceil(a)`, since
+        `ceil(c x a) <= c x ceil(a)` for every whole fill size c. It is an
+        ESTIMATE that errs high: maker fees and some markets' multipliers are
+        lower. Evaluating at the limit price is safe even though fills can
+        happen at better prices: per contract, price + this fee bound is
+        non-decreasing in whole-cent prices, so the limit price bounds it.
+        """
+        p = self.limit_price_cents
+        per_contract_numerator = _TAKER_FEE_RATE_NUMERATOR * p * (100 - p)
+        per_contract = -(-per_contract_numerator // _TAKER_FEE_DENOMINATOR_CENTS)  # ceil
+        return self.count * per_contract
+
+    def worst_case_cost_cents(self) -> int:
+        """Worst-case cash at risk in cents: notional at the limit + fee bound.
+
+        For a buy the notional is `count x price`. A sell is treated
+        symmetrically as the complementary buy (selling YES at 30c is buying NO
+        at 70c), so its notional is `count x (100 - price)`. The P x (1-P) fee
+        term is the same either way. This is THE cost formula: the size cap,
+        the daily counter, the cash-reserve check and prepare's displayed
+        estimate all use it, so they can never disagree.
+        """
+        max_price_cents = (
+            self.limit_price_cents if self.action == "buy" else 100 - self.limit_price_cents
+        )
+        return self.count * max_price_cents + self.fee_upper_bound_cents()
+
+    def worst_case_cost_usd(self) -> float:
+        """`worst_case_cost_cents()` in dollars."""
+        return self.worst_case_cost_cents() / 100.0
+
+
+@dataclass(frozen=True)
+class OrderReservation:
+    """A debit against one UTC day's spend counter, made by `reserve_order`.
+
+    The `day` matters: a release, or a retry's "is this still reserved?"
+    question, only makes sense against the day the money was charged to.
+    """
+
+    cost_usd: float
+    day: str
 
 
 @dataclass
@@ -134,8 +200,12 @@ class _DailyCounter:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def _maybe_roll(self) -> None:
+        # Roll FORWARD only. ISO dates compare correctly as strings, and "" (the
+        # initial value) sorts before any date. A wall clock stepping backwards
+        # across midnight (NTP correction, VM resume) must not zero the counter
+        # and hand out a second day's budget — we just stay on the later day.
         today = datetime.now(UTC).strftime("%Y-%m-%d")
-        if today != self.day:
+        if today > self.day:
             self.day = today
             self.cost_usd = 0.0
 
@@ -159,6 +229,29 @@ class _DailyCounter:
             self._maybe_roll()
             self.cost_usd += cost_usd
             return self.cost_usd
+
+    def add_on_today(self, cost_usd: float) -> str:
+        """`add`, returning the UTC day the amount was charged to (same lock)."""
+        if cost_usd < 0:
+            raise ValueError(f"add_on_today takes a non-negative amount, got {cost_usd}.")
+        with self._lock:
+            self._maybe_roll()
+            self.cost_usd += cost_usd
+            return self.day
+
+    def subtract_if_day(self, amount: float, day: str) -> bool:
+        """Give back `amount` only if the counter is still on `day`.
+
+        A reservation made before UTC midnight belongs to the OLD day; the
+        counter has since reset, so crediting it to the new day would widen
+        the new day's budget. Returns whether anything was subtracted.
+        """
+        with self._lock:
+            self._maybe_roll()
+            if self.day != day:
+                return False
+            self.cost_usd = max(0.0, self.cost_usd - amount)
+            return True
 
     def subtract(self, amount: float) -> float:
         """Give back `amount`, clamped at zero, atomically with the day roll.
@@ -184,13 +277,15 @@ class _DailyCounter:
 class SafetyController:
     """Enforces trading-enabled + size + daily caps. Lives for the server's lifetime.
 
-    The four numeric limits are *runtime-adjustable* (see `set_limits`), but
-    only ever to a value at least as tight as the env-configured ceiling —
-    the env vars in `Config` are the absolute maximum and can never be
-    loosened past at runtime. Adjustments persist via the injected
-    `LimitsStore` (in-memory by default; Redis-backed when configured) and
-    are re-clamped to the env ceiling on load, so a stale or hostile stored
-    value can never widen a limit.
+    The four numeric limits are *runtime-adjustable* (see `set_limits`). By
+    default a runtime change may only TIGHTEN a limit relative to its current
+    effective value — the risk envelope can shrink but never widen at runtime.
+    With `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1` a change may also relax a limit,
+    but never past the env-configured ceiling: the env vars in `Config` are the
+    absolute maximum either way. Adjustments persist via the injected
+    `LimitsStore` (in-memory by default; Redis-backed when configured) and are
+    re-clamped to the env ceiling on load, so a stale or hostile stored value
+    can never widen a limit past it.
     """
 
     def __init__(self, config: Config, *, store: LimitsStore | None = None) -> None:
@@ -208,6 +303,11 @@ class SafetyController:
         # Separate counter: combo creations draw on Kalshi's weekly creation
         # quota, not on the USD spend budget, so they must not share a bucket.
         self._combo_creations = _DailyCounter()
+        # Makes reserve_order's check + debit one atomic step. The callers are
+        # all on the event loop and reserve_order never awaits, so this is
+        # belt-and-braces there — but it also keeps the guarantee if a caller
+        # ever runs on another thread.
+        self._order_lock = threading.Lock()
 
     @property
     def ceilings(self) -> SafetyLimits:
@@ -228,13 +328,16 @@ class SafetyController:
         """The safety fields for `kalshi_get_environment` / `kalshi://environment`.
 
         Centralized here so the two callers can't drift: `safety_limits` are
-        the limits in force, `safety_ceilings` the env hard maximums, and
-        `safety_limits_persist` whether a runtime change survives a restart.
+        the limits in force, `safety_ceilings` the env hard maximums,
+        `safety_limits_persist` whether a runtime change survives a restart, and
+        `safety_limits_loosening_allowed` whether a runtime change may relax a
+        limit (MCP_ALLOW_RUNTIME_LIMIT_LOOSENING) or only tighten it.
         """
         return {
             "safety_limits": self._effective.as_dict(),
             "safety_ceilings": self._ceilings.as_dict(),
             "safety_limits_persist": self._store.durable,
+            "safety_limits_loosening_allowed": self._config.runtime_limit_loosening_enabled,
         }
 
     @property
@@ -250,13 +353,18 @@ class SafetyController:
         max_contracts_per_order: int | None = None,
         cash_reserve_usd: float | None = None,
     ) -> tuple[SafetyLimits, bool]:
-        """Tighten (or relax, up to the env ceiling) one or more limits at runtime.
+        """Tighten one or more limits at runtime (relax only when explicitly allowed).
 
         Only the fields you pass are changed; `None` leaves a field as-is.
-        Each new value is validated against the env ceiling in the correct
-        direction (the three caps may only go <= their env value; the cash
-        reserve may only go >= its env value). A value that would loosen
-        past the ceiling raises `SafetyError` and nothing changes.
+        Each new value is validated in the correct direction (the three caps
+        tighten downward; the cash reserve tightens upward):
+
+        - Always: never looser than the env ceiling.
+        - By default: never looser than the CURRENT effective value either, so
+          a runtime caller can only shrink the envelope. Relaxing a limit back
+          toward its ceiling needs `MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1`.
+
+        Any violating value raises `SafetyError` and nothing changes.
 
         Returns `(new_effective_limits, durably_persisted)`. Persistence is
         best-effort: the in-memory update always succeeds (so an emergency
@@ -285,6 +393,11 @@ class SafetyController:
         # leave Redis reflecting a stale subset of the overrides.
         async with self._limits_lock:
             previous = self._effective
+            # Judged against the current value INSIDE the lock, so a concurrent
+            # tighten can't be undone by a stale read.
+            if not self._config.runtime_limit_loosening_enabled:
+                for name, value in provided.items():
+                    self._validate_not_looser_than_current(name, value, getattr(previous, name))
             merged = previous.as_dict()
             for name, value in provided.items():
                 merged[name] = int(value) if name == "max_contracts_per_order" else float(value)
@@ -343,6 +456,22 @@ class SafetyController:
                 f"redeploy to lift the ceiling."
             )
 
+    @staticmethod
+    def _validate_not_looser_than_current(name: str, value: float, current: float) -> None:
+        looser = value < current if name in _ASCENDING_LIMITS else value > current
+        if looser:
+            direction = "lower" if name in _ASCENDING_LIMITS else "raise"
+            raise SafetyError(
+                f"Refusing to set {name}={value}: that would {direction} it from its "
+                f"current value ({current}), i.e. LOOSEN it. At runtime limits may "
+                f"only be tightened. To relax a runtime-tightened limit an operator "
+                f"must either set MCP_ALLOW_RUNTIME_LIMIT_LOOSENING=1 and redeploy "
+                f"(still capped at the env ceiling), or restart the server — after "
+                f"setting the Redis key {_PERSISTED_OVERRIDE_KEY!r} (default "
+                f"MCP_REDIS_COLLECTION_PREFIX; {_PERSISTED_OVERRIDE_KEY_TEMPLATE!r} "
+                f"otherwise) to '{{}}' if overrides persist via MCP_REDIS_URL."
+            )
+
     def _overrides_of(self, effective: SafetyLimits) -> dict[str, float | int]:
         """The fields where `effective` differs from the env ceiling (sparse)."""
         return {
@@ -396,21 +525,42 @@ class SafetyController:
             raise TradingDisabledError(
                 "Trading is disabled. The server is in read-only mode. "
                 "Set KALSHI_TRADING_ENABLED=1 and restart to enable order "
-                "placement, cancellation, and amendment."
+                "placement. (Cancelling or decreasing existing orders is always "
+                "allowed — kalshi_cancel_order / kalshi_decrease_order.)"
             )
 
     def check_order(self, intent: OrderIntent, *, current_cash_usd: float | None = None) -> None:
         """Raise SafetyError if the order violates any configured policy.
 
+        A pure CHECK — it reserves nothing. `kalshi_prepare_order` uses it as
+        an early fast-fail; the authoritative gate is `reserve_order`, which
+        re-runs this against the limits in force at confirm time and debits
+        the daily budget in the same atomic step.
+
         Pass `current_cash_usd` (from a fresh balance read) to enforce the
-        cash-reserve floor. Omit to skip that check (e.g. dry-run mode).
+        cash-reserve floor. Omit to skip that check (prepare's fast-fail).
         """
+        self._check_order(
+            intent,
+            self.effective_limits(),
+            current_cash_usd=current_cash_usd,
+            include_daily=True,
+        )
+
+    def _check_order(
+        self,
+        intent: OrderIntent,
+        limits: SafetyLimits,
+        *,
+        current_cash_usd: float | None,
+        include_daily: bool,
+    ) -> None:
         self.assert_trading_enabled()
 
-        # Snapshot the limits in force once. These are the env ceilings unless
-        # an operator has tightened them at runtime via `set_limits`.
-        limits = self.effective_limits()
-
+        if intent.action not in {"buy", "sell"}:
+            raise SafetyError(f"action must be 'buy' or 'sell', got {intent.action!r}.")
+        if intent.side not in {"yes", "no"}:
+            raise SafetyError(f"side must be 'yes' or 'no', got {intent.side!r}.")
         if intent.count <= 0:
             raise SafetyError(f"Order count must be positive, got {intent.count}.")
         if not 1 <= intent.limit_price_cents <= 99:
@@ -424,13 +574,9 @@ class SafetyController:
                 f"({limits.max_contracts_per_order})."
             )
 
-        # Cost in USD = (count * price_cents) / 100. For sells, cost is risk
-        # to the position (selling YES at 30c is buying NO at 70c), so we
-        # treat both sides symmetrically for the size cap.
-        max_price_cents = (
-            intent.limit_price_cents if intent.action == "buy" else 100 - intent.limit_price_cents
-        )
-        cost_usd = (intent.count * max_price_cents) / 100.0
+        # Worst-case notional + a conservative fee bound — see
+        # OrderIntent.worst_case_cost_cents, the single source of the formula.
+        cost_usd = intent.worst_case_cost_usd()
 
         if cost_usd > limits.max_order_size_usd:
             raise SafetyError(
@@ -438,22 +584,122 @@ class SafetyController:
                 f"(${limits.max_order_size_usd:.2f}). Reduce count or price."
             )
 
-        _, today_so_far = self._daily.peek()
-        projected = today_so_far + cost_usd
-        if projected > limits.daily_limit_usd:
-            raise SafetyError(
-                f"Projected daily cost ${projected:.2f} would exceed the active "
-                f"daily limit (${limits.daily_limit_usd:.2f}). Already spent "
-                f"${today_so_far:.2f} today. Resets at UTC midnight."
-            )
+        if include_daily:
+            _, today_so_far = self._daily.peek()
+            projected = today_so_far + cost_usd
+            if projected > limits.daily_limit_usd:
+                raise SafetyError(
+                    f"Projected daily cost ${projected:.2f} would exceed the active "
+                    f"daily limit (${limits.daily_limit_usd:.2f}). Already committed "
+                    f"${today_so_far:.2f} today (confirmed orders, incl. any whose "
+                    f"outcome was ambiguous). Resets at UTC midnight."
+                )
 
         if current_cash_usd is not None:
+            if not math.isfinite(current_cash_usd):
+                # NaN would make the `<` below False and silently pass the floor.
+                raise SafetyError(
+                    f"Refusing the order: the cash balance read back as "
+                    f"{current_cash_usd!r}, which is not a finite number."
+                )
             remaining_after = current_cash_usd - cost_usd
             if remaining_after < limits.cash_reserve_usd:
                 raise SafetyError(
                     f"Order would leave ${remaining_after:.2f} in cash, below the "
-                    f"active reserve floor (${limits.cash_reserve_usd:.2f})."
+                    f"active reserve floor (${limits.cash_reserve_usd:.2f}). Cash "
+                    f"now ${current_cash_usd:.2f}; worst-case order cost "
+                    f"${cost_usd:.2f}."
                 )
+
+    # ── Order reservation (the authoritative gate, run at confirm) ─────────
+    #
+    # Same reserve-then-release shape as combo creation, for the same two
+    # reasons. (1) Concurrency: check-then-await-then-record leaves the whole
+    # POST between the check and the increment, so N confirms in flight all
+    # pass a daily cap only one should. (2) Ambiguity: a timeout/5xx may still
+    # have placed the order, so only an unambiguous refusal may give the
+    # budget back. Over-reserving is the safe failure; under-reserving is not.
+
+    def reserve_order(
+        self, intent: OrderIntent, *, current_cash_usd: float | None
+    ) -> OrderReservation:
+        """Re-run every check against the limits in force NOW and debit the cost.
+
+        Call immediately before the order POST. The check and the debit happen
+        under one lock with no `await` in between, so concurrent confirms can
+        never jointly exceed the daily cap, and an order prepared before an
+        operator tightened a limit is judged by the tightened limit.
+
+        `current_cash_usd` must come from a fresh balance read — net of any
+        outstanding ambiguous reservations — whenever the active cash reserve
+        is non-zero; passing None then refuses the order (fail closed) rather
+        than silently skipping the floor.
+
+        Returns the reservation (amount + UTC day charged); hand it to
+        `release_order` only if Kalshi certainly placed nothing.
+        """
+        with self._order_lock:
+            limits = self.effective_limits()
+            self._require_cash_if_reserve(limits, current_cash_usd)
+            self._check_order(intent, limits, current_cash_usd=current_cash_usd, include_daily=True)
+            cost_usd = intent.worst_case_cost_usd()
+            day = self._daily.add_on_today(cost_usd)
+            return OrderReservation(cost_usd=cost_usd, day=day)
+
+    def recheck_reserved_order(
+        self, intent: OrderIntent, *, current_cash_usd: float | None
+    ) -> None:
+        """Checks for RESENDING an order whose cost is already reserved TODAY.
+
+        Used when retrying a confirm whose earlier attempt had an ambiguous
+        outcome. Today's counter already carries this order (the caller must
+        re-reserve via `reserve_order` if the reservation is from an earlier
+        UTC day), so the daily check is "today's total, which INCLUDES this
+        order, must not exceed the daily limit in force NOW" — no double count,
+        but an operator who tightened the daily cap since the first send still
+        stops the resend. Everything else runs against the limits in force now,
+        INCLUDING the cash floor: the balance may have dropped since the first
+        attempt. If the first send did land, the balance already reflects it
+        and the floor check counts it twice — over-strict, the safe direction.
+        """
+        with self._order_lock:
+            limits = self.effective_limits()
+            self._require_cash_if_reserve(limits, current_cash_usd)
+            self._check_order(
+                intent, limits, current_cash_usd=current_cash_usd, include_daily=False
+            )
+            _, today_so_far = self._daily.peek()
+            if today_so_far > limits.daily_limit_usd:
+                raise SafetyError(
+                    f"Today's committed cost ${today_so_far:.2f} (which already "
+                    f"includes this order) exceeds the active daily limit "
+                    f"(${limits.daily_limit_usd:.2f}), so it will not be resent. "
+                    f"Resets at UTC midnight."
+                )
+
+    @staticmethod
+    def _require_cash_if_reserve(limits: SafetyLimits, current_cash_usd: float | None) -> None:
+        if current_cash_usd is None and limits.cash_reserve_usd > 0:
+            raise SafetyError(
+                f"Refusing the order: a cash reserve of "
+                f"${limits.cash_reserve_usd:.2f} is active but no current cash "
+                f"balance was supplied to check it against."
+            )
+
+    def daily_spend_day(self) -> str:
+        """The UTC day the spend counter is on now (rolling it if needed)."""
+        return self._daily.peek()[0]
+
+    def release_order(self, reservation: OrderReservation) -> bool:
+        """Give back a reservation when Kalshi CERTAINLY placed nothing.
+
+        Only for an unambiguous refusal (a 4xx/429 on the first send) or a
+        failure before the request was dispatched — never after a timeout,
+        transport error, 5xx or cancellation once the POST may be in flight.
+        A reservation from an earlier UTC day is NOT credited to today's
+        counter (that would widen today's budget); returns False then.
+        """
+        return self._daily.subtract_if_day(reservation.cost_usd, reservation.day)
 
     # ── Combo (parlay) creation ────────────────────────────────────────────
     #
@@ -541,11 +787,3 @@ class SafetyController:
             "max_combo_creations_per_day": self._config.max_combo_creations_per_day,
             "combo_creation_day_utc": day,
         }
-
-    def record_order_committed(self, intent: OrderIntent) -> None:
-        """Call AFTER the order is successfully accepted by Kalshi."""
-        max_price_cents = (
-            intent.limit_price_cents if intent.action == "buy" else 100 - intent.limit_price_cents
-        )
-        cost_usd = (intent.count * max_price_cents) / 100.0
-        self._daily.add(cost_usd)
