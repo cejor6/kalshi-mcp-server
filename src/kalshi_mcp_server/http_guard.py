@@ -52,12 +52,29 @@ def is_loopback_bind(host: str) -> bool:
         return False
 
 
+def _has_control_chars(value: str) -> bool:
+    return any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+
+
+def _is_loopback_ipv4_literal(hostname: str) -> bool:
+    """Any 127.0.0.0/8 literal — matches what `is_loopback_bind` accepts,
+    so binding 127.0.0.2 doesn't 421 every request addressed to it."""
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return addr.version == 4 and addr.is_loopback
+
+
 def _hostname_from_host_header(value: str) -> str | None:
     """`example.com:8000` → `example.com`; `[::1]:8000` → `::1`.
 
     Returns None for anything urlsplit can't make sense of (including a
-    value carrying userinfo or a path — not a legal Host header).
+    value carrying userinfo, a path, or control characters — not a legal
+    Host header; urlsplit would otherwise silently strip tabs/newlines).
     """
+    if _has_control_chars(value):
+        return None
     value = value.strip()
     if not value or any(c in value for c in "/@?#\\ "):
         return None
@@ -71,6 +88,8 @@ def _hostname_from_host_header(value: str) -> str | None:
 
 
 def _hostname_from_origin(value: str) -> str | None:
+    if _has_control_chars(value):
+        return None
     value = value.strip()
     if not value or value == "null":
         return None
@@ -105,7 +124,8 @@ def parse_allowed_hosts_env() -> frozenset[str]:
 class HostOriginGuard:
     """Pure-ASGI middleware: refuse requests whose Host/Origin isn't allowed.
 
-    - `Host` must be present and name an allowed host → else 421.
+    - `Host` must be present and name an allowed host (a loopback name, any
+      127.0.0.0/8 literal, or an `MCP_ALLOWED_HOSTS` entry) → else 421.
     - `Origin`, when present, must name an allowed host → else 403.
       (Absent `Origin` is normal for non-browser clients.)
 
@@ -116,6 +136,11 @@ class HostOriginGuard:
     def __init__(self, app, allowed_hosts: frozenset[str] = frozenset()) -> None:
         self.app = app
         self.allowed = LOOPBACK_HOSTNAMES | frozenset(h.lower() for h in allowed_hosts)
+
+    def _is_allowed(self, hostname: str | None) -> bool:
+        if hostname is None:
+            return False
+        return hostname in self.allowed or _is_loopback_ipv4_literal(hostname)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -134,14 +159,14 @@ class HostOriginGuard:
                 headers[name] = value.decode("latin-1")
 
         host = _hostname_from_host_header(headers.get("host", ""))
-        if host is None or host not in self.allowed:
+        if not self._is_allowed(host):
             logger.warning("Refused request with Host header %r", headers.get("host"))
             await self._reject(scope, send, 421, "Invalid Host header")
             return
 
         if "origin" in headers:
             origin_host = _hostname_from_origin(headers["origin"])
-            if origin_host is None or origin_host not in self.allowed:
+            if not self._is_allowed(origin_host):
                 logger.warning("Refused request with Origin header %r", headers["origin"])
                 await self._reject(scope, send, 403, "Invalid Origin header")
                 return

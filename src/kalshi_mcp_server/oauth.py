@@ -365,8 +365,6 @@ def _build_client_storage() -> tuple[object | None, str]:
 OAUTH_CORE_ENV_VARS = ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "MCP_BASE_URL")
 # Identity allowlists. Only meaningful once OAuth is on.
 ALLOWLIST_ENV_VARS = ("MCP_ALLOWED_GITHUB_LOGINS", "MCP_ALLOWED_GITHUB_IDS")
-# Everything whose presence says "this deployment means to use OAuth". Used
-# by cli.py to refuse MCP_ALLOW_INSECURE_HTTP=1 alongside any of them.
 OAUTH_ENV_VARS = OAUTH_CORE_ENV_VARS + ALLOWLIST_ENV_VARS
 
 # JSON-RPC error code for a refused (non-tool) request. JSON-RPC reserves
@@ -380,7 +378,7 @@ def _env_set(name: str) -> bool:
     return bool(os.environ.get(name, "").strip())
 
 
-def build_auth_provider() -> tuple[GitHubProvider | None, str]:
+def build_auth_provider(*, strict: bool = True) -> tuple[GitHubProvider | None, str]:
     """Construct the GitHub OAuth provider from env vars, or `(None, '')`.
 
     Returns `(provider, storage_description)`. The description is logged
@@ -393,7 +391,11 @@ def build_auth_provider() -> tuple[GitHubProvider | None, str]:
     - `MCP_BASE_URL`         — public URL of this server (no trailing slash)
 
     Setting one or two of them raises `ConfigError` (fail closed): a
-    half-configured proxy is a mistake, not a request for no auth.
+    half-configured proxy is a mistake, not a request for no auth. With
+    `strict=False` (stdio, which never uses OAuth) a partial set only logs
+    a warning and returns `(None, '')` — `GITHUB_CLIENT_ID` is a generic
+    name, and the CLI auto-loads `./.env`, so an unrelated value in a local
+    env file must not take the stdio server down.
 
     Optional:
     - `MCP_JWT_SIGNING_KEY`  — stable signing key for proxy-issued JWTs.
@@ -411,11 +413,16 @@ def build_auth_provider() -> tuple[GitHubProvider | None, str]:
         return None, ""
     if len(present) != len(OAUTH_CORE_ENV_VARS):
         missing = [name for name in OAUTH_CORE_ENV_VARS if name not in present]
-        raise ConfigError(
+        detail = (
             f"Partial OAuth configuration: {', '.join(present)} set but "
             f"{', '.join(missing)} missing. Set all of {', '.join(OAUTH_CORE_ENV_VARS)} "
-            "to enable the GitHub OAuth proxy, or none of them. Refusing to "
-            "start rather than silently running without authentication."
+            "to enable the GitHub OAuth proxy, or none of them."
+        )
+        if not strict:
+            logger.warning("%s Ignored: OAuth is not used on this transport.", detail)
+            return None, ""
+        raise ConfigError(
+            f"{detail} Refusing to start rather than silently running without authentication."
         )
 
     client_id = os.environ["GITHUB_CLIENT_ID"].strip()

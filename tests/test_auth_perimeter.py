@@ -31,6 +31,7 @@ from kalshi_mcp_server.http_guard import (
     parse_allowed_hosts_env,
 )
 from kalshi_mcp_server.oauth import (
+    ALLOWLIST_ENV_VARS,
     OAUTH_CORE_ENV_VARS,
     OAUTH_ENV_VARS,
     RestrictGitHubUsersMiddleware,
@@ -266,22 +267,46 @@ def test_whitespace_only_oauth_var_counts_as_unset(monkeypatch):
 # ── insecure-HTTP policy ──────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("var", OAUTH_ENV_VARS)
-def test_insecure_flag_with_any_oauth_var_refuses(monkeypatch, var):
+@pytest.mark.parametrize("var", OAUTH_CORE_ENV_VARS)
+def test_insecure_flag_with_partial_oauth_refuses(monkeypatch, var):
     monkeypatch.setenv("MCP_ALLOW_INSECURE_HTTP", "1")
     monkeypatch.setenv(var, "123")
-    with pytest.raises(ConfigError, match="alongside OAuth configuration"):
+    with pytest.raises(ConfigError, match="partial OAuth"):
         _enforce_http_auth_policy(auth_provider=None)
+    # ...and on the real path build_auth_provider refuses first.
+    with pytest.raises(ConfigError, match="Partial OAuth configuration"):
+        build_auth_provider()
 
 
-def test_insecure_flag_with_full_oauth_refuses(monkeypatch):
-    """DEPLOY.md Phase B: forgetting to delete the flag must not boot."""
+def test_insecure_flag_with_full_oauth_is_ignored_with_a_warning(monkeypatch, caplog):
+    """A prod OAuth deploy still carrying Phase A's flag must keep booting —
+    with OAuth on, not off."""
     _set_oauth(monkeypatch)
     monkeypatch.setenv("MCP_ALLOWED_GITHUB_LOGINS", "alice")
     monkeypatch.setenv("MCP_ALLOW_INSECURE_HTTP", "1")
     provider, _ = build_auth_provider()
-    with pytest.raises(ConfigError, match="MCP_ALLOW_INSECURE_HTTP"):
+    assert provider is not None
+    with caplog.at_level(logging.WARNING, logger="kalshi_mcp_server"):
+        _enforce_http_auth_policy(auth_provider=provider, bind_host="0.0.0.0")  # noqa: S104
+    assert "MCP_ALLOW_INSECURE_HTTP=1 is IGNORED" in caplog.text
+
+
+def test_insecure_flag_with_full_oauth_still_requires_allowlist(monkeypatch):
+    _set_oauth(monkeypatch)
+    monkeypatch.setenv("MCP_ALLOW_INSECURE_HTTP", "1")
+    provider, _ = build_auth_provider()
+    with pytest.raises(ConfigError, match="no GitHub allowlist"):
         _enforce_http_auth_policy(auth_provider=provider)
+
+
+@pytest.mark.parametrize("var", ALLOWLIST_ENV_VARS)
+def test_insecure_loopback_with_allowlist_var_runs_and_warns(monkeypatch, caplog, var):
+    """A shared .env carrying an allowlist mustn't block local insecure HTTP."""
+    monkeypatch.setenv("MCP_ALLOW_INSECURE_HTTP", "1")
+    monkeypatch.setenv(var, "123")
+    with caplog.at_level(logging.WARNING, logger="kalshi_mcp_server"):
+        _enforce_http_auth_policy(auth_provider=None, bind_host="127.0.0.1")
+    assert f"{var} set but NOT enforced" in caplog.text
 
 
 def test_insecure_flag_set_to_zero_is_not_a_conflict(monkeypatch):
@@ -351,7 +376,14 @@ def _guarded_client(base_url: str, **guard_kwargs) -> httpx.AsyncClient:
 
 @pytest.mark.parametrize(
     "base_url",
-    ["http://localhost:8000", "http://127.0.0.1:8000", "http://[::1]:8000", "http://localhost"],
+    [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.2:8000",
+        "http://127.255.0.9",
+        "http://[::1]:8000",
+        "http://localhost",
+    ],
 )
 async def test_guard_allows_loopback_hosts(base_url):
     async with _guarded_client(base_url) as client:
@@ -381,6 +413,38 @@ async def test_guard_rejects_malformed_host():
     async with _guarded_client("http://localhost:8000") as client:
         resp = await client.get("/mcp", headers={"Host": "localhost@attacker.example"})
     assert resp.status_code == 421
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        b"local\thost",
+        b"localhost\t",
+        b"\tlocalhost",
+        b"127.0.0.1\r\n",
+        b"128.0.0.1",
+        b"127.0.0.1.evil",
+    ],
+)
+async def test_guard_rejects_control_chars_and_non_loopback_ips(host):
+    # Raw ASGI scope: httpx won't emit some of these, but a hostile client can.
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():  # pragma: no cover — never read
+        return {"type": "http.request", "body": b""}
+
+    scope = {"type": "http", "method": "GET", "path": "/mcp", "headers": [(b"host", host)]}
+    await HostOriginGuard(_ok_app)(scope, receive, send)
+    assert sent[0]["status"] == 421
+
+
+async def test_guard_rejects_origin_with_control_chars():
+    async with _guarded_client("http://localhost:8000") as client:
+        resp = await client.get("/mcp", headers={"Origin": "http://local\x7fhost"})
+    assert resp.status_code == 403
 
 
 async def test_guard_allows_operator_listed_hosts(monkeypatch):
@@ -440,10 +504,37 @@ def test_main_reports_partial_oauth_without_traceback(
     kalshi_env, captured_run, capsys, monkeypatch
 ):
     monkeypatch.setenv("GITHUB_CLIENT_ID", "id")
-    assert main(["--transport", "stdio"]) == 2
+    assert main(["--transport", "http"]) == 2
     err = capsys.readouterr().err
     assert "Startup failed: Partial OAuth configuration" in err
+    assert "Traceback" not in err
     assert captured_run == []
+
+
+def test_main_stdio_only_warns_on_partial_oauth(kalshi_env, captured_run, monkeypatch, capsys):
+    # GITHUB_CLIENT_ID is a generic name and ./.env is auto-loaded; stdio
+    # never uses OAuth, so an unrelated value must not stop it. (main()
+    # re-runs logging.basicConfig(force=True), so read stderr, not caplog.)
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "some-other-app")
+    assert main(["--transport", "stdio"]) == 0
+    assert "Partial OAuth configuration" in capsys.readouterr().err
+    (server, kwargs) = captured_run[0]
+    assert kwargs["transport"] == "stdio"
+    assert server.auth is None
+
+
+def test_main_http_oauth_with_leftover_insecure_flag_boots_with_oauth(
+    kalshi_env, captured_run, monkeypatch
+):
+    _set_oauth(monkeypatch)
+    monkeypatch.setenv("MCP_ALLOWED_GITHUB_IDS", "4242")
+    monkeypatch.setenv("MCP_ALLOW_INSECURE_HTTP", "1")
+    monkeypatch.setenv("MCP_ALLOW_INSECURE_PUBLIC_BIND", "1")
+    assert main(["--transport", "http", "--host", "0.0.0.0"]) == 0  # noqa: S104
+    (server, kwargs) = captured_run[0]
+    assert server.auth is not None
+    assert any(isinstance(m, RestrictGitHubUsersMiddleware) for m in server.middleware)
+    assert kwargs.get("middleware") is None
 
 
 def test_main_refuses_insecure_public_bind(kalshi_env, captured_run, capsys, monkeypatch):
@@ -482,3 +573,86 @@ def test_main_insecure_http_installs_host_guard(kalshi_env, captured_run, monkey
     (server, kwargs) = captured_run[0]
     assert [m.cls for m in kwargs["middleware"]] == [HostOriginGuard]
     assert not any(isinstance(m, RestrictGitHubUsersMiddleware) for m in server.middleware)
+
+
+# ── real HTTP transport (no get_access_token patching) ────────────────────
+#
+# Everything above patches `get_access_token`. This drives the real
+# streamable-HTTP app — bearer auth middleware, token verifier, FastMCP's
+# request routing — in-process over httpx.ASGITransport (no socket, no
+# network), with StaticTokenVerifier standing in for the GitHub verifier
+# (it puts the same `sub` / `login` claims on the AccessToken).
+
+
+def _real_http_server() -> FastMCP:
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+    verifier = StaticTokenVerifier(
+        tokens={
+            "insider-token": {"client_id": "c", "scopes": [], "sub": "4242", "login": "alice"},
+            "outsider-token": {"client_id": "c", "scopes": [], "sub": "666", "login": "mallory"},
+        }
+    )
+    server = FastMCP("perimeter-e2e", auth=verifier)
+
+    @server.resource("kalshi://balance")
+    def balance() -> str:
+        return '{"balance": 100}'
+
+    server.add_middleware(RestrictGitHubUsersMiddleware(frozenset(), frozenset({"4242"})))
+    return server
+
+
+async def _rpc(app, token: str, method: str, params: dict) -> dict:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+    ) as http:
+        resp = await http.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_real_transport_refuses_outsider_resource_read():
+    # Stateless + JSON responses so a bare resources/read is a complete
+    # request/response, letting us hit that method directly.
+    app = _real_http_server().http_app(stateless_http=True, json_response=True)
+    async with app.router.lifespan_context(app):
+        denied = await _rpc(app, "outsider-token", "resources/read", {"uri": "kalshi://balance"})
+        allowed = await _rpc(app, "insider-token", "resources/read", {"uri": "kalshi://balance"})
+
+    assert denied["error"]["code"] == oauth.FORBIDDEN_ERROR_CODE
+    assert "mallory" in denied["error"]["message"]
+    assert "100" not in str(denied)
+    assert "100" in allowed["result"]["contents"][0]["text"]
+
+
+async def test_real_transport_client_session():
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    app = _real_http_server().http_app()
+
+    def factory(**kwargs):
+        kwargs.pop("transport", None)
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+
+    def transport(token: str) -> StreamableHttpTransport:
+        return StreamableHttpTransport(
+            "http://localhost/mcp", auth=token, httpx_client_factory=factory
+        )
+
+    async with app.router.lifespan_context(app):
+        async with Client(transport("insider-token")) as client:
+            contents = await client.read_resource("kalshi://balance")
+            assert "100" in contents[0].text
+
+        with pytest.raises(McpError) as exc:
+            async with Client(transport("outsider-token")):
+                pass
+        assert exc.value.error.code == oauth.FORBIDDEN_ERROR_CODE

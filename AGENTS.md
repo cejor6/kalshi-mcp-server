@@ -215,18 +215,25 @@ line, never a traceback):
 trade server is a serious footgun; the policy fails closed. Specifically:
 
 - A **partial** OAuth config (1 or 2 of `GITHUB_CLIENT_ID` /
-  `GITHUB_CLIENT_SECRET` / `MCP_BASE_URL`) raises `ConfigError` — on every
-  transport. It used to silently mean "no OAuth".
+  `GITHUB_CLIENT_SECRET` / `MCP_BASE_URL`) raises `ConfigError` on HTTP. It
+  used to silently mean "no OAuth". On stdio it only warns (stdio never uses
+  OAuth, `GITHUB_CLIENT_ID` is a generic name, and `./.env` is auto-loaded).
 - OAuth on HTTP requires `MCP_ALLOWED_GITHUB_IDS` and/or
   `MCP_ALLOWED_GITHUB_LOGINS`.
-- `MCP_ALLOW_INSECURE_HTTP=1` alongside any OAuth/allowlist var refuses
-  (a half-finished migration where the allowlist would silently not apply).
+- `MCP_ALLOW_INSECURE_HTTP=1` with a **complete** OAuth config is ignored
+  with a loud WARNING — OAuth wins. Deliberately not a refusal: a prod deploy
+  still carrying the flag from DEPLOY.md's Phase A would otherwise fail its
+  next redeploy. With a *partial* OAuth config it refuses (as above). With
+  no OAuth but `MCP_ALLOWED_GITHUB_*` set (a shared local `.env`) it runs and
+  warns that the allowlist isn't enforced — there's no identity to check.
 - Insecure HTTP on a non-loopback `--host` refuses unless
   `MCP_ALLOW_INSECURE_PUBLIC_BIND=1` is also set — the Docker image binds
   `0.0.0.0`, so a containerized no-auth deploy needs both flags.
 - Insecure HTTP always gets `http_guard.HostOriginGuard` (DNS-rebinding
-  protection): `Host`, and `Origin` when present, must be a loopback name or
-  listed in `MCP_ALLOWED_HOSTS`, else 421/403. It is deliberately NOT
+  protection): `Host`, and `Origin` when present, must be a loopback name,
+  any `127.0.0.0/8` literal (matching what the bind check accepts), or listed
+  in `MCP_ALLOWED_HOSTS`, else 421/403. Values with control characters are
+  rejected before parsing. It is deliberately NOT
   installed with OAuth on — a rebinding page can't obtain a bearer token, and
   Render forwards the public hostname as `Host`.
 
@@ -241,7 +248,8 @@ safety controls reduce blast radius but don't eliminate it.
 `GitHubProvider` OAuth proxy when relevant env vars are set:
 
 - `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `MCP_BASE_URL` — required
-  to enable the proxy (all three or none; a partial set refuses to start)
+  to enable the proxy (all three or none; a partial set refuses to start
+  on HTTP)
 - `MCP_ALLOWED_GITHUB_IDS` and/or `MCP_ALLOWED_GITHUB_LOGINS` — at least one
   required for HTTP transport. The proxy lets anyone with a GitHub account
   authenticate; `RestrictGitHubUsersMiddleware` refuses every MCP request
@@ -260,8 +268,8 @@ safety controls reduce blast radius but don't eliminate it.
   distinct value; changing it is a keyspace move, so treat it like a key
   rotation
 
-Stdio transport ignores all of these (except that a partial OAuth set
-still refuses to start). Local stdio clients (Claude Desktop, Claude Code,
+Stdio transport ignores all of these (a partial OAuth set only logs a
+warning there). Local stdio clients (Claude Desktop, Claude Code,
 Cursor) authenticate trivially — the MCP client itself is the operator.
 
 **The allowlist hooks `on_request`, not `on_call_tool` — don't narrow it.**

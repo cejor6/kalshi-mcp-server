@@ -419,10 +419,12 @@ makes existing state unreadable. That degrades to a cache miss, so
 clients re-register cleanly — you'll just see a single reconnect prompt.
 
 **Delete** the `MCP_ALLOW_INSECURE_HTTP` and
-`MCP_ALLOW_INSECURE_PUBLIC_BIND` variables. The first is not just
-unneeded: the server refuses to start with `MCP_ALLOW_INSECURE_HTTP=1`
-set alongside any OAuth or allowlist variable. (The second is ignored
-once OAuth is on, but don't leave a loaded footgun lying around.)
+`MCP_ALLOW_INSECURE_PUBLIC_BIND` variables. Once all three OAuth vars are
+set, OAuth wins and both flags are ignored — the server still boots, so a
+forgotten flag won't take a working deploy down — but it logs a
+`MCP_ALLOW_INSECURE_HTTP=1 is IGNORED` warning on every start, and a
+leftover flag is one deleted OAuth var away from an unauthenticated
+server. (If only *some* OAuth vars are set, the server refuses to start.)
 
 **Save** with the **"Save, rebuild, and deploy"** option (the dropdown
 next to "Save only"). Render rebuilds + redeploys. Watch the logs for:
@@ -1042,13 +1044,21 @@ and/or `MCP_ALLOWED_GITHUB_LOGINS`).
 
 One or two of `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` /
 `MCP_BASE_URL` are set. All three enable OAuth; none disables it;
-anything in between is refused rather than silently running without
-authentication. Set the missing ones (or remove the stray one).
+anything in between is refused on HTTP rather than silently running
+without authentication. Set the missing ones (or remove the stray one).
+On stdio this is only a warning, since stdio never uses OAuth.
 
-### "MCP_ALLOW_INSECURE_HTTP=1 is set alongside OAuth configuration"
+### "MCP_ALLOW_INSECURE_HTTP=1 is set alongside a partial OAuth configuration"
 
-You added the OAuth vars (Phase B) but didn't delete
-`MCP_ALLOW_INSECURE_HTTP`. Delete it and redeploy.
+You're midway through Phase B: some OAuth vars are set, the insecure flag
+is still on. Finish setting `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` and
+`MCP_BASE_URL` (then delete the flag), or remove the stray OAuth var.
+
+### Warning: "MCP_ALLOW_INSECURE_HTTP=1 is IGNORED because OAuth is configured"
+
+Not an error — the server is running with OAuth. Delete the leftover
+`MCP_ALLOW_INSECURE_HTTP` (and `MCP_ALLOW_INSECURE_PUBLIC_BIND`) to
+silence it.
 
 ### "Refusing to serve unauthenticated HTTP on non-loopback host"
 
