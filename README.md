@@ -335,6 +335,16 @@ OAuth-protected HTTP — host the server somewhere reachable and point
 the client at it. The OAuth proxy is bundled with the server; you
 just need to configure it.
 
+The proxy lets any GitHub account sign in, so HTTP transport also
+requires an identity allowlist — `MCP_ALLOWED_GITHUB_IDS` (numeric ids,
+preferred: they survive renames) and/or `MCP_ALLOWED_GITHUB_LOGINS` —
+enforced on **every** MCP request (tool calls, resource reads such as
+`kalshi://balance`, and listings). The server refuses to start on a
+partial OAuth config, and unauthenticated HTTP
+(`MCP_ALLOW_INSECURE_HTTP=1`) is confined to a loopback bind with
+DNS-rebinding protection unless you also set
+`MCP_ALLOW_INSECURE_PUBLIC_BIND=1`.
+
 See [DEPLOY.md](DEPLOY.md) for an end-to-end walkthrough using
 Render + GitHub OAuth + Upstash Redis. Other image-deploy hosts
 (Fly.io, Cloud Run, ECS, Railway) work the same way — Render is just

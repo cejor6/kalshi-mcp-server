@@ -14,11 +14,13 @@ Three pieces here:
 
 1. `build_auth_provider()` returns a configured `GitHubProvider` when
    `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` / `MCP_BASE_URL` are all
-   set, else `None`.
+   set, `None` when none are, and raises `ConfigError` for a partial set.
 2. `build_user_restriction_middleware()` returns middleware that rejects
-   tool calls from GitHub logins not in `MCP_ALLOWED_GITHUB_LOGINS`.
-   Without this, anyone with a GitHub account who completes the OAuth
-   flow could invoke tools — usually not what you want.
+   EVERY MCP request (tool calls, resource reads, listings) from GitHub
+   users matching neither `MCP_ALLOWED_GITHUB_IDS` nor
+   `MCP_ALLOWED_GITHUB_LOGINS`. Without this, anyone with a GitHub
+   account who completes the OAuth flow could read your balance and
+   positions and invoke tools.
 3. `_build_client_storage()` builds an Upstash Redis-backed store for
    the proxy's DCR registrations + OAuth state when `MCP_REDIS_URL` is
    set. Without it, registrations live only in the container's memory
@@ -26,7 +28,9 @@ Three pieces here:
    reconnect via claude.ai).
 
 The "fail closed when http+missing-config" check lives in `cli.py`, not
-here — this module is policy-free and just builds what the env says.
+here — this module just builds what the env says. It does refuse env it
+can't build correctly (a partial OAuth set, a malformed id list, Redis
+without a signing key), since "build nothing" would mean "no auth".
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 
 from kalshi_mcp_server.errors import ConfigError
 
@@ -352,6 +358,28 @@ def _build_client_storage() -> tuple[object | None, str]:
     )
 
 
+# Env vars that together enable the OAuth proxy. All three or none: a
+# partial set is an operator mistake, and the old "silently return None"
+# behavior turned it into an unauthenticated server (cli.py then fell into
+# the insecure-HTTP branch, or refused with a misleading message).
+OAUTH_CORE_ENV_VARS = ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "MCP_BASE_URL")
+# Identity allowlists. Only meaningful once OAuth is on.
+ALLOWLIST_ENV_VARS = ("MCP_ALLOWED_GITHUB_LOGINS", "MCP_ALLOWED_GITHUB_IDS")
+# Everything whose presence says "this deployment means to use OAuth". Used
+# by cli.py to refuse MCP_ALLOW_INSECURE_HTTP=1 alongside any of them.
+OAUTH_ENV_VARS = OAUTH_CORE_ENV_VARS + ALLOWLIST_ENV_VARS
+
+# JSON-RPC error code for a refused (non-tool) request. JSON-RPC reserves
+# -32000..-32099 for implementation-defined server errors; the MCP SDK uses
+# -32000 (connection closed) and -32042 (URL elicitation), so -32003 is free.
+# Tool calls are refused with a ToolError instead (see the middleware).
+FORBIDDEN_ERROR_CODE = -32003
+
+
+def _env_set(name: str) -> bool:
+    return bool(os.environ.get(name, "").strip())
+
+
 def build_auth_provider() -> tuple[GitHubProvider | None, str]:
     """Construct the GitHub OAuth provider from env vars, or `(None, '')`.
 
@@ -364,6 +392,9 @@ def build_auth_provider() -> tuple[GitHubProvider | None, str]:
     - `GITHUB_CLIENT_SECRET` — OAuth App client secret
     - `MCP_BASE_URL`         — public URL of this server (no trailing slash)
 
+    Setting one or two of them raises `ConfigError` (fail closed): a
+    half-configured proxy is a mistake, not a request for no auth.
+
     Optional:
     - `MCP_JWT_SIGNING_KEY`  — stable signing key for proxy-issued JWTs.
       Without this, a fresh key is generated each process start and
@@ -375,11 +406,21 @@ def build_auth_provider() -> tuple[GitHubProvider | None, str]:
     - `MCP_REDIS_COLLECTION_PREFIX` — namespace for this deployment's
       collections when several servers share one Redis (default `kalshi`).
     """
-    client_id = os.environ.get("GITHUB_CLIENT_ID")
-    client_secret = os.environ.get("GITHUB_CLIENT_SECRET")
-    base_url = os.environ.get("MCP_BASE_URL")
-    if not (client_id and client_secret and base_url):
+    present = [name for name in OAUTH_CORE_ENV_VARS if _env_set(name)]
+    if not present:
         return None, ""
+    if len(present) != len(OAUTH_CORE_ENV_VARS):
+        missing = [name for name in OAUTH_CORE_ENV_VARS if name not in present]
+        raise ConfigError(
+            f"Partial OAuth configuration: {', '.join(present)} set but "
+            f"{', '.join(missing)} missing. Set all of {', '.join(OAUTH_CORE_ENV_VARS)} "
+            "to enable the GitHub OAuth proxy, or none of them. Refusing to "
+            "start rather than silently running without authentication."
+        )
+
+    client_id = os.environ["GITHUB_CLIENT_ID"].strip()
+    client_secret = os.environ["GITHUB_CLIENT_SECRET"].strip()
+    base_url = os.environ["MCP_BASE_URL"].strip()
 
     storage, storage_desc = _build_client_storage()
 
@@ -403,34 +444,111 @@ def _parse_allowed_logins() -> frozenset[str]:
     return frozenset(s.strip().lower() for s in raw.split(",") if s.strip())
 
 
-class RestrictGitHubUsersMiddleware(Middleware):
-    """Reject tool calls from GitHub users not in MCP_ALLOWED_GITHUB_LOGINS.
+def _parse_allowed_ids() -> frozenset[str]:
+    """Parse `MCP_ALLOWED_GITHUB_IDS` — comma-separated GitHub numeric user ids.
 
-    The OAuth proxy will happily issue a token to any GitHub account
-    that completes the flow. Without this middleware, anyone with a
-    GitHub account could call your Kalshi tools. The middleware checks
-    the `login` claim on the proxy-issued JWT against an env-configured
-    allowlist and aborts the call before it reaches the tool body.
+    Kept as strings because that's how they arrive in the token: FastMCP's
+    `GitHubTokenVerifier` sets `claims["sub"] = str(user["id"])` from the
+    GitHub `/user` response. A non-numeric entry raises `ConfigError` rather
+    than being skipped — someone who pasted a login into the ID list should
+    find out at boot, not when they're locked out (or, worse, when a
+    lookalike entry quietly matches nothing).
+    """
+    raw = os.environ.get("MCP_ALLOWED_GITHUB_IDS", "").strip()
+    ids: set[str] = set()
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if not (value.isascii() and value.isdigit()):
+            raise ConfigError(
+                f"MCP_ALLOWED_GITHUB_IDS entry {value!r} is not a numeric GitHub "
+                "user id. Find yours with `gh api user --jq .id` (or "
+                "https://api.github.com/users/<login>); put logins in "
+                "MCP_ALLOWED_GITHUB_LOGINS instead."
+            )
+        # Normalize away leading zeros so "0123" and "123" agree — GitHub
+        # never emits them, so this can only widen a typo into the id the
+        # operator evidently meant.
+        ids.add(str(int(value)))
+    return frozenset(ids)
+
+
+class RestrictGitHubUsersMiddleware(Middleware):
+    """Reject every MCP request from GitHub users outside the allowlist.
+
+    The OAuth proxy will happily issue a token to any GitHub account that
+    completes the flow. This middleware is the authorization half: a caller
+    passes if their GitHub numeric id (the token's `sub` claim) is in
+    `MCP_ALLOWED_GITHUB_IDS` **or** their login (the `login` claim) is in
+    `MCP_ALLOWED_GITHUB_LOGINS`. Ids are preferred — a login can be renamed
+    and the freed name re-registered by someone else, an id never changes.
+
+    It hooks `on_request`, not just `on_call_tool`. A tool-only check let any
+    GitHub user `resources/read` `kalshi://balance` / `positions` / `orders`
+    / `environment` and enumerate the tool + resource surface. `on_request`
+    wraps every client request FastMCP routes through middleware
+    (`initialize`, `tools/*`, `resources/*`, `prompts/*`), so a new resource
+    or request type is covered by default instead of needing its own hook.
+    (`ping` isn't routed through middleware; it carries no data.)
+
+    Refusals: a `tools/call` raises `ToolError`, which reaches the model as an
+    ordinary tool error; everything else raises `McpError`, the JSON-RPC
+    error type FastMCP passes through verbatim (including on `initialize`).
+
+    Only install this on HTTP transport. On stdio there's no access token at
+    all (the MCP client *is* the operator), so it would refuse everything.
     """
 
-    def __init__(self, allowed_logins: frozenset[str]) -> None:
-        self._allowed = allowed_logins
+    def __init__(
+        self,
+        allowed_logins: frozenset[str],
+        allowed_ids: frozenset[str] = frozenset(),
+    ) -> None:
+        self._allowed_logins = frozenset(login.lower() for login in allowed_logins)
+        self._allowed_ids = frozenset(allowed_ids)
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        if not self._allowed:
-            raise ToolError("Server misconfigured: MCP_ALLOWED_GITHUB_LOGINS is empty")
+    def _refusal_reason(self) -> str | None:
+        """Return why the current caller is refused, or None if allowed."""
+        if not self._allowed_logins and not self._allowed_ids:
+            # Fail closed. cli.py refuses to start in this state; this guards
+            # a direct construction that skipped that check.
+            return (
+                "Server misconfigured: neither MCP_ALLOWED_GITHUB_IDS nor "
+                "MCP_ALLOWED_GITHUB_LOGINS is set"
+            )
         token = get_access_token()
         if token is None:
-            raise ToolError("Unauthenticated")
-        login = (token.claims.get("login") or "").lower()
-        if login not in self._allowed:
-            raise ToolError(f"GitHub user '{login or '(unknown)'}' is not authorized")
-        return await call_next(context)
+            return "Unauthenticated"
+        claims = token.claims or {}
+        user_id = str(claims.get("sub") or "").strip()
+        login = str(claims.get("login") or "").strip().lower()
+        if user_id and user_id in self._allowed_ids:
+            return None
+        if login and login in self._allowed_logins:
+            return None
+        who = login or "(unknown)"
+        if user_id:
+            who = f"{who} (id {user_id})"
+        return f"GitHub user {who} is not authorized"
+
+    async def on_request(self, context: MiddlewareContext, call_next):
+        reason = self._refusal_reason()
+        if reason is None:
+            return await call_next(context)
+        logger.warning("Refused MCP %s: %s", context.method or "request", reason)
+        if context.method == "tools/call":
+            raise ToolError(reason)
+        raise McpError(ErrorData(code=FORBIDDEN_ERROR_CODE, message=reason))
 
 
 def build_user_restriction_middleware() -> RestrictGitHubUsersMiddleware | None:
-    """Return the allowlist middleware if configured, else None."""
-    allowed = _parse_allowed_logins()
-    if not allowed:
+    """Return the allowlist middleware if either allowlist is set, else None.
+
+    Raises `ConfigError` for a malformed `MCP_ALLOWED_GITHUB_IDS`.
+    """
+    logins = _parse_allowed_logins()
+    ids = _parse_allowed_ids()
+    if not logins and not ids:
         return None
-    return RestrictGitHubUsersMiddleware(allowed)
+    return RestrictGitHubUsersMiddleware(logins, ids)
