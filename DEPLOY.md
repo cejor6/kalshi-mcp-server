@@ -812,8 +812,8 @@ Clear build cache & deploy.
 
 Image was built without the `[oauth]` extras. The fix is to use a
 **v0.1.2 or newer** image. If you've forked and built your own, your
-Dockerfile needs `RUN uv pip install --no-cache ".[oauth]"` (not just
-`.`).
+Dockerfile needs `--extra oauth` on its `uv sync --locked` install
+steps.
 
 ### Stuck "Connecting" / OAuth fails in claude.ai
 

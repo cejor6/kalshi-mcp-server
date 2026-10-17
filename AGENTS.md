@@ -360,8 +360,16 @@ of these in a refactor, check that they still hold.
   override via `CMD ["--host", "0.0.0.0"]`**. Without this, hosted
   deploys return 502 — the gateway can't reach a localhost-only bind.
 - **The published image must include `[oauth]` extras.** The Dockerfile
-  installs with `uv pip install ".[oauth]"`, not `.`. Without the
+  installs with `uv sync --locked --no-dev --extra oauth`. Without the
   extras, the OAuth proxy crashes on import when `MCP_REDIS_URL` is set.
+- **The image installs from `uv.lock`, never a fresh resolve.** `--locked`
+  installs the exact hash-checked set CI tested and fails the build if the
+  lock is stale. Don't go back to `uv pip install ".[oauth]"` — it ignores
+  the lock, so every release silently shipped whatever was newest on PyPI
+  that day. The project itself is installed `--no-editable` (an editable
+  `.pth` would point at `/app/src`, absent from the runtime stage). Base
+  images and the `uv` image are pinned by tag **and** digest; bump both
+  together (`docker buildx imagetools inspect <image>:<tag>`, index digest).
 - **The Dockerfile's `ENTRYPOINT` runs as a non-root user** (uid 10001).
   Don't add steps that require root after the `USER app` directive.
 - **The release workflow tags both `:vX.Y.Z` and `:latest`** so image-

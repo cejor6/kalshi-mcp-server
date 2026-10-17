@@ -1,37 +1,72 @@
 # syntax=docker/dockerfile:1.7
 
-# Stage 1 — build wheel + install into a venv with uv.
-FROM python:3.14-slim-bookworm AS build
+# Base images are pinned by tag AND digest, so a rebuild of the same commit
+# gets the same bytes rather than whatever the tag points at today. The tag is
+# kept alongside the digest for readability and so Dependabot (docker
+# ecosystem, see .github/dependabot.yml) can propose bumps. Both stages use
+# the SAME python image on purpose: the venv built in stage 1 symlinks to
+# stage 1's interpreter, so the runtime stage must provide an identical one.
+#
+# To bump by hand: `docker buildx imagetools inspect <image>:<tag>` and copy
+# the top-level index `Digest:` (not a per-platform manifest digest — the
+# release builds linux/amd64 + linux/arm64).
 
+# Stage 1 — install the LOCKED dependency set into a venv with uv.
+FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS build
+
+# UV_PYTHON_DOWNLOADS=never: use the base image's interpreter, never a
+# uv-managed download (the runtime stage wouldn't have it).
+# UV_PROJECT_ENVIRONMENT: `uv sync` installs into /opt/venv instead of
+# /app/.venv, so the runtime stage can copy it wholesale.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv directly from the official image — avoids pip overhead.
-COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+# Install uv directly from the official image — avoids pip overhead. Pinned to
+# an exact release + digest: a floating `0.x` tag would let a new uv change
+# lockfile handling under an unchanged commit.
+COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /uvx /usr/local/bin/
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
 
-# Create venv and install. We don't install dev dependencies in production.
-RUN uv venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:$PATH"
-# Install with [oauth] extras so the OAuth proxy (FastMCP GitHubProvider
-# + Redis-backed DCR store) works out of the box on hosted deploys. The
-# extras add ~6MB to the image — worth it to avoid silent crashes when
-# MCP_REDIS_URL is set on a deployment.
-RUN uv pip install --no-cache ".[oauth]"
+# Install from uv.lock, not a fresh resolve. `uv pip install ".[oauth]"`
+# ignored the lock entirely, so every image build pulled whatever versions
+# were newest on PyPI that day — a different (unreviewed, untested) dependency
+# set from the one CI ran against. `--locked` both installs exactly the
+# pinned + hash-checked versions AND fails the build if uv.lock is stale
+# relative to pyproject.toml, rather than silently re-resolving.
+#
+# `--extra oauth` installs the [oauth] extras so the OAuth proxy (FastMCP
+# GitHubProvider + Redis-backed DCR store) works out of the box on hosted
+# deploys — without them the proxy crashes on import when MCP_REDIS_URL is
+# set. `--no-dev` drops dependency groups; the `dev` *extra* is simply not
+# requested.
+#
+# Two steps so the (slow, rarely-changing) dependency layer is cached
+# independently of source edits.
+#
+# Known residual: the build backend (`hatchling`, used only to build this
+# project's own wheel in the second step) is fetched into an isolated build
+# env and is NOT covered by uv.lock. Runtime dependencies all are.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --locked --no-dev --extra oauth --no-install-project --no-cache
+
+# `--no-editable` installs the project itself as a regular package in
+# /opt/venv. The default editable install would leave a .pth pointing at
+# /app/src, which doesn't exist in the runtime stage.
+COPY src ./src
+RUN uv sync --locked --no-dev --extra oauth --no-editable --no-cache
 
 # Stage 2 — slim runtime image.
-FROM python:3.14-slim-bookworm AS runtime
+FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS runtime
 
 # MCP Registry ownership verification: the registry confirms this image
 # belongs to the io.github.cejor6/* namespace by reading this annotation.
