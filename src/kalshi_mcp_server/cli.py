@@ -147,8 +147,9 @@ def main(argv: list[str] | None = None) -> int:
         signer = _build_signer(config)
         # Runtime safety-limit overrides persist via this store when
         # MCP_REDIS_URL is set; otherwise they're in-memory (reset on
-        # restart). Building the store is non-fatal — an unreachable Redis
-        # surfaces later, at load/save time.
+        # restart). An unreachable Redis doesn't fail here — it surfaces
+        # later, at load/save time — but a disallowed URL (cleartext
+        # redis:// to a non-loopback host) raises ConfigError, caught below.
         from kalshi_mcp_server.safety_store import build_limits_store
 
         limits_store, limits_store_desc = build_limits_store()

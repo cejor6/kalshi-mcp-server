@@ -14,7 +14,12 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.actor == 'dependabot[bot]'
+    # Key on the PR's author, not `github.actor`: the actor is whoever
+    # triggered THIS run (e.g. someone re-running it or pushing to the
+    # Dependabot branch), so it can be dependabot[bot] on a run whose PR
+    # content isn't Dependabot's, or vice versa. GitHub's documented pattern
+    # checks the PR author.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Fetch Dependabot metadata
