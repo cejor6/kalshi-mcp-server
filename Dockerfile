@@ -18,7 +18,7 @@
 FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
 # Stage 1 — install the LOCKED dependency set into a venv with uv.
-FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS build
+FROM python:3.15.0-slim-bookworm@sha256:0e019bbdfb5d9874cb2389f1c2884b64aa2ac97c99960b5bc521cef978c0617d AS build
 
 # UV_PYTHON_DOWNLOADS=never: use the base image's interpreter, never a
 # uv-managed download (the runtime stage wouldn't have it).
@@ -70,7 +70,7 @@ COPY src ./src
 RUN uv sync --locked --no-dev --extra oauth --no-editable --no-cache
 
 # Stage 2 — slim runtime image.
-FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS runtime
+FROM python:3.15.0-slim-bookworm@sha256:0e019bbdfb5d9874cb2389f1c2884b64aa2ac97c99960b5bc521cef978c0617d AS runtime
 
 # MCP Registry ownership verification: the registry confirms this image
 # belongs to the io.github.cejor6/* namespace by reading this annotation.
