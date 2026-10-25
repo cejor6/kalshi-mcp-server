@@ -15,7 +15,7 @@
 # FROM lines, not `COPY --from=<image>` refs) can propose bumps. Pinned to an
 # exact release + digest: a floating `0.x` tag would let a new uv change
 # lockfile handling under an unchanged commit.
-FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff AS uv
 
 # Stage 1 — install the LOCKED dependency set into a venv with uv.
 FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS build
